@@ -887,6 +887,46 @@ class AgentCore:
             return []
         return _parse_file_plan(raw)
 
+    async def _multi_file_flow(
+        self, user_message: str, refs: list[str]
+    ) -> tuple[str, list[dict]]:
+        """Plan a set of per-file operations, then run each through _file_op_flow.
+
+        Reads the existing files relevant to the request (the @refs plus any
+        file named in the message that exists on disk) so the planner can decide
+        what to split out, then executes create/edit for each planned file by
+        delegating to the already-tested single-file flow.
+        """
+        workdir = Path(self._project_path or Path.cwd())
+
+        # Gather context: @refs first, then any existing filename mentioned in text.
+        ctx_names: list[str] = list(refs)
+        guessed = _extract_filename(user_message)
+        if guessed and guessed not in ctx_names:
+            ctx_names.append(guessed)
+        context = self._read_refs([n for n in ctx_names if (workdir / n).is_file()])
+
+        ops = await self._plan_file_ops(user_message, context)
+        if not ops:
+            return (
+                "I couldn't plan the multi-file change — try naming the files, "
+                "e.g. 'split index.html into styles.css and script.js'.",
+                [],
+            )
+
+        trace: list[dict] = []
+        summaries: list[str] = []
+        for op in ops:
+            # Each op reuses the single-file flow: create → FILENAME gen,
+            # edit on an existing file → surgical SEARCH/REPLACE then rewrite.
+            sub_msg = op.instruction or user_message
+            ans, sub_trace = await self._file_op_flow(sub_msg, target=op.filename)
+            trace.extend(sub_trace)
+            summaries.append(f"- {op.filename}: {ans}")
+
+        answer = f"Handled {len(ops)} file(s):\n" + "\n".join(summaries)
+        return answer, trace
+
     async def chat(self, user_message: str) -> tuple[str, list[dict]]:
         """Process one user message. Returns (answer, tool_trace)."""
         # @path references: pull them out, then work with a cleaned message so the
