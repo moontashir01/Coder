@@ -1,5 +1,6 @@
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 
@@ -326,6 +327,51 @@ def _apply_search_replace(
         else:
             failed += 1
     return new, applied, failed
+
+
+# --- Multi-file planning --------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FileOp:
+    """One planned per-file operation produced by the multi-file planner."""
+
+    filename: str
+    action: str  # "create" | "edit"
+    instruction: str
+
+
+def _parse_file_plan(raw: str) -> list[FileOp]:
+    """Parse a planner response of {"files": [{filename, action, instruction}]}.
+
+    Tolerant of prose around the JSON (reuses _extract_json). Entries without a
+    filename are skipped; a missing/blank action defaults to "create".
+    """
+    try:
+        data = _extract_json(raw)
+    except Exception:
+        return []
+    items = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    ops: list[FileOp] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("filename") or "").strip()
+        if not name:
+            continue
+        action = str(item.get("action") or "create").strip().lower()
+        if action not in ("create", "edit"):
+            action = "create"
+        ops.append(
+            FileOp(
+                filename=name,
+                action=action,
+                instruction=str(item.get("instruction") or "").strip(),
+            )
+        )
+    return ops
 
 
 class AgentCore:

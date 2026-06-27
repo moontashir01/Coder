@@ -7,7 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.agent.core import _extension_guard, wants_multifile
+from app.agent.core import (FileOp, _extension_guard, _parse_file_plan,
+                            wants_multifile)
 
 
 class ScriptedLLM:
@@ -60,3 +61,41 @@ def test_wants_multifile_true(msg):
 )
 def test_wants_multifile_false(msg):
     assert wants_multifile(msg) is False
+
+
+def test_parse_file_plan_basic():
+    raw = """{"files": [
+        {"filename": "styles.css", "action": "create", "instruction": "move the css here"},
+        {"filename": "index.html", "action": "edit", "instruction": "remove inline css, link styles.css"}
+    ]}"""
+    ops = _parse_file_plan(raw)
+    assert ops == [
+        FileOp(filename="styles.css", action="create", instruction="move the css here"),
+        FileOp(
+            filename="index.html",
+            action="edit",
+            instruction="remove inline css, link styles.css",
+        ),
+    ]
+
+
+def test_parse_file_plan_tolerates_surrounding_prose():
+    raw = 'Here is the plan:\n{"files": [{"filename": "a.js", "action": "create", "instruction": "x"}]}\nDone.'
+    ops = _parse_file_plan(raw)
+    assert ops == [FileOp(filename="a.js", action="create", instruction="x")]
+
+
+def test_parse_file_plan_defaults_action_to_create():
+    raw = '{"files": [{"filename": "new.css", "instruction": "styles"}]}'
+    ops = _parse_file_plan(raw)
+    assert ops == [FileOp(filename="new.css", action="create", instruction="styles")]
+
+
+def test_parse_file_plan_skips_entries_without_filename():
+    raw = '{"files": [{"action": "create", "instruction": "no name"}, {"filename": "ok.js", "instruction": "y"}]}'
+    ops = _parse_file_plan(raw)
+    assert ops == [FileOp(filename="ok.js", action="create", instruction="y")]
+
+
+def test_parse_file_plan_empty_on_garbage():
+    assert _parse_file_plan("not json at all") == []
