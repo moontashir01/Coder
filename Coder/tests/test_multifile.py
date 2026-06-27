@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.agent.core import (FileOp, _extension_guard, _parse_file_plan,
-                            wants_multifile)
+from app.agent.core import (AgentCore, FileOp, _extension_guard,
+                            _parse_file_plan, wants_multifile)
 
 
 class ScriptedLLM:
@@ -99,3 +99,33 @@ def test_parse_file_plan_skips_entries_without_filename():
 
 def test_parse_file_plan_empty_on_garbage():
     assert _parse_file_plan("not json at all") == []
+
+
+async def test_plan_file_ops_parses_scripted_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_plan")
+    a._llm_direct = ScriptedLLM(["""{"files": [
+        {"filename": "styles.css", "action": "create", "instruction": "the css"},
+        {"filename": "script.js", "action": "create", "instruction": "the js"},
+        {"filename": "index.html", "action": "edit", "instruction": "link them, drop inline"}
+    ]}"""])
+
+    ops = await a._plan_file_ops(
+        "separate index.html into files",
+        context="### index.html\n<html><style>x</style></html>",
+    )
+
+    assert [o.filename for o in ops] == ["styles.css", "script.js", "index.html"]
+    assert [o.action for o in ops] == ["create", "create", "edit"]
+
+
+async def test_plan_file_ops_empty_on_llm_error(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_plan_err")
+
+    class Boom:
+        def invoke(self, messages):
+            raise RuntimeError("offline")
+
+    a._llm_direct = Boom()
+    assert await a._plan_file_ops("separate it", context="") == []

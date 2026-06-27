@@ -257,6 +257,22 @@ and the request "make greet return hello", you output ONLY:
     return "hello"
 >>>>>>> REPLACE"""
 
+_MULTIFILE_PLAN_INSTRUCTIONS = """
+You are planning how to split or reorganize code across MULTIPLE files.
+Return ONLY a JSON object, nothing else, in exactly this shape:
+{"files": [
+  {"filename": "<relative path>", "action": "create" | "edit", "instruction": "<what to put in / change about this file>"}
+]}
+
+Rules:
+- "create" = a brand-new file. "edit" = modify a file that already exists.
+- When you move code OUT of an existing file, you MUST include an "edit" entry
+  for that existing file whose instruction says to REMOVE the moved code and add
+  the link/import (e.g. for index.html: remove the inline <style>/<script> and
+  add <link rel="stylesheet" href="styles.css"> and <script src="script.js">).
+- Keep each instruction specific and self-contained.
+- Output ONLY the JSON. No prose, no markdown fences."""
+
 _SR_BLOCK_RE = re.compile(
     r"<{3,}\s*SEARCH\s*\n(.*?)\n={3,}\s*\n(.*?)\n>{3,}\s*REPLACE",
     re.DOTALL,
@@ -844,6 +860,32 @@ class AgentCore:
         else:
             answer = f"Failed to write {filename}: {result.get('error')}"
         return answer, trace
+
+    async def _plan_file_ops(self, user_message: str, context: str) -> list[FileOp]:
+        """One LLM call → an ordered list of per-file operations.
+
+        ``context`` is the text of the existing files relevant to the request
+        (so the planner knows what to split out). Returns [] on any failure;
+        the caller falls back to the single-file flow.
+        """
+        messages = [
+            SystemMessage(
+                content="You are a precise multi-file refactoring planner. "
+                "You output only JSON." + _MULTIFILE_PLAN_INSTRUCTIONS
+            ),
+            HumanMessage(
+                content=(
+                    f"Request: {user_message}\n\n"
+                    f"Existing files:\n{context or '(none)'}\n\n"
+                    f"Output the JSON plan now:"
+                )
+            ),
+        ]
+        try:
+            raw = self._llm_direct.invoke(messages).content
+        except Exception:
+            return []
+        return _parse_file_plan(raw)
 
     async def chat(self, user_message: str) -> tuple[str, list[dict]]:
         """Process one user message. Returns (answer, tool_trace)."""
