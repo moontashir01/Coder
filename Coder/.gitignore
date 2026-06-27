@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.chroma_db/
+.coder.db
+.symbols.db
+.coder_history
+models/*.gguf
+projects/
+*.egg-info/
+dist/
+build/
+.pytest_cache/

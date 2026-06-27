@@ -1,0 +1,334 @@
+"""Tests for file-creation routing, loose-JSON normalization, and the file_op flow.
+
+All offline: the LLM is a scripted fake, file writes go to tmp_path.
+"""
+import os
+from types import SimpleNamespace
+
+import pytest
+
+from app.agent import core as core_mod
+from app.agent.core import (
+    AgentCore,
+    _wants_file_op,
+    _extract_filename,
+    _infer_filename,
+    _parse_file_output,
+    _strip_code_fences,
+    _extract_at_refs,
+    _strip_at_refs,
+    _parse_search_replace,
+    _apply_search_replace,
+)
+
+
+def _sr_block(search: str, replace: str) -> str:
+    return f"<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE"
+
+
+class ScriptedLLM:
+    def __init__(self, outputs):
+        self._outputs = list(outputs)
+        self.calls = 0
+
+    def invoke(self, messages):
+        out = self._outputs[min(self.calls, len(self._outputs) - 1)]
+        self.calls += 1
+        return SimpleNamespace(content=out)
+
+
+# ---------------------------------------------------------------------------
+# Intent heuristic
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("msg", [
+    "make me a html file, it should mimic a nicely built website",
+    "create an index.html file for a landing page",
+    "edit index.html to change the title",
+    "add a navbar to index.html",
+    "write a CSS file for the theme",
+])
+def test_wants_file_op_true(msg):
+    assert _wants_file_op(msg) is True
+
+
+@pytest.mark.parametrize("msg", [
+    "write a python function that adds two numbers",
+    "explain what a decorator does",
+    "what is the time complexity of quicksort",
+    "create a class that represents a point",
+])
+def test_wants_file_op_false(msg):
+    assert _wants_file_op(msg) is False
+
+
+# ---------------------------------------------------------------------------
+# Filename + content parsing
+# ---------------------------------------------------------------------------
+
+def test_extract_filename():
+    assert _extract_filename("edit index.html now") == "index.html"
+    assert _extract_filename("update src/app.py please") == "src/app.py"
+    assert _extract_filename("make a website") is None
+
+
+def test_infer_filename():
+    assert _infer_filename("make me an html page") == "index.html"
+    assert _infer_filename("write a python script") == "main.py"
+    assert _infer_filename("something unknown") == "output.txt"
+
+
+def test_strip_code_fences():
+    assert _strip_code_fences("```html\n<h1>hi</h1>\n```") == "<h1>hi</h1>"
+    assert _strip_code_fences("no fences") == "no fences"
+    # a stray unmatched closing fence must be dropped, not written to the file
+    assert _strip_code_fences("def f():\n    return 1\n```") == "def f():\n    return 1"
+    # prose around a real fenced block → keep only the block
+    assert _strip_code_fences("Here:\n```\ncode\n```\nthanks") == "code"
+
+
+def test_parse_file_output_with_filename_header():
+    name, content = _parse_file_output("FILENAME: page.html\n<html></html>", fallback="x.txt")
+    assert name == "page.html"
+    assert content == "<html></html>"
+
+
+def test_parse_file_output_fallback():
+    name, content = _parse_file_output("<html></html>", fallback="index.html")
+    assert name == "index.html"
+    assert content == "<html></html>"
+
+
+# ---------------------------------------------------------------------------
+# Loose-JSON normalization + arg coercion (uses a real registry)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def agent(tmp_path, monkeypatch):
+    # Write DB/chroma side effects into tmp, not the repo.
+    monkeypatch.chdir(tmp_path)
+    return AgentCore(session_id="pytest_fileflow")
+
+
+def test_normalize_flattened_tool_call(agent):
+    out = agent._normalize_action(
+        {"action": "write_file", "path": "a.txt", "content": "hi"}
+    )
+    assert out["action"] == "tool_call"
+    assert out["tool"] == "write_file"
+    assert out["arguments"] == {"path": "a.txt", "content": "hi"}
+
+
+def test_normalize_tool_without_action(agent):
+    out = agent._normalize_action({"tool": "read_file", "arguments": {"path": "x"}})
+    assert out["action"] == "tool_call"
+    assert out["tool"] == "read_file"
+
+
+def test_normalize_bare_answer(agent):
+    out = agent._normalize_action({"answer": "done"})
+    assert out == {"action": "final_answer", "answer": "done"}
+
+
+def test_normalize_passthrough(agent):
+    a = {"action": "final_answer", "answer": "x"}
+    assert agent._normalize_action(a) is a
+
+
+def test_coerce_args_file_path_alias(agent):
+    coerced = agent._coerce_args("write_file", {"file_path": "a.txt", "content": "hi"})
+    assert coerced["path"] == "a.txt"
+    assert "file_path" not in coerced
+
+
+# ---------------------------------------------------------------------------
+# _file_op_flow — deterministic create/update (scripted LLM, real write_file)
+# ---------------------------------------------------------------------------
+
+async def test_file_op_flow_creates_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_create")
+    a._llm_direct = ScriptedLLM(["FILENAME: hello.html\n<html><body>Hi</body></html>"])
+
+    answer, trace = await a._file_op_flow("make me an html file")
+
+    written = tmp_path / "hello.html"
+    assert written.exists()
+    assert written.read_text(encoding="utf-8") == "<html><body>Hi</body></html>"
+    assert trace[0]["tool"] == "write_file"
+    assert trace[0]["result"]["success"] is True
+    assert "Created" in answer
+
+
+async def test_file_op_flow_updates_existing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    existing = tmp_path / "index.html"
+    existing.write_text("<html>old</html>", encoding="utf-8")
+
+    a = AgentCore(session_id="pytest_update")
+    # force the whole-file rewrite path: surgical emits no blocks
+    a._llm_edit = ScriptedLLM(["no blocks"])
+    a._llm_direct = ScriptedLLM(["FILENAME: index.html\n<html>new + contact</html>"])
+
+    answer, trace = await a._file_op_flow("add a contact section to index.html")
+
+    assert existing.read_text(encoding="utf-8") == "<html>new + contact</html>"
+    assert "Updated" in answer
+
+
+# ---------------------------------------------------------------------------
+# @ file references (Slice 1)
+# ---------------------------------------------------------------------------
+
+def test_extract_at_refs():
+    assert _extract_at_refs("change @src/app.py and @utils.py now") == [
+        "src/app.py",
+        "utils.py",
+    ]
+    assert _extract_at_refs("no refs here") == []
+    # an email must not be mistaken for a reference
+    assert _extract_at_refs("mail me at a@b.com") == []
+
+
+def test_strip_at_refs():
+    assert _strip_at_refs("edit @src/app.py please") == "edit src/app.py please"
+    assert _strip_at_refs("nothing") == "nothing"
+
+
+def test_resolve_ref_prefers_existing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "real.py").write_text("x = 1\n", encoding="utf-8")
+    a = AgentCore(session_id="pytest_resolve")
+    # ghost.py does not exist, real.py does → resolve to the existing one
+    assert a._resolve_ref(["ghost.py", "real.py"]) == "real.py"
+    # none exist → fall back to the first (so it can be created)
+    assert a._resolve_ref(["new.py"]) == "new.py"
+    assert a._resolve_ref([]) is None
+
+
+def test_read_refs_injects_content(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.py").write_text("print('hello a')\n", encoding="utf-8")
+    a = AgentCore(session_id="pytest_readrefs")
+    ctx = a._read_refs(["a.py", "missing.py"])
+    assert "### a.py" in ctx
+    assert "hello a" in ctx
+    assert "missing.py" not in ctx  # non-existent refs are skipped
+
+
+async def test_at_ref_targets_file_over_message_guess(tmp_path, monkeypatch):
+    """An @ref pins the edit target even when the message names another file."""
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "real.py"
+    target.write_text("v = 1\n", encoding="utf-8")
+
+    a = AgentCore(session_id="pytest_attarget")
+    # surgical emits no blocks → falls back to the whole-file rewrite path
+    a._llm_edit = ScriptedLLM(["no blocks here"])
+    a._llm_direct = ScriptedLLM(["FILENAME: real.py\nv = 2\n"])
+
+    # _resolve_ref would be fed ["real.py"]; pass it directly as target
+    answer, trace = await a._file_op_flow("bump the version", target="real.py")
+
+    # content is written verbatim minus surrounding whitespace (fence-stripping)
+    assert target.read_text(encoding="utf-8") == "v = 2"
+    assert "Updated" in answer
+    assert "real.py" in answer
+
+
+# ---------------------------------------------------------------------------
+# Surgical SEARCH/REPLACE editing (Slice 3)
+# ---------------------------------------------------------------------------
+
+def test_parse_search_replace_single():
+    blocks = _parse_search_replace(_sr_block("old line", "new line"))
+    assert blocks == [("old line", "new line")]
+
+
+def test_parse_search_replace_multiple():
+    text = _sr_block("a", "A") + "\n" + _sr_block("b", "B")
+    assert _parse_search_replace(text) == [("a", "A"), ("b", "B")]
+
+
+def test_parse_search_replace_none():
+    assert _parse_search_replace("just prose, no blocks") == []
+
+
+def test_apply_exact_match_changes_only_target():
+    content = "line1\nline2\nline3\n"
+    new, applied, failed = _apply_search_replace(content, [("line2", "LINE2")])
+    assert new == "line1\nLINE2\nline3\n"
+    assert (applied, failed) == (1, 0)
+
+
+def test_apply_whitespace_tolerant():
+    content = "def f():\n    return 1\n"
+    # SEARCH has different trailing whitespace than the file
+    new, applied, failed = _apply_search_replace(content, [("    return 1   ", "    return 2")])
+    assert "return 2" in new
+    assert applied == 1
+
+
+def test_apply_no_match_counts_failure():
+    content = "alpha\nbeta\n"
+    new, applied, failed = _apply_search_replace(content, [("zeta", "z")])
+    assert new == content
+    assert (applied, failed) == (0, 1)
+
+
+def test_apply_reindents_when_search_drops_indentation():
+    # The 3B copies SEARCH lines without the file's leading indent; the matched
+    # region must still be replaced AND the replacement re-indented to match.
+    content = 'def greet(name):\n    return f"Hello {name}"\n'
+    blocks = [('return f"Hello {name}"', 'return f"Goodbye {name}"')]
+    new, applied, failed = _apply_search_replace(content, blocks)
+    assert new == 'def greet(name):\n    return f"Goodbye {name}"\n'
+    assert (applied, failed) == (1, 0)
+
+
+async def test_surgical_edit_changes_one_line(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "app.py"
+    f.write_text('def greet(name):\n    return f"Hello {name}"\n', encoding="utf-8")
+
+    a = AgentCore(session_id="pytest_surgical")
+    a._llm_edit = ScriptedLLM([
+        _sr_block('    return f"Hello {name}"', '    return f"Goodbye {name}"')
+    ])
+
+    result = await a._surgical_edit("app.py", f, f.read_text(encoding="utf-8"), "say goodbye")
+    assert result is not None
+    answer, trace = result
+    assert f.read_text(encoding="utf-8") == 'def greet(name):\n    return f"Goodbye {name}"\n'
+    assert "Edited" in answer
+    assert trace[0]["result"]["success"] is True
+
+
+async def test_surgical_edit_returns_none_without_blocks(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "app.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    a = AgentCore(session_id="pytest_noblocks")
+    # both the initial call and the one retry yield no blocks → None (fall back)
+    a._llm_edit = ScriptedLLM(["sorry, here is some prose with no blocks"])
+    assert await a._surgical_edit("app.py", f, "x = 1\n", "change it") is None
+
+
+async def test_file_op_flow_prefers_surgical_then_falls_back(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "app.py"
+    f.write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
+
+    a = AgentCore(session_id="pytest_flow_surgical")
+    # Surgical (uses _llm_edit) returns a valid block → only line b changes.
+    a._llm_edit = ScriptedLLM([_sr_block("b = 2", "b = 20")])
+    answer, trace = await a._file_op_flow("change b", target="app.py")
+    assert f.read_text(encoding="utf-8") == "a = 1\nb = 20\nc = 3\n"
+    assert "Edited" in answer
+
+    # Now surgical fails (no blocks, incl. retry) → falls back to whole-file rewrite.
+    a._llm_edit = ScriptedLLM(["no blocks"])
+    a._llm_direct = ScriptedLLM(["FILENAME: app.py\nWHOLE NEW FILE"])
+    answer2, trace2 = await a._file_op_flow("rewrite it", target="app.py")
+    assert f.read_text(encoding="utf-8") == "WHOLE NEW FILE"
+    assert "Updated" in answer2
