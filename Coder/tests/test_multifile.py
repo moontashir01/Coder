@@ -197,3 +197,48 @@ async def test_multi_file_flow_empty_plan_falls_back(tmp_path, monkeypatch):
     answer, trace = await a._multi_file_flow("separate things", refs=[])
     assert trace == []
     assert "couldn't" in answer.lower() or "could not" in answer.lower()
+
+
+async def test_chat_routes_to_multifile(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "index.html").write_text(
+        "<html><style>a{}</style></html>\n", encoding="utf-8"
+    )
+    a = AgentCore(session_id="pytest_chat_multi")
+
+    # classify() must not need a live LLM — force a harmless task type.
+    monkeypatch.setattr(a.planner, "classify", lambda msg: "file_edit")
+
+    called = {}
+
+    async def fake_multi(message, refs):
+        called["message"] = message
+        called["refs"] = refs
+        return "multi done", [{"tool": "write_file"}]
+
+    monkeypatch.setattr(a, "_multi_file_flow", fake_multi)
+
+    answer, trace = await a.chat("separate index.html into separate files")
+
+    assert answer == "multi done"
+    assert called["message"] == "separate index.html into separate files"
+
+
+async def test_chat_single_file_still_uses_file_op(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_chat_single")
+    monkeypatch.setattr(a.planner, "classify", lambda msg: "file_edit")
+
+    multi_called = {"hit": False}
+
+    async def fake_multi(message, refs):
+        multi_called["hit"] = True
+        return "x", []
+
+    monkeypatch.setattr(a, "_multi_file_flow", fake_multi)
+    a._llm_edit = ScriptedLLM(["no blocks"])
+    a._llm_direct = ScriptedLLM(["FILENAME: index.html\n<html>new</html>"])
+
+    await a.chat("make me an index.html file")
+
+    assert multi_called["hit"] is False  # single-file requests skip the multi flow

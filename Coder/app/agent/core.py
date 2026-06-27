@@ -939,7 +939,10 @@ class AgentCore:
 
         task_type = self.planner.classify(clean_message)
 
-        if _wants_file_op(clean_message) or task_type == "file_edit":
+        if wants_multifile(clean_message):
+            # Plan + execute several file operations in one turn.
+            answer, trace = await self._multi_file_flow(clean_message, refs=at_refs)
+        elif _wants_file_op(clean_message) or task_type == "file_edit":
             # Create/update a single file deterministically; an @ref pins the target.
             target = self._resolve_ref(at_refs)
             answer, trace = await self._file_op_flow(clean_message, target=target)
