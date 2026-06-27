@@ -83,9 +83,7 @@ _FILE_OP_TARGET_RE = re.compile(
 
 def _wants_file_op(message: str) -> bool:
     """True when the message asks to create/edit a file on disk (not just show code)."""
-    return bool(
-        _FILE_OP_VERB_RE.search(message) and _FILE_OP_TARGET_RE.search(message)
-    )
+    return bool(_FILE_OP_VERB_RE.search(message) and _FILE_OP_TARGET_RE.search(message))
 
 
 _FILENAME_IN_MSG_RE = re.compile(r"\b([\w./-]+\.\w{1,6})\b")
@@ -144,6 +142,25 @@ def _infer_filename(message: str) -> str:
     return "output.txt"
 
 
+# Per-extension content guard — the 3B model otherwise writes JS into a .css
+# file (and vice-versa) when a request mentions several languages at once.
+_EXT_GUARD: dict[str, str] = {
+    ".css": "This file is CSS. Output ONLY CSS rules and selectors. "
+    "Do NOT include any HTML tags or JavaScript.",
+    ".js": "This file is JavaScript. Output ONLY JavaScript. "
+    "Do NOT include any HTML tags, <script> wrappers, or CSS.",
+    ".ts": "This file is TypeScript. Output ONLY TypeScript. No HTML or CSS.",
+    ".html": 'This file is HTML. Link external CSS with <link rel="stylesheet"> '
+    "and external JS with <script src> — do NOT inline large blocks.",
+    ".py": "This file is Python. Output ONLY Python source.",
+}
+
+
+def _extension_guard(filename: str) -> str:
+    """Return a one-line content rule for the file's extension, or '' if unknown."""
+    return _EXT_GUARD.get(Path(filename).suffix.lower(), "")
+
+
 _FENCE_BLOCK_RE = re.compile(r"```[\w+.-]*\n(.*?)\n?```", re.DOTALL)
 
 
@@ -174,7 +191,7 @@ def _parse_file_output(raw: str, fallback: str) -> tuple[str, str]:
     m = re.search(r"^\s*FILENAME:\s*(\S+)\s*$", text, re.IGNORECASE | re.MULTILINE)
     if m:
         name = m.group(1).strip().strip("`\"'")
-        text = text[m.end():].lstrip("\n")
+        text = text[m.end() :].lstrip("\n")
     content = _strip_code_fences(text)
     return (name or "output.txt"), content
 
@@ -253,9 +270,7 @@ def _apply_block_linewise(content: str, search: str, replace: str) -> str | None
                 if file_indent.endswith(search_indent)
                 else ""
             )
-            r_lines = [
-                (pad + rl if rl.strip() else rl) for rl in replace.split("\n")
-            ]
+            r_lines = [(pad + rl if rl.strip() else rl) for rl in replace.split("\n")]
             return "\n".join(c_lines[:i] + r_lines + c_lines[i + n :])
     return None
 
@@ -299,7 +314,9 @@ class AgentCore:
         self.planner = Planner()
         self._llm = get_llm(temperature=0.1, json_mode=True)
         self._llm_direct = get_llm(temperature=0.2, json_mode=False)
-        self._llm_edit = get_llm(temperature=0.0, json_mode=False)  # format-strict edits
+        self._llm_edit = get_llm(
+            temperature=0.0, json_mode=False
+        )  # format-strict edits
         self._llm_stream = get_streaming_llm(temperature=0.1)
         self._project_path: str | None = None
         self._skills_context: str = ""
@@ -632,6 +649,9 @@ class AgentCore:
         sys_parts.append(_FILE_GEN_INSTRUCTIONS)
 
         ctx = f"User request: {user_message}\n\nWorking directory: {workdir}"
+        guard = _extension_guard(filename) if filename else ""
+        if guard:
+            ctx += f"\n\nIMPORTANT: {guard}"
         if full_existing:
             ctx += (
                 f"\n\nThe file '{filename}' already exists. Apply the requested change "
@@ -655,7 +675,11 @@ class AgentCore:
             "write_file", {"path": str(out_path), "content": content}
         )
         trace = [
-            {"tool": "write_file", "arguments": {"path": str(out_path)}, "result": result}
+            {
+                "tool": "write_file",
+                "arguments": {"path": str(out_path)},
+                "result": result,
+            }
         ]
 
         if result.get("success"):
@@ -684,8 +708,11 @@ class AgentCore:
             sys_parts.append(f"\n## Active Skills\n{self._skills_context}")
         sys_parts.append(_EDIT_INSTRUCTIONS)
 
+        guard = _extension_guard(filename)
+        guard_line = f"IMPORTANT: {guard}\n\n" if guard else ""
         ctx = (
             f"File: {filename}\nCurrent content:\n{full_content[:6000]}\n\n"
+            f"{guard_line}"
             f"Request: {user_message}\n\n"
             f"Output the SEARCH/REPLACE block(s) now:"
         )
