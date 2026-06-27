@@ -86,6 +86,38 @@ def _wants_file_op(message: str) -> bool:
     return bool(_FILE_OP_VERB_RE.search(message) and _FILE_OP_TARGET_RE.search(message))
 
 
+# A separation/restructure verb that implies touching more than one file.
+_MULTIFILE_VERB_RE = re.compile(
+    r"\b(separate|split|extract|reorganize|reorganise|restructure)\b",
+    re.IGNORECASE,
+)
+_MOVE_INTO_FILES_RE = re.compile(
+    r"\bmove\b.*\binto\b.*\bfiles?\b", re.IGNORECASE | re.DOTALL
+)
+_FILETYPE_RE = re.compile(
+    r"\b(html|css|js|javascript|ts|typescript|python|json|scss)\b", re.IGNORECASE
+)
+
+
+def wants_multifile(message: str) -> bool:
+    """True when the request implies operating on several files at once.
+
+    Catches "separate/split/extract … files" and "move the css and js into
+    separate files". Deliberately tighter than _wants_file_op so ordinary
+    single-file create/edit requests still go through _file_op_flow.
+    """
+    if _MOVE_INTO_FILES_RE.search(message):
+        return True
+    if not _MULTIFILE_VERB_RE.search(message):
+        return False
+    if re.search(r"\bfiles\b", message, re.IGNORECASE):  # plural "files"
+        return True
+    # …or it names two or more distinct languages to pull apart.
+    types = {m.lower() for m in _FILETYPE_RE.findall(message)}
+    types.discard("ts")  # avoid double-counting typescript/ts overlap noise
+    return len(types) >= 2
+
+
 _FILENAME_IN_MSG_RE = re.compile(r"\b([\w./-]+\.\w{1,6})\b")
 
 # keyword → default filename when the user names no explicit file

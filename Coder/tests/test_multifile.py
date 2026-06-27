@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.agent.core import _extension_guard
+from app.agent.core import _extension_guard, wants_multifile
 
 
 class ScriptedLLM:
@@ -34,3 +34,29 @@ def test_extension_guard_js():
 
 def test_extension_guard_unknown_is_empty():
     assert _extension_guard("notes.txt") == ""
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "separate the html, css and js into separate files",
+        "split index.html into separate files",
+        "extract the styles and scripts into their own files",
+        "move the css and javascript out of index.html into separate files",
+    ],
+)
+def test_wants_multifile_true(msg):
+    assert wants_multifile(msg) is True
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "make me an index.html file",  # single-file create
+        "edit index.html to change the title",  # single-file edit
+        "write a python function that adds two numbers",
+        "explain what a decorator does",
+    ],
+)
+def test_wants_multifile_false(msg):
+    assert wants_multifile(msg) is False
