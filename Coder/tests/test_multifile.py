@@ -63,6 +63,35 @@ def test_wants_multifile_false(msg):
     assert wants_multifile(msg) is False
 
 
+@pytest.mark.parametrize(
+    "msg",
+    [
+        # eval-driven: explicit multi-file CREATE ("create three files: a, b, c")
+        "Create three files: index.html, styles.css and script.js",
+        "make index.html, styles.css and app.js",
+        "generate two separate files for the frontend",
+        "build a webpage using multiple files",
+        "create several files for the project",
+    ],
+)
+def test_wants_multifile_true_explicit_create(msg):
+    assert wants_multifile(msg) is True
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        # ordinary single-file creates must NOT be pulled into the multi-file flow
+        "create an index.html file for a landing page",
+        "make me a styles.css file",
+        "write a config.json file with a version key",
+        "what is the difference between a.py and b.py",
+    ],
+)
+def test_wants_multifile_false_single_create(msg):
+    assert wants_multifile(msg) is False
+
+
 def test_parse_file_plan_basic():
     raw = """{"files": [
         {"filename": "styles.css", "action": "create", "instruction": "move the css here"},

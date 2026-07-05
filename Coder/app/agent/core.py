@@ -90,17 +90,45 @@ _MOVE_INTO_FILES_RE = re.compile(
 _FILETYPE_RE = re.compile(
     r"\b(html|css|js|javascript|ts|typescript|python|json|scss)\b", re.IGNORECASE
 )
+# Explicit multi-file *creation* signals (eval-driven: the golden suite showed
+# "create three files: a, b and c" was misrouted to the single-file flow).
+_CREATE_VERB_RE = re.compile(
+    r"\b(create|make|build|generate|write|scaffold)\b", re.IGNORECASE
+)
+# "three files", "3 files", "two separate files", "multiple/several files".
+_MULTIPLE_FILES_RE = re.compile(
+    r"\b(two|three|four|five|six|several|multiple|many|\d+)\s+"
+    r"(?:separate\s+|different\s+)?files?\b",
+    re.IGNORECASE,
+)
+# Two filenames adjacent via a list separator: "styles.css and script.js",
+# "index.html, app.js". Requires the separator so a lone referenced file
+# ("create index.html that imports data.json") is NOT treated as multi-file.
+_FILENAME_LIST_RE = re.compile(
+    r"[\w-]+\.\w{1,6}\s*(?:,|and|&)\s*[\w-]+\.\w{1,6}", re.IGNORECASE
+)
 
 
 def wants_multifile(message: str) -> bool:
     """True when the request implies operating on several files at once.
 
-    Catches "separate/split/extract … files" and "move the css and js into
-    separate files". Deliberately tighter than _wants_file_op so ordinary
-    single-file create/edit requests still go through _file_op_flow.
+    Catches "separate/split/extract … files", "move the css and js into
+    separate files", and explicit multi-file creation ("create three files:
+    index.html, styles.css and script.js"). Deliberately tighter than
+    _wants_file_op so ordinary single-file create/edit requests still go
+    through _file_op_flow.
     """
     if _MOVE_INTO_FILES_RE.search(message):
         return True
+
+    # Explicit multi-file creation: a create verb plus either an N-files phrase
+    # or a comma/and-separated list of two or more filenames.
+    if _CREATE_VERB_RE.search(message):
+        if _MULTIPLE_FILES_RE.search(message):
+            return True
+        if _FILENAME_LIST_RE.search(message):
+            return True
+
     if not _MULTIFILE_VERB_RE.search(message):
         return False
     if re.search(r"\bfiles\b", message, re.IGNORECASE):  # plural "files"
