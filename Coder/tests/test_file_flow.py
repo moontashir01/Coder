@@ -1,25 +1,18 @@
-"""Tests for file-creation routing, loose-JSON normalization, and the file_op flow.
+"""Tests for file-creation routing and the file_op flow.
 
 All offline: the LLM is a scripted fake, file writes go to tmp_path.
 """
+
 import os
 from types import SimpleNamespace
 
 import pytest
 
 from app.agent import core as core_mod
-from app.agent.core import (
-    AgentCore,
-    _wants_file_op,
-    _extract_filename,
-    _infer_filename,
-    _parse_file_output,
-    _strip_code_fences,
-    _extract_at_refs,
-    _strip_at_refs,
-    _parse_search_replace,
-    _apply_search_replace,
-)
+from app.agent.core import (AgentCore, _apply_search_replace, _extract_at_refs,
+                            _extract_filename, _infer_filename,
+                            _parse_file_output, _parse_search_replace,
+                            _strip_at_refs, _strip_code_fences, _wants_file_op)
 
 
 def _sr_block(search: str, replace: str) -> str:
@@ -41,23 +34,30 @@ class ScriptedLLM:
 # Intent heuristic
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("msg", [
-    "make me a html file, it should mimic a nicely built website",
-    "create an index.html file for a landing page",
-    "edit index.html to change the title",
-    "add a navbar to index.html",
-    "write a CSS file for the theme",
-])
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "make me a html file, it should mimic a nicely built website",
+        "create an index.html file for a landing page",
+        "edit index.html to change the title",
+        "add a navbar to index.html",
+        "write a CSS file for the theme",
+    ],
+)
 def test_wants_file_op_true(msg):
     assert _wants_file_op(msg) is True
 
 
-@pytest.mark.parametrize("msg", [
-    "write a python function that adds two numbers",
-    "explain what a decorator does",
-    "what is the time complexity of quicksort",
-    "create a class that represents a point",
-])
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "write a python function that adds two numbers",
+        "explain what a decorator does",
+        "what is the time complexity of quicksort",
+        "create a class that represents a point",
+    ],
+)
 def test_wants_file_op_false(msg):
     assert _wants_file_op(msg) is False
 
@@ -65,6 +65,7 @@ def test_wants_file_op_false(msg):
 # ---------------------------------------------------------------------------
 # Filename + content parsing
 # ---------------------------------------------------------------------------
+
 
 def test_extract_filename():
     assert _extract_filename("edit index.html now") == "index.html"
@@ -88,7 +89,9 @@ def test_strip_code_fences():
 
 
 def test_parse_file_output_with_filename_header():
-    name, content = _parse_file_output("FILENAME: page.html\n<html></html>", fallback="x.txt")
+    name, content = _parse_file_output(
+        "FILENAME: page.html\n<html></html>", fallback="x.txt"
+    )
     assert name == "page.html"
     assert content == "<html></html>"
 
@@ -100,50 +103,9 @@ def test_parse_file_output_fallback():
 
 
 # ---------------------------------------------------------------------------
-# Loose-JSON normalization + arg coercion (uses a real registry)
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def agent(tmp_path, monkeypatch):
-    # Write DB/chroma side effects into tmp, not the repo.
-    monkeypatch.chdir(tmp_path)
-    return AgentCore(session_id="pytest_fileflow")
-
-
-def test_normalize_flattened_tool_call(agent):
-    out = agent._normalize_action(
-        {"action": "write_file", "path": "a.txt", "content": "hi"}
-    )
-    assert out["action"] == "tool_call"
-    assert out["tool"] == "write_file"
-    assert out["arguments"] == {"path": "a.txt", "content": "hi"}
-
-
-def test_normalize_tool_without_action(agent):
-    out = agent._normalize_action({"tool": "read_file", "arguments": {"path": "x"}})
-    assert out["action"] == "tool_call"
-    assert out["tool"] == "read_file"
-
-
-def test_normalize_bare_answer(agent):
-    out = agent._normalize_action({"answer": "done"})
-    assert out == {"action": "final_answer", "answer": "done"}
-
-
-def test_normalize_passthrough(agent):
-    a = {"action": "final_answer", "answer": "x"}
-    assert agent._normalize_action(a) is a
-
-
-def test_coerce_args_file_path_alias(agent):
-    coerced = agent._coerce_args("write_file", {"file_path": "a.txt", "content": "hi"})
-    assert coerced["path"] == "a.txt"
-    assert "file_path" not in coerced
-
-
-# ---------------------------------------------------------------------------
 # _file_op_flow — deterministic create/update (scripted LLM, real write_file)
 # ---------------------------------------------------------------------------
+
 
 async def test_file_op_flow_creates_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
@@ -179,6 +141,7 @@ async def test_file_op_flow_updates_existing(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # @ file references (Slice 1)
 # ---------------------------------------------------------------------------
+
 
 def test_extract_at_refs():
     assert _extract_at_refs("change @src/app.py and @utils.py now") == [
@@ -240,6 +203,7 @@ async def test_at_ref_targets_file_over_message_guess(tmp_path, monkeypatch):
 # Surgical SEARCH/REPLACE editing (Slice 3)
 # ---------------------------------------------------------------------------
 
+
 def test_parse_search_replace_single():
     blocks = _parse_search_replace(_sr_block("old line", "new line"))
     assert blocks == [("old line", "new line")]
@@ -264,7 +228,9 @@ def test_apply_exact_match_changes_only_target():
 def test_apply_whitespace_tolerant():
     content = "def f():\n    return 1\n"
     # SEARCH has different trailing whitespace than the file
-    new, applied, failed = _apply_search_replace(content, [("    return 1   ", "    return 2")])
+    new, applied, failed = _apply_search_replace(
+        content, [("    return 1   ", "    return 2")]
+    )
     assert "return 2" in new
     assert applied == 1
 
@@ -292,14 +258,19 @@ async def test_surgical_edit_changes_one_line(tmp_path, monkeypatch):
     f.write_text('def greet(name):\n    return f"Hello {name}"\n', encoding="utf-8")
 
     a = AgentCore(session_id="pytest_surgical")
-    a._llm_edit = ScriptedLLM([
-        _sr_block('    return f"Hello {name}"', '    return f"Goodbye {name}"')
-    ])
+    a._llm_edit = ScriptedLLM(
+        [_sr_block('    return f"Hello {name}"', '    return f"Goodbye {name}"')]
+    )
 
-    result = await a._surgical_edit("app.py", f, f.read_text(encoding="utf-8"), "say goodbye")
+    result = await a._surgical_edit(
+        "app.py", f, f.read_text(encoding="utf-8"), "say goodbye"
+    )
     assert result is not None
     answer, trace = result
-    assert f.read_text(encoding="utf-8") == 'def greet(name):\n    return f"Goodbye {name}"\n'
+    assert (
+        f.read_text(encoding="utf-8")
+        == 'def greet(name):\n    return f"Goodbye {name}"\n'
+    )
     assert "Edited" in answer
     assert trace[0]["result"]["success"] is True
 

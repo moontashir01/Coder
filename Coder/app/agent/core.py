@@ -1,10 +1,9 @@
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from app.agent.executor import Executor
 from app.agent.planner import Planner, _extract_json
@@ -34,27 +33,18 @@ def _get_mcp_manager_class():
 _SYSTEM_PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "system.md"
 
 
-def _tool_loop_prompt(tool_names: list[str], workdir: str) -> str:
-    names = ", ".join(tool_names) if tool_names else "(none)"
-    return f"""You can either answer directly or call ONE tool. Output ONLY valid JSON, nothing else.
+def _tool_guidance(workdir: str) -> str:
+    """System-prompt block for the native tool-calling loop.
 
-To call a tool, use this EXACT shape — the tool name goes in "tool", parameters go inside "arguments":
-{{"action": "tool_call", "tool": "write_file", "arguments": {{"path": "index.html", "content": "<full file text>"}}}}
+    Tool schemas are provided via ChatOllama.bind_tools — no JSON protocol
+    text belongs here, only behavioral guidance.
+    """
+    return f"""Working directory: {workdir}
 
-To answer (only when no file/command access is needed):
-{{"action": "final_answer", "answer": "<your full response, INCLUDING the actual code>"}}
-
-VALID TOOL NAMES — you may ONLY use these, never invent others:
-{names}
-
-Working directory: {workdir}
-When asked to create or save a file, call write_file (or create_file) with a relative path
-like "index.html" — the file is saved in the working directory above.
-
-Rules:
-- "action" is ALWAYS the literal string "tool_call" or "final_answer" — never a tool name.
-- If the task asks you to create, save, or write a file, you MUST call write_file/create_file. Do not just print the code.
-- Never call a tool name that is not in the list above."""
+You have access to real tools via native function calling. Use a tool when the
+task needs file or command access; answer directly (in plain text) when it does not.
+When asked to create or save a file, you MUST call write_file (or create_file)
+with a relative path like "index.html" — do not just print the code."""
 
 
 def _load_system_prompt() -> str:
@@ -407,7 +397,9 @@ class AgentCore:
         self.memory = ConversationMemory(session_id=session_id)
         self.executor = Executor(self.registry)
         self.planner = Planner()
-        self._llm = get_llm(temperature=0.1, json_mode=True)
+        # Tool loop uses native function calling (bind_tools) — plain mode, NOT
+        # json_mode: format="json" would fight the tool-call output format.
+        self._llm = get_llm(temperature=0.1, json_mode=False)
         self._llm_direct = get_llm(temperature=0.2, json_mode=False)
         self._llm_edit = get_llm(
             temperature=0.0, json_mode=False
@@ -468,10 +460,10 @@ class AgentCore:
         if extra_context:
             parts.append(f"\n## Additional Context\n{extra_context}")
 
-        # Tool loop instruction (lists the real registered tool names + workdir)
+        # Tool-loop guidance (workdir + when to use tools; schemas come from bind_tools)
         if include_tool_protocol:
             workdir = self._project_path or str(Path.cwd())
-            parts.append("\n" + _tool_loop_prompt(self.registry.names(), workdir))
+            parts.append("\n" + _tool_guidance(workdir))
 
         system_text = "\n".join(parts)
 
@@ -483,114 +475,49 @@ class AgentCore:
         return msgs
 
     # ------------------------------------------------------------------
-    # Tool-call loop (ReAct-style)
+    # Tool-call loop (native function calling)
     # ------------------------------------------------------------------
-
-    def _parse_action(self, text: str) -> dict | None:
-        try:
-            return _extract_json(text)
-        except Exception:
-            return None
-
-    def _normalize_action(self, action: dict) -> dict:
-        """Coerce the loose JSON shapes a small model emits into the canonical form.
-
-        Handles e.g. a flattened tool call where the model puts the tool name in
-        "action" and the arguments at the top level:
-            {"action": "write_file", "path": "x", "content": "..."}
-        → {"action": "tool_call", "tool": "write_file", "arguments": {...}}
-        """
-        if not isinstance(action, dict):
-            return action
-        act = action.get("action")
-
-        if act in ("tool_call", "final_answer"):
-            return action
-
-        valid_tools = set(self.registry.names())
-
-        # Flattened: tool name lives in "action"
-        if isinstance(act, str) and act in valid_tools:
-            if isinstance(action.get("arguments"), dict):
-                args = action["arguments"]
-            else:
-                args = {k: v for k, v in action.items() if k != "action"}
-            return {"action": "tool_call", "tool": act, "arguments": args}
-
-        # No "action" but a recognizable tool field
-        tool = action.get("tool")
-        if isinstance(tool, str) and tool in valid_tools:
-            args = action.get("arguments")
-            if not isinstance(args, dict):
-                args = {k: v for k, v in action.items() if k not in ("tool", "action")}
-            return {"action": "tool_call", "tool": tool, "arguments": args}
-
-        # A bare answer
-        if "answer" in action:
-            return {"action": "final_answer", "answer": action["answer"]}
-
-        return action
-
-    def _coerce_args(self, tool_name: str, args: dict) -> dict:
-        """Map common argument-name synonyms onto the tool's real schema (e.g. file_path → path)."""
-        if not isinstance(args, dict):
-            return {}
-        try:
-            props = self.registry.get(tool_name).parameters.get("properties", {})
-        except Exception:
-            return args
-        if "path" in props and "path" not in args:
-            for alt in ("file_path", "filepath", "filename", "file"):
-                if alt in args:
-                    args = dict(args)
-                    args["path"] = args.pop(alt)
-                    break
-        return args
 
     async def _run_tool_loop(
         self,
         messages: list,
         max_steps: int = 8,
     ) -> tuple[str, list[dict]]:
-        """Async tool-call loop. Returns (final_answer, tool_trace)."""
+        """Async tool-call loop via native function calling.
+
+        The model emits structured tool calls through ChatOllama.bind_tools —
+        no hand-rolled JSON protocol, no output parsing/repair. A response
+        without tool calls is the final answer. Returns (final_answer, trace).
+        """
         tool_trace: list[dict] = []
         current_messages = list(messages)
         fail_counts: dict[str, int] = {}  # §11: bail out of doomed retries
+        llm = self._llm.bind_tools(self.registry.to_openai_tools())
 
-        for step in range(max_steps):
+        for _step in range(max_steps):
             retries = 0
-            raw = ""
+            response = None
             while retries <= settings.max_tool_retries:
                 try:
-                    response = self._llm.invoke(current_messages)
-                    raw = response.content
+                    response = llm.invoke(current_messages)
                     break
                 except Exception as e:
                     retries += 1
                     if retries > settings.max_tool_retries:
                         return f"LLM error after retries: {e}", tool_trace
 
-            action = self._parse_action(raw)
-            if action is not None:
-                action = self._normalize_action(action)
+            tool_calls = list(getattr(response, "tool_calls", None) or [])
+            if not tool_calls:
+                return str(getattr(response, "content", "") or ""), tool_trace
 
-            if action is None:
-                retries_left = settings.max_tool_retries - step
-                if retries_left <= 0:
-                    return f"Could not parse LLM output: {raw[:200]}", tool_trace
-                current_messages.append(
-                    HumanMessage(
-                        content=f"ERROR: Your output was not valid JSON. Try again.\nYour output: {raw[:200]}"
-                    )
-                )
-                continue
-
-            if action.get("action") == "final_answer":
-                return action.get("answer", raw), tool_trace
-
-            if action.get("action") == "tool_call":
-                tool_name = action.get("tool", "")
-                arguments = self._coerce_args(tool_name, action.get("arguments", {}))
+            # The assistant message carrying the tool calls must precede the
+            # ToolMessages that answer them.
+            current_messages.append(response)
+            give_up: str | None = None
+            for call in tool_calls:
+                tool_name = call.get("name", "")
+                arguments = call.get("args") or {}
+                call_id = call.get("id") or ""
 
                 result = await self.executor.execute(tool_name, arguments)
                 tool_trace.append(
@@ -598,51 +525,44 @@ class AgentCore:
                 )
 
                 error = result.get("error") or ""
-                # Small models invent tool names — correct them firmly instead of
-                # letting them retry the same hallucinated tool until max_steps.
                 if not result.get("success") and "Tool not found" in error:
+                    # Model invented a tool name — correct it firmly instead of
+                    # letting it retry the hallucination until max_steps.
                     valid = ", ".join(self.registry.names())
-                    current_messages.append(
-                        HumanMessage(
-                            content=(
-                                f"ERROR: '{tool_name}' is NOT a real tool and was not run. "
-                                f"The only valid tools are: {valid}. "
-                                f"If you do not need any of these, respond NOW with "
-                                f'{{"action": "final_answer", "answer": "<the complete code>"}}.'
-                            )
-                        )
+                    feedback = (
+                        f"ERROR: '{tool_name}' is NOT a real tool and was not run. "
+                        f"The only valid tools are: {valid}. "
+                        f"If you do not need any of these, answer directly now."
                     )
-                    continue
-
-                # §11: structured recovery for real tool failures. Give one
-                # targeted hint, then bail out gracefully instead of letting the
-                # model retry a doomed call until max_steps.
-                if not result.get("success"):
+                elif not result.get("success"):
+                    # §11: structured recovery — one targeted hint, then bail
+                    # out gracefully instead of retrying a doomed call.
                     fail_counts[tool_name] = fail_counts.get(tool_name, 0) + 1
                     if fail_counts[tool_name] >= settings.max_tool_failures:
                         category = classify_error(error)
-                        return (
-                            f"Could not complete the request: tool '{tool_name}' failed "
-                            f"repeatedly ({category}). Last error: {error[:200]}"
-                        ), tool_trace
+                        give_up = (
+                            f"Could not complete the request: tool '{tool_name}' "
+                            f"failed repeatedly ({category}). "
+                            f"Last error: {error[:200]}"
+                        )
                     try:
                         hints = self.registry.get(tool_name).error_hints
                     except Exception:
                         hints = None
-                    current_messages.append(
-                        HumanMessage(content=recovery_hint(tool_name, error, hints))
+                    feedback = recovery_hint(tool_name, error, hints)
+                else:
+                    result_text = result.get("result") or error or "No output"
+                    feedback = (
+                        f"Tool result for {tool_name}:\n"
+                        f"{_truncate_context(result_text, 2000)}"
                     )
-                    continue
 
-                result_text = result.get("result") or error or "No output"
                 current_messages.append(
-                    HumanMessage(
-                        content=f"Tool result for {tool_name}:\n{_truncate_context(result_text, 2000)}"
-                    )
+                    ToolMessage(content=feedback, tool_call_id=call_id)
                 )
-                continue
 
-            return raw, tool_trace
+            if give_up:
+                return give_up, tool_trace
 
         return "Reached maximum steps without a final answer.", tool_trace
 

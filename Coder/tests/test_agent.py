@@ -7,10 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.agent.tool_registry import ToolDefinition, ToolRegistry, create_registry
-from app.agent.executor import Executor
 from app.agent import planner as planner_mod
+from app.agent.executor import Executor
 from app.agent.planner import Planner, _extract_json
+from app.agent.tool_registry import (ToolDefinition, ToolRegistry,
+                                     create_registry)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -244,8 +245,40 @@ def test_planner_plan_multi_step():
 
 
 # ---------------------------------------------------------------------------
-# AgentCore tool loop (full ReAct cycle with scripted LLM)
+# AgentCore tool loop — native function calling (bind_tools + AIMessage.tool_calls)
 # ---------------------------------------------------------------------------
+
+
+from langchain_core.messages import AIMessage, ToolMessage
+
+
+class ToolCallingLLM:
+    """Scripted fake for the native tool-calling loop.
+
+    `outputs` is a list of AIMessage objects; `.tool_calls` on each drives the
+    loop. bind_tools records what was bound and returns self, like the real
+    ChatOllama API.
+    """
+
+    def __init__(self, outputs):
+        self._outputs = list(outputs)
+        self.calls = 0
+        self.bound_tools = None
+        self.seen_messages: list[list] = []
+
+    def bind_tools(self, tools):
+        self.bound_tools = tools
+        return self
+
+    def invoke(self, messages):
+        self.seen_messages.append(list(messages))
+        out = self._outputs[min(self.calls, len(self._outputs) - 1)]
+        self.calls += 1
+        return out
+
+
+def _tc(name, args, call_id="call_1"):
+    return {"name": name, "args": args, "id": call_id, "type": "tool_call"}
 
 
 @pytest.fixture
@@ -258,10 +291,10 @@ def agent():
 
 
 async def test_agent_tool_loop_runs_tool_then_answers(agent):
-    agent._llm = ScriptedLLM(
+    agent._llm = ToolCallingLLM(
         [
-            '{"action": "tool_call", "tool": "echo", "arguments": {"text": "hi"}}',
-            '{"action": "final_answer", "answer": "all done"}',
+            AIMessage(content="", tool_calls=[_tc("echo", {"text": "hi"})]),
+            AIMessage(content="all done"),
         ]
     )
     answer, trace = await agent._run_tool_loop(messages=[])
@@ -272,24 +305,70 @@ async def test_agent_tool_loop_runs_tool_then_answers(agent):
 
 
 async def test_agent_tool_loop_direct_final_answer(agent):
-    agent._llm = ScriptedLLM(['{"action": "final_answer", "answer": "quick"}'])
+    agent._llm = ToolCallingLLM([AIMessage(content="quick")])
     answer, trace = await agent._run_tool_loop(messages=[])
     assert answer == "quick"
     assert trace == []
 
 
-async def test_agent_tool_loop_handles_unparseable_output(agent):
-    agent._llm = ScriptedLLM(["not json", "still not", "nope", "garbage"])
-    answer, trace = await agent._run_tool_loop(messages=[])
-    assert "could not parse" in answer.lower()
+async def test_tool_loop_binds_registry_tools(agent):
+    llm = ToolCallingLLM([AIMessage(content="ok")])
+    agent._llm = llm
+    await agent._run_tool_loop(messages=[])
+    bound_names = {t["function"]["name"] for t in llm.bound_tools}
+    assert "echo" in bound_names
+    assert "write_file" in bound_names
 
 
-def test_agent_parse_action(agent):
-    assert (
-        agent._parse_action('{"action": "final_answer", "answer": "x"}')["action"]
-        == "final_answer"
+async def test_tool_loop_feeds_back_tool_message_with_call_id(agent):
+    llm = ToolCallingLLM(
+        [
+            AIMessage(content="", tool_calls=[_tc("echo", {"text": "hi"}, "call_42")]),
+            AIMessage(content="done"),
+        ]
     )
-    assert agent._parse_action("garbage") is None
+    agent._llm = llm
+    await agent._run_tool_loop(messages=[])
+    # 2nd invoke must see the assistant tool-call message + a paired ToolMessage
+    second = llm.seen_messages[1]
+    tool_msgs = [m for m in second if isinstance(m, ToolMessage)]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0].tool_call_id == "call_42"
+    assert "echo:hi" in tool_msgs[0].content
+
+
+async def test_tool_loop_executes_multiple_calls_in_one_turn(agent):
+    agent._llm = ToolCallingLLM(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _tc("echo", {"text": "a"}, "call_a"),
+                    _tc("echo", {"text": "b"}, "call_b"),
+                ],
+            ),
+            AIMessage(content="both done"),
+        ]
+    )
+    answer, trace = await agent._run_tool_loop(messages=[])
+    assert answer == "both done"
+    assert [t["result"]["result"] for t in trace] == ["echo:a", "echo:b"]
+
+
+async def test_tool_loop_corrects_hallucinated_tool(agent):
+    llm = ToolCallingLLM(
+        [
+            AIMessage(content="", tool_calls=[_tc("banana", {})]),
+            AIMessage(content="answered directly"),
+        ]
+    )
+    agent._llm = llm
+    answer, trace = await agent._run_tool_loop(messages=[])
+    assert answer == "answered directly"
+    # firm correction listing the real tools went back to the model
+    correction = [m for m in llm.seen_messages[1] if isinstance(m, ToolMessage)][0]
+    assert "NOT a real tool" in correction.content
+    assert "write_file" in correction.content
 
 
 # ---------------------------------------------------------------------------
@@ -393,10 +472,10 @@ def _failing_tool():
 
 async def test_tool_loop_recovers_after_single_failure(agent):
     agent.registry.register(_failing_tool())
-    agent._llm = ScriptedLLM(
+    agent._llm = ToolCallingLLM(
         [
-            '{"action": "tool_call", "tool": "boom", "arguments": {}}',
-            '{"action": "final_answer", "answer": "recovered"}',
+            AIMessage(content="", tool_calls=[_tc("boom", {})]),
+            AIMessage(content="recovered"),
         ]
     )
     answer, trace = await agent._run_tool_loop(messages=[])
@@ -407,9 +486,7 @@ async def test_tool_loop_recovers_after_single_failure(agent):
 async def test_tool_loop_gives_up_after_repeated_failures(agent):
     agent.registry.register(_failing_tool())
     # Model stubbornly calls the same failing tool every turn.
-    agent._llm = ScriptedLLM(
-        ['{"action": "tool_call", "tool": "boom", "arguments": {}}']
-    )
+    agent._llm = ToolCallingLLM([AIMessage(content="", tool_calls=[_tc("boom", {})])])
     answer, trace = await agent._run_tool_loop(messages=[], max_steps=8)
     # Must bail out well before max_steps instead of looping 8 times.
     assert len(trace) <= 3

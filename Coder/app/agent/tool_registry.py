@@ -50,6 +50,20 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._tools.keys())
 
+    def to_openai_tools(self) -> list[dict]:
+        """All tools in OpenAI function-calling format, for ChatOllama.bind_tools()."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                },
+            }
+            for t in self._tools.values()
+        ]
+
     def summary(self) -> str:
         lines = []
         for t in self._tools.values():
@@ -63,18 +77,12 @@ class ToolRegistry:
 
 
 def _build_builtin_tools() -> list[ToolDefinition]:
-    from app.tools.filesystem import (
-        read_file,
-        write_file,
-        edit_file,
-        create_file,
-        delete_file,
-        list_directory,
-        search_files,
-    )
+    from app.tools.filesystem import (create_file, delete_file, edit_file,
+                                      list_directory, read_file, search_files,
+                                      write_file)
+    from app.tools.git_tool import git_commit, git_diff, git_log, git_status
+    from app.tools.symbols_tool import find_references, find_symbol
     from app.tools.terminal import run_command
-    from app.tools.git_tool import git_status, git_diff, git_commit, git_log
-    from app.tools.symbols_tool import find_symbol, find_references
 
     return [
         ToolDefinition(
