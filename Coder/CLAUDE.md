@@ -48,14 +48,22 @@ chat(msg)
   ├─ memory.add_human(msg)
   ├─ task_type = planner.classify(msg)       # 1 LLM call → simple_qa | explanation
   │                                          #   code_generation | file_edit | multi_step
-  ├─ if _wants_file_op(msg) or task_type=="file_edit":
+  ├─ if wants_multifile(msg):
+  │      _multi_file_flow(msg)               # plan JSON → per-file _file_op_flow
+  │  elif _wants_file_op(msg) or task_type=="file_edit":
   │      _file_op_flow(msg)                  # DETERMINISTIC: gen full file → write_file
   │  elif task_type=="multi_step" and project loaded:
-  │      _build_messages() → _run_tool_loop()   # ReAct JSON tool loop
+  │      _build_messages() → _run_tool_loop()   # native tool-calling loop
   │  else:
   │      _direct_answer()                    # one plain LLM call, NO tool protocol
   └─ memory.add_ai(answer)
 ```
+
+Every successful write in `_file_op_flow` / `_surgical_edit` then runs
+**`_verify_and_repair`**: `app/agent/verify.py:check_file()` syntax-checks the file (`.py`
+in-process `compile()`, `.js` `node --check`, `.ts` `tsc --noEmit`, `.html` tag-balance parser;
+unknown ext / missing checker binary = unverifiable-ok, never "broken"), and on failure feeds the
+error back for a complete-file regeneration, capped at `settings.max_repair_attempts`.
 
 **Why three paths:** the 3B model these paths were built for is unreliable at the JSON tool
 protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-coder:7b`). So:
@@ -76,7 +84,13 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
 - **`@path` references** (`_extract_at_refs`): in any message, `@src/app.py` pins the edit *target*
   (`_resolve_ref`, prefers an existing file) and, for non-edit questions, injects the file as context
   (`_read_refs`). The `@` is stripped before the model/classifier see the text. Emails are ignored.
-- **Genuine multi-step work in a loaded project → `_run_tool_loop`** (ReAct).
+- **Split/reorganize across several files → `_multi_file_flow`** (`wants_multifile()` regex:
+  separate/split/extract… + plural "files" or ≥2 languages). One `_plan_file_ops` LLM call returns
+  `{"files": [{filename, action, instruction}]}` (`_parse_file_plan`, tolerant), then each op runs
+  through `_file_op_flow`. **Cross-file consistency:** every per-file call gets the full plan
+  manifest as `extra_context`, plus the content of already-written siblings, so
+  `<link href>`/`<script src>`/shared names line up.
+- **Genuine multi-step work in a loaded project → `_run_tool_loop`** (native tool calling).
 - **Everything else (write/explain code, Q&A) → `_direct_answer`** (one call, no tools).
 
 > **3B-era hardening — candidate for re-testing now that `qwen2.5-coder:7b` is the default.**
@@ -85,9 +99,8 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
 > - **`_wants_file_op()` regex routing** — bypasses `classify()` for file creation because 3B was
 >   unreliable at the JSON tool protocol. 7B may not need this workaround; candidate to route file
 >   creation back through `classify()`/the tool loop and A/B the result.
-> - **`_normalize_action()` / `_coerce_args()`** JSON-repair in the tool loop — coerces flattened /
->   bare / synonym-keyed tool calls. 7B likely emits canonical JSON more often; measure how often the
->   repair actually fires before loosening.
+> - ~~`_normalize_action()` / `_coerce_args()` JSON-repair~~ — **resolved 2026-07** by roadmap
+>   Tier 1 #2: the loop now uses native function calling and the repair machinery is deleted.
 > - **`_surgical_edit` one-retry-then-whole-file-rewrite fallback** — 3B routinely dropped SEARCH
 >   indentation and produced unmatched blocks. 7B may hit the exact/tolerant matchers more reliably,
 >   so the rewrite fallback may fire less; re-measure the surgical-vs-rewrite ratio.
@@ -100,27 +113,25 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
 >   `_file_op_flow`) still describe 3B behavior as their rationale — left intact deliberately; they
 >   document *why* the guards exist, not a claim that 7B misbehaves identically.
 
-**`prompts/system.md` must NOT contain the tool-call JSON instructions** — the tool loop gets its
-protocol from `_tool_loop_prompt()` instead. If you put tool-protocol text back in system.md it
-leaks into `_direct_answer`/`_file_op_flow` and the model emits fake tool-call JSON instead of the
-file/answer.
+**`prompts/system.md` must NOT contain tool-protocol text** — the tool loop's behavioral guidance
+comes from `_tool_guidance()` and the schemas from `bind_tools`. If you put tool-protocol text in
+system.md it leaks into `_direct_answer`/`_file_op_flow` and the model emits fake tool-call JSON
+instead of the file/answer.
 
-### Tool-call protocol (the ReAct loop)
+### Tool-call loop (native function calling)
 
-`_run_tool_loop()` prompts the LLM to emit ONLY JSON, two shapes:
-```json
-{"action": "tool_call", "tool": "<name>", "arguments": {}}
-{"action": "final_answer", "answer": "<text>"}
-```
-Small-model hardening lives here and in `_tool_loop_prompt()`:
-- The prompt **lists the real registered tool names** and tells the model to return
-  `final_answer` directly when no file/command access is needed (don't invent tools).
-- A `"Tool not found"` result triggers a **firm correction** message (lists valid tools, tells it
-  to answer now) instead of letting it retry a hallucinated tool until `max_steps`.
-- `_normalize_action()` repairs loose JSON: a flattened call
-  (`{"action":"write_file","path":...}`) or a bare `{"tool":...}`/`{"answer":...}` is coerced into
-  the canonical shape. `_coerce_args()` then maps arg synonyms (`file_path`/`filename` → `path`).
-- Unparseable output retries up to `settings.max_tool_retries`.
+`_run_tool_loop()` binds the registry (`ToolRegistry.to_openai_tools()` → OpenAI function format)
+via `ChatOllama.bind_tools()` and consumes structured `AIMessage.tool_calls` — there is **no
+hand-rolled JSON protocol and no output parsing/repair** (deleted in roadmap Tier 1 #2). Loop
+shape: a response with tool calls → execute each via the executor, feed each result back as a
+`ToolMessage` (paired by `tool_call_id`, preceded by the assistant message that carried the calls);
+a response with **no** tool calls is the final answer. The loop LLM is plain-mode — `format="json"`
+would fight native tool calls. What remains of the hardening:
+- A `"Tool not found"` result triggers a **firm correction** ToolMessage (lists valid tools, tells
+  it to answer directly) instead of letting it retry a hallucinated tool until `max_steps`.
+- Real tool failures get one `recovery_hint()` (§11), then the loop **gives up gracefully** after
+  `settings.max_tool_failures` failures of the same tool.
+- LLM invoke exceptions retry up to `settings.max_tool_retries`.
 
 ### Tool registry & executor — the central hub
 
