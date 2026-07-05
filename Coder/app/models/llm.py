@@ -1,5 +1,3 @@
-from typing import Iterator
-
 import httpx
 from langchain_ollama import ChatOllama
 
@@ -17,7 +15,9 @@ def get_llm(temperature: float = 0.1, json_mode: bool = False) -> ChatOllama:
         "model": settings.llm_model,
         "base_url": settings.ollama_base_url,
         "temperature": temperature,
-        "timeout": 30,
+        # ChatOllama has no top-level `timeout`; it must go to the underlying
+        # ollama client via client_kwargs, else it is silently dropped.
+        "client_kwargs": {"timeout": settings.llm_request_timeout_seconds},
     }
     if json_mode:
         kwargs["format"] = "json"
@@ -25,12 +25,13 @@ def get_llm(temperature: float = 0.1, json_mode: bool = False) -> ChatOllama:
 
 
 def get_streaming_llm(temperature: float = 0.1) -> ChatOllama:
+    # NB: langchain_ollama streams via .stream()/.astream() at the call site;
+    # there is no `streaming=True` ctor flag (it would be silently ignored).
     return ChatOllama(
         model=settings.llm_model,
         base_url=settings.ollama_base_url,
         temperature=temperature,
-        streaming=True,
-        timeout=30,
+        client_kwargs={"timeout": settings.llm_request_timeout_seconds},
     )
 
 

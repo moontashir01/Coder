@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 **Coder** — a fully **offline** AI coding assistant. It talks only to a local Ollama
-(`http://localhost:11434`); nothing leaves the machine. `qwen2.5-coder:3b` is the default LLM,
+(`http://localhost:11434`); nothing leaves the machine. `qwen2.5-coder:7b` is the default LLM,
 `nomic-embed-text` the only embedding model. Primary interface is a CLI/REPL. ChromaDB for
 vectors, SQLite for memory, LangChain for the Ollama wrappers.
 
@@ -14,7 +14,7 @@ vectors, SQLite for memory, LangChain for the Ollama wrappers.
 Ollama running with both models pulled:
 ```
 ollama serve
-ollama pull qwen2.5-coder:3b
+ollama pull qwen2.5-coder:7b
 ollama pull nomic-embed-text
 ```
 All Python work uses the venv (`.venv\Scripts\activate` on Windows, `source .venv/bin/activate` on Unix).
@@ -57,7 +57,8 @@ chat(msg)
   └─ memory.add_ai(answer)
 ```
 
-**Why three paths:** the 3B model is unreliable at the JSON tool protocol. So:
+**Why three paths:** the 3B model these paths were built for is unreliable at the JSON tool
+protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-coder:7b`). So:
 - **Create/edit a single file → `_file_op_flow`** (the common case). `_wants_file_op()` is a
   verb+target regex ("make/create/edit … html/file/`*.ext`"); note `classify()` tags file
   *creation* as `code_generation`, so the regex — not the classifier — is what catches it. Files land
@@ -77,6 +78,27 @@ chat(msg)
   (`_read_refs`). The `@` is stripped before the model/classifier see the text. Emails are ignored.
 - **Genuine multi-step work in a loaded project → `_run_tool_loop`** (ReAct).
 - **Everything else (write/explain code, Q&A) → `_direct_answer`** (one call, no tools).
+
+> **3B-era hardening — candidate for re-testing now that `qwen2.5-coder:7b` is the default.**
+> The following were tuned for the 3B model's unreliability, NOT yet re-validated on 7B. Behavior is
+> unchanged in this pass — these are flagged as follow-up experiments, not edits:
+> - **`_wants_file_op()` regex routing** — bypasses `classify()` for file creation because 3B was
+>   unreliable at the JSON tool protocol. 7B may not need this workaround; candidate to route file
+>   creation back through `classify()`/the tool loop and A/B the result.
+> - **`_normalize_action()` / `_coerce_args()`** JSON-repair in the tool loop — coerces flattened /
+>   bare / synonym-keyed tool calls. 7B likely emits canonical JSON more often; measure how often the
+>   repair actually fires before loosening.
+> - **`_surgical_edit` one-retry-then-whole-file-rewrite fallback** — 3B routinely dropped SEARCH
+>   indentation and produced unmatched blocks. 7B may hit the exact/tolerant matchers more reliably,
+>   so the rewrite fallback may fire less; re-measure the surgical-vs-rewrite ratio.
+> - **Test fixtures encode 3B quirks** — `tests/test_file_flow.py` (e.g. the re-indent test at the
+>   "3B copies SEARCH lines without the file's leading indent" comment) and the `ScriptedLLM`-driven
+>   flows assert the fallback/repair paths still work given 3B-style malformed output. Keep these:
+>   they verify the hardening survives regardless of model. Don't tighten expectations to assume 7B
+>   is cleaner without first confirming against the live model.
+> - **Code comments in [app/agent/core.py](app/agent/core.py)** (`_EXT_GUARD`, `_apply_block_linewise`,
+>   `_file_op_flow`) still describe 3B behavior as their rationale — left intact deliberately; they
+>   document *why* the guards exist, not a claim that 7B misbehaves identically.
 
 **`prompts/system.md` must NOT contain the tool-call JSON instructions** — the tool loop gets its
 protocol from `_tool_loop_prompt()` instead. If you put tool-protocol text back in system.md it

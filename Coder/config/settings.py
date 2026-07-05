@@ -5,8 +5,11 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # Model config
     ollama_base_url: str = "http://localhost:11434"
-    llm_model: str = "qwen2.5-coder:3b"
+    llm_model: str = "qwen2.5-coder:7b"
     embedding_model: str = "nomic-embed-text"
+    # 7B is meaningfully slower than the old 3B default on the same hardware;
+    # keep a generous per-request timeout so longer generations aren't cut off.
+    llm_request_timeout_seconds: int = 120
 
     # Paths
     project_root: Path = Path(".")
@@ -19,7 +22,9 @@ class Settings(BaseSettings):
     mcp_config: Path = Path("config/mcp_servers.json")
 
     # Agent config
-    max_context_tokens: int = 4096
+    # qwen2.5-coder:7b handles a larger context window than the old 3B default;
+    # raised from 4096 accordingly.
+    max_context_tokens: int = 8192
     max_tool_retries: int = 3
     max_tool_failures: int = 2  # §11: give up a tool after this many failures
     retrieval_top_k: int = 5
