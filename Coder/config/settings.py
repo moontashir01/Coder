@@ -1,4 +1,5 @@
 from pathlib import Path
+
 from pydantic_settings import BaseSettings
 
 
@@ -27,6 +28,9 @@ class Settings(BaseSettings):
     max_context_tokens: int = 8192
     max_tool_retries: int = 3
     max_tool_failures: int = 2  # §11: give up a tool after this many failures
+    # Verify-and-repair: how many LLM repair passes to run when a just-written
+    # file fails its syntax/structure check.
+    max_repair_attempts: int = 2
     retrieval_top_k: int = 5
     conversation_buffer_size: int = 20
 

@@ -10,6 +10,7 @@ from app.agent.executor import Executor
 from app.agent.planner import Planner, _extract_json
 from app.agent.recovery import classify_error, recovery_hint
 from app.agent.tool_registry import ToolRegistry, create_registry
+from app.agent.verify import check_file, is_verifiable
 from app.memory.conversation import ConversationMemory
 from app.memory.project_memory import ProjectMemory, project_memory
 from app.models.llm import get_llm, get_streaming_llm
@@ -779,6 +780,10 @@ class AgentCore:
         if result.get("success"):
             verb = "Updated" if full_existing else "Created"
             answer = f"{verb} `{name}` ({len(content)} bytes) in {workdir}"
+            note, extra = await self._verify_and_repair(out_path, name)
+            trace.extend(extra)
+            if note:
+                answer += f" — {note}"
         else:
             answer = f"Failed to write {name}: {result.get('error')}"
         return answer, trace
@@ -857,9 +862,81 @@ class AgentCore:
             answer = f"Edited `{filename}`: {applied} change(s) applied"
             if failed:
                 answer += f" ({failed} block(s) didn't match the file)"
+            note, extra = await self._verify_and_repair(target_path, filename)
+            trace.extend(extra)
+            if note:
+                answer += f" — {note}"
         else:
             answer = f"Failed to write {filename}: {result.get('error')}"
         return answer, trace
+
+    async def _verify_and_repair(
+        self, target_path: Path, filename: str
+    ) -> tuple[str, list[dict]]:
+        """Syntax-check a just-written file; feed failures back for repair.
+
+        Roadmap Tier 1 #1: generate → check → send the error back → the model
+        returns the complete corrected file → re-check, capped at
+        settings.max_repair_attempts. Returns (status_note, extra_trace); the
+        note is "" for file types check_file cannot validate on this machine.
+        """
+        if not is_verifiable(target_path):
+            return "", []
+        ok, error = check_file(target_path)
+        if ok:
+            return "verified OK", []
+
+        trace: list[dict] = []
+        guard = _extension_guard(filename)
+        for attempt in range(1, settings.max_repair_attempts + 1):
+            content = target_path.read_text(encoding="utf-8", errors="replace")
+            ctx = (
+                f"The file '{filename}' was just written but FAILED its syntax check.\n\n"
+                f"Check error:\n{error}\n\n"
+                f"Current content:\n{content[:6000]}\n\n"
+                + (f"IMPORTANT: {guard}\n\n" if guard else "")
+                + "Fix the error and return the COMPLETE corrected file."
+            )
+            messages = [
+                SystemMessage(
+                    content="You are a code-repair engine. You fix files so they "
+                    "parse cleanly, changing as little as possible."
+                    + _FILE_GEN_INSTRUCTIONS
+                ),
+                HumanMessage(content=ctx),
+            ]
+            try:
+                raw = self._llm_direct.invoke(messages).content
+            except Exception as e:
+                return (
+                    f"verification failed ({error[:120]}); repair LLM error: {e}",
+                    trace,
+                )
+            _, fixed = _parse_file_output(raw, fallback=filename)
+            result = await self.executor.execute(
+                "write_file", {"path": str(target_path), "content": fixed}
+            )
+            trace.append(
+                {
+                    "tool": "write_file",
+                    "arguments": {"path": str(target_path)},
+                    "result": result,
+                }
+            )
+            if not result.get("success"):
+                return (
+                    f"verification failed ({error[:120]}); repair write failed: "
+                    f"{result.get('error')}",
+                    trace,
+                )
+            ok, error = check_file(target_path)
+            if ok:
+                return f"auto-repaired after {attempt} attempt(s)", trace
+        return (
+            f"verification failed after {settings.max_repair_attempts} repair "
+            f"attempt(s): {error[:200]}",
+            trace,
+        )
 
     async def _plan_file_ops(self, user_message: str, context: str) -> list[FileOp]:
         """One LLM call → an ordered list of per-file operations.
