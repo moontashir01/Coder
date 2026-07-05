@@ -1,3 +1,4 @@
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -206,6 +207,32 @@ def _strip_code_fences(text: str) -> str:
     if lines and lines[-1].strip().startswith("```"):
         lines = lines[:-1]
     return "\n".join(lines).strip()
+
+
+def _parse_textual_tool_call(text: str) -> dict | None:
+    """Fallback for old Ollama servers (e.g. 0.31.x) that never populate
+    message.tool_calls — the model's tool JSON arrives as plain content.
+
+    Accepts ONLY a response whose entire content is one JSON object of the
+    shape {"name": <str>, "arguments": <dict>} (optionally code-fenced) — the
+    raw qwen tool-call format. Anything else (prose, prose+JSON, other shapes)
+    returns None and is treated as a normal final answer. Upgrading Ollama
+    makes native tool_calls arrive and this fallback stop firing.
+    """
+    t = _strip_code_fences(text.strip()).strip()
+    if not t.startswith("{"):
+        return None
+    try:
+        data = json.loads(t)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    name = data.get("name")
+    args = data.get("arguments")
+    if not isinstance(name, str) or not name or not isinstance(args, dict):
+        return None
+    return {"name": name, "args": args, "id": "", "type": "tool_call"}
 
 
 def _parse_file_output(raw: str, fallback: str) -> tuple[str, str]:
@@ -508,7 +535,11 @@ class AgentCore:
 
             tool_calls = list(getattr(response, "tool_calls", None) or [])
             if not tool_calls:
-                return str(getattr(response, "content", "") or ""), tool_trace
+                content = str(getattr(response, "content", "") or "")
+                textual = _parse_textual_tool_call(content)
+                if textual is None:
+                    return content, tool_trace
+                tool_calls = [textual]
 
             # The assistant message carrying the tool calls must precede the
             # ToolMessages that answer them.

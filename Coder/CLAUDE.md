@@ -132,6 +132,11 @@ would fight native tool calls. What remains of the hardening:
 - Real tool failures get one `recovery_hint()` (§11), then the loop **gives up gracefully** after
   `settings.max_tool_failures` failures of the same tool.
 - LLM invoke exceptions retry up to `settings.max_tool_retries`.
+- **Old-Ollama fallback (`_parse_textual_tool_call`)**: Ollama servers ≤ ~0.31 never populate
+  `tool_calls` — the model's tool JSON arrives as plain content (confirmed live on 0.31.1). If a
+  response's ENTIRE content is one `{"name": <str>, "arguments": <dict>}` object (optionally
+  fenced), it is executed as a tool call; anything else is a final answer. Upgrading Ollama makes
+  native `tool_calls` arrive and this fallback stop firing — do not widen it into a JSON repairer.
 
 ### Tool registry & executor — the central hub
 

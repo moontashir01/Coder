@@ -492,3 +492,73 @@ async def test_tool_loop_gives_up_after_repeated_failures(agent):
     assert len(trace) <= 3
     assert "repeatedly" in answer.lower()
     assert "file_not_found" in answer
+
+
+# ---------------------------------------------------------------------------
+# Textual tool-call fallback (old Ollama servers, e.g. 0.31.x, never populate
+# message.tool_calls — the model's tool JSON arrives as plain content)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_textual_tool_call_bare_json():
+    from app.agent.core import _parse_textual_tool_call
+
+    call = _parse_textual_tool_call(
+        '{"name": "write_file", "arguments": {"path": "a.txt", "content": "hi"}}'
+    )
+    assert call == {
+        "name": "write_file",
+        "args": {"path": "a.txt", "content": "hi"},
+        "id": "",
+        "type": "tool_call",
+    }
+
+
+def test_parse_textual_tool_call_fenced_json():
+    from app.agent.core import _parse_textual_tool_call
+
+    call = _parse_textual_tool_call(
+        '```json\n{"name": "echo", "arguments": {"text": "x"}}\n```'
+    )
+    assert call is not None
+    assert call["name"] == "echo"
+    assert call["args"] == {"text": "x"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'Here is how you\'d do it: {"name": "write_file", "arguments": {}}',  # prose + JSON
+        '{"name": "write_file"}',  # no arguments
+        '{"name": "write_file", "arguments": "not a dict"}',
+        '{"arguments": {"path": "x"}}',  # no name
+        "just a plain answer",
+        '["not", "an", "object"]',
+    ],
+)
+def test_parse_textual_tool_call_rejects(text):
+    from app.agent.core import _parse_textual_tool_call
+
+    assert _parse_textual_tool_call(text) is None
+
+
+async def test_tool_loop_falls_back_to_textual_tool_call(agent):
+    agent._llm = ToolCallingLLM(
+        [
+            AIMessage(content='{"name": "echo", "arguments": {"text": "hi"}}'),
+            AIMessage(content="done via fallback"),
+        ]
+    )
+    answer, trace = await agent._run_tool_loop(messages=[])
+    assert answer == "done via fallback"
+    assert len(trace) == 1
+    assert trace[0]["result"]["result"] == "echo:hi"
+
+
+async def test_tool_loop_plain_prose_is_still_final_answer(agent):
+    agent._llm = ToolCallingLLM(
+        [AIMessage(content="The answer is 42, no tools needed.")]
+    )
+    answer, trace = await agent._run_tool_loop(messages=[])
+    assert answer == "The answer is 42, no tools needed."
+    assert trace == []

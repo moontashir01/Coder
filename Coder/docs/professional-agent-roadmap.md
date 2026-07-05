@@ -38,7 +38,12 @@ caught and corrected instead of shipped.
 > Shipped: `_run_tool_loop` uses `ChatOllama.bind_tools(registry.to_openai_tools())` +
 > `AIMessage.tool_calls` + `ToolMessage` feedback. Deleted `_tool_loop_prompt`,
 > `_parse_action`, `_normalize_action`, `_coerce_args`. Kept Tool-not-found correction +
-> §11 recovery/give-up. NOT yet smoke-tested against live Ollama/7B.
+> §11 recovery/give-up.
+> Live smoke 2026-07-05 (qwen2.5-coder:7b): the installed **Ollama 0.31.1 is too old to emit
+> structured `tool_calls`** (tool JSON arrives as plain content, even via the raw API). Added a
+> narrow `_parse_textual_tool_call` fallback (whole-content `{"name","arguments"}` only); smoke
+> then passes end-to-end (write_file executed, file on disk). **Recommended: upgrade Ollama**,
+> after which the fallback stops firing.
 **Problem.** The `_run_tool_loop` machinery — `_tool_loop_prompt()`, `_normalize_action()`,
 `_coerce_args()`, the "Tool not found" correction, retry-on-unparseable — all exists because
 the old 3B model mangled the JSON tool protocol.
