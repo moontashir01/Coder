@@ -6,6 +6,7 @@ from typing import Any, AsyncIterator
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+from app.agent.context_budget import trim_history_to_budget
 from app.agent.executor import Executor
 from app.agent.planner import Planner, _extract_json
 from app.agent.recovery import classify_error, recovery_hint
@@ -522,8 +523,12 @@ class AgentCore:
 
         system_text = "\n".join(parts)
 
-        # Conversation history
+        # Conversation history — trimmed to the token budget (oldest dropped),
+        # so long sessions don't silently overflow the model's context window.
         history = await self.memory.get_messages()
+        history = trim_history_to_budget(
+            system_text, history, user_message, settings.max_context_tokens
+        )
         msgs = [SystemMessage(content=system_text)]
         msgs.extend(history)
         msgs.append(HumanMessage(content=user_message))
