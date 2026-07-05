@@ -242,3 +242,104 @@ async def test_chat_single_file_still_uses_file_op(tmp_path, monkeypatch):
     await a.chat("make me an index.html file")
 
     assert multi_called["hit"] is False  # single-file requests skip the multi flow
+
+
+# ---------------------------------------------------------------------------
+# Cross-file consistency (roadmap Tier 1 #3): manifest + sibling context
+# ---------------------------------------------------------------------------
+
+
+class RecordingLLM(ScriptedLLM):
+    """ScriptedLLM that also records the full prompt text of every call."""
+
+    def __init__(self, outputs):
+        super().__init__(outputs)
+        self.prompts: list[str] = []
+
+    def invoke(self, messages):
+        self.prompts.append("\n".join(str(getattr(m, "content", m)) for m in messages))
+        return super().invoke(messages)
+
+
+async def test_file_op_flow_injects_extra_context(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_extra_ctx")
+    a._llm_direct = RecordingLLM(["FILENAME: a.css\nbody{color:blue}"])
+
+    await a._file_op_flow(
+        "make a.css", target="a.css", extra_context="MANIFEST-MARKER-42"
+    )
+
+    assert "MANIFEST-MARKER-42" in a._llm_direct.prompts[0]
+
+
+async def test_multi_file_flow_manifest_and_sibling_context(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_multi_consistency")
+
+    a._llm_direct = RecordingLLM(
+        [
+            # call 0: the plan
+            '{"files": ['
+            '{"filename": "a.css", "action": "create", "instruction": "site styles"},'
+            '{"filename": "b.html", "action": "create", "instruction": "page linking a.css"}'
+            "]}",
+            # call 1: generate a.css
+            "FILENAME: a.css\nbody{color:blue}",
+            # call 2: generate b.html (balanced so verify does not fire)
+            'FILENAME: b.html\n<html><head><link rel="stylesheet" href="a.css">'
+            "</head><body><p>x</p></body></html>",
+        ]
+    )
+
+    answer, trace = await a._multi_file_flow(
+        "split the site into css and html files", refs=[]
+    )
+
+    # Both files written
+    assert (tmp_path / "a.css").read_text(encoding="utf-8") == "body{color:blue}"
+    assert "a.css" in (tmp_path / "b.html").read_text(encoding="utf-8")
+
+    # First generation call sees the full plan manifest (knows b.html is coming)
+    assert "b.html" in a._llm_direct.prompts[1]
+    # Second generation call sees the already-generated sibling's CONTENT
+    assert "body{color:blue}" in a._llm_direct.prompts[2]
+    assert "a.css" in a._llm_direct.prompts[2]
+
+
+async def test_multi_file_flow_edit_sees_generated_siblings(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    index = tmp_path / "index.html"
+    index.write_text(
+        "<html><head><style>body{color:red}</style></head><body></body></html>",
+        encoding="utf-8",
+    )
+
+    a = AgentCore(session_id="pytest_multi_edit_ctx")
+    a._llm_direct = RecordingLLM(
+        [
+            # plan: create styles.css, then edit index.html
+            '{"files": ['
+            '{"filename": "styles.css", "action": "create", "instruction": "move css"},'
+            '{"filename": "index.html", "action": "edit", "instruction": "link styles.css"}'
+            "]}",
+            # generate styles.css — content deliberately DIFFERENT from the
+            # inline <style> so the assertion below can only be satisfied by
+            # the sibling-context injection, not by index.html's own body.
+            "FILENAME: styles.css\nbody{color:blue;font-size:14px}",
+        ]
+    )
+    a._llm_edit = RecordingLLM(
+        [
+            "<<<<<<< SEARCH\n<style>body{color:red}</style>\n=======\n"
+            '<link rel="stylesheet" href="styles.css">\n>>>>>>> REPLACE'
+        ]
+    )
+
+    await a._multi_file_flow("separate the css into its own file", refs=["index.html"])
+
+    # The surgical edit prompt for index.html must include the sibling's content
+    assert "body{color:blue;font-size:14px}" in a._llm_edit.prompts[0]
+    assert "styles.css" in a._llm_edit.prompts[0]
+    # And the edit actually landed
+    assert 'href="styles.css"' in index.read_text(encoding="utf-8")

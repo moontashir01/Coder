@@ -703,7 +703,10 @@ class AgentCore:
             return f"LLM error: {e}"
 
     async def _file_op_flow(
-        self, user_message: str, target: str | None = None
+        self,
+        user_message: str,
+        target: str | None = None,
+        extra_context: str = "",
     ) -> tuple[str, list[dict]]:
         """Deterministically create/update a single file on disk.
 
@@ -731,7 +734,11 @@ class AgentCore:
         # Editing an existing file → try a surgical SEARCH/REPLACE edit first.
         if full_existing and target_path is not None:
             edited = await self._surgical_edit(
-                filename, target_path, full_existing, user_message
+                filename,
+                target_path,
+                full_existing,
+                user_message,
+                extra_context=extra_context,
             )
             if edited is not None:
                 return edited
@@ -747,6 +754,8 @@ class AgentCore:
         guard = _extension_guard(filename) if filename else ""
         if guard:
             ctx += f"\n\nIMPORTANT: {guard}"
+        if extra_context:
+            ctx += f"\n\n{extra_context}"
         if full_existing:
             ctx += (
                 f"\n\nThe file '{filename}' already exists. Apply the requested change "
@@ -794,6 +803,7 @@ class AgentCore:
         target_path: Path,
         full_content: str,
         user_message: str,
+        extra_context: str = "",
     ) -> tuple[str, list[dict]] | None:
         """Edit an existing file via SEARCH/REPLACE blocks.
 
@@ -809,8 +819,10 @@ class AgentCore:
 
         guard = _extension_guard(filename)
         guard_line = f"IMPORTANT: {guard}\n\n" if guard else ""
+        extra_block = f"{extra_context}\n\n" if extra_context else ""
         ctx = (
             f"File: {filename}\nCurrent content:\n{full_content[:6000]}\n\n"
+            f"{extra_block}"
             f"{guard_line}"
             f"Request: {user_message}\n\n"
             f"Output the SEARCH/REPLACE block(s) now:"
@@ -991,15 +1003,41 @@ class AgentCore:
                 [],
             )
 
+        # Cross-file consistency (Tier 1 #3): every per-file call sees the full
+        # plan (so filenames/links agree even before siblings exist), and each
+        # subsequent call additionally sees the already-written siblings.
+        manifest = (
+            "## Multi-file plan\n"
+            "All files below are part of ONE change and must be consistent with "
+            "each other (matching filenames, links/imports, class/function/id "
+            "names):\n"
+            + "\n".join(
+                f"- {op.filename} ({op.action}): {op.instruction or '(as requested)'}"
+                for op in ops
+            )
+        )
+
         trace: list[dict] = []
         summaries: list[str] = []
+        written: list[str] = []
         for op in ops:
             # Each op reuses the single-file flow: create → FILENAME gen,
             # edit on an existing file → surgical SEARCH/REPLACE then rewrite.
             sub_msg = op.instruction or user_message
-            ans, sub_trace = await self._file_op_flow(sub_msg, target=op.filename)
+            extra = manifest
+            siblings = self._read_refs(written, max_chars=2500)
+            if siblings:
+                extra += (
+                    "\n\n## Already-written files in this change\n"
+                    "Make every reference to them (paths, selectors, ids, "
+                    "function names) match EXACTLY:\n\n" + siblings
+                )
+            ans, sub_trace = await self._file_op_flow(
+                sub_msg, target=op.filename, extra_context=extra
+            )
             trace.extend(sub_trace)
             summaries.append(f"- {op.filename}: {ans}")
+            written.append(op.filename)
 
         answer = f"Handled {len(ops)} file(s):\n" + "\n".join(summaries)
         return answer, trace
