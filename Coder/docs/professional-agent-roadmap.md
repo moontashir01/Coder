@@ -78,39 +78,42 @@ files.
 
 ---
 
-## Tier 2 — Quality
+## Tier 2 — Quality — ✅ DONE 2026-07-05
 
-### 4. Fix RAG chunking (tree-sitter)
+### 4. Fix RAG chunking (tree-sitter) ✅ (already fixed — verified)
 **Problem.** `tree-sitter 0.25.2` + `tree-sitter-languages 1.10.2` are incompatible in this
-env; `_chunk_with_tree_sitter` silently falls back to token-window chunking. Semantic chunking
-is **not actually running** (documented gotcha in CLAUDE.md).
+env; `_chunk_with_tree_sitter` silently falls back to token-window chunking.
 
-**Fix.** Pin `tree-sitter==0.21.3`, or migrate to `tree-sitter-language-pack`. Semantic
-(function/class) chunks → better retrieval → better answers and edits.
-
----
-
-### 5. Token-aware context management
-**Problem.** `max_context_tokens` is defined in `config/settings.py` but **read nowhere** in
-the code. History trimming is a fixed message count (`conversation_buffer_size = 20`), with no
-token budget. Long sessions can silently overflow the model's context window.
-
-**Fix.** Add token-based history truncation against `max_context_tokens`, plus conversation
-summarization for older turns. Project summarization already exists — extend the same idea to
-conversation history.
+**Resolution.** Already pinned `tree-sitter==0.21.3` (an earlier slice; recorded in
+`requirements.txt`). Verified live 2026-07-05: `get_parser('python')` works and
+`tests/test_rag.py::test_chunk_python_is_semantic_not_token_fallback` asserts real
+function/class chunks (2 defs → 2 chunks). Corrected the stale "currently broken" gotcha in
+CLAUDE.md. No code change needed this pass.
 
 ---
 
-### 6. Offline eval harness
-**Problem.** The 3B → 7B model swap shipped with **zero measurement** of whether quality
-improved. There is no way to detect a regression when changing models or prompts.
+### 5. Token-aware context management ✅
+**Problem.** `max_context_tokens` was defined but **read nowhere**; history was capped only by
+message count (`conversation_buffer_size`), so long turns could overflow the context window.
 
-**Fix.** Build a small offline golden-task suite (10–20 prompts) that asserts observable
-outcomes: file created, edit applied, answer contains an expected token, plan has N files, etc.
-Run it on every model/prompt change.
+**Shipped.** `app/agent/context_budget.py` (`count_tokens`, `trim_history_to_budget`, local
+tiktoken) drops the oldest turns until system prompt + history + latest message fit
+`settings.max_context_tokens`; wired into `_build_messages`. Tests: `tests/test_context_budget.py`.
+Conversation *summarization* of dropped turns is a further follow-up (not done).
 
-**Bonus.** Once evals exist, the 3B-era hardening (see the flagged block in CLAUDE.md) can be
-loosened with data instead of guesswork.
+---
+
+### 6. Offline eval harness ✅
+**Problem.** The 3B → 7B swap shipped with zero measurement.
+
+**Shipped.** `evals/` package — `checks.py` (declarative outcome checks), `harness.py`
+(`EvalTask`/`run_task`/`run_suite`, isolated per-task cwd, scored), `tasks.py` (12 golden
+tasks), `run.py` (`python -m evals.run` live runner, NOT pytest). Harness logic unit-tested
+offline (`tests/test_evals.py`). First live baseline vs qwen2.5-coder:7b: **10/12 (83%)**.
+
+**Bonus realized.** The suite immediately caught a real routing bug ("create three files: a, b
+and c" misrouted to the single-file flow) → fixed `wants_multifile()` (separate commit),
+re-verified live 4/4. This is the "adjust with data, not guesswork" loop working.
 
 ---
 

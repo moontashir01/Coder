@@ -195,16 +195,33 @@ prompt block.
 
 `config/settings.py` — single pydantic-settings `Settings` instance reading `.env`. Import as
 `from config.settings import settings`. Only `blocked_commands` is enforced (in
-`app/tools/terminal.py`); `allowed_commands` is currently informational.
+`app/tools/terminal.py`); `allowed_commands` is currently informational. `max_context_tokens` is
+the per-prompt token budget enforced by `app/agent/context_budget.py` (oldest history dropped
+first in `_build_messages`); `max_repair_attempts` caps the verify-and-repair loop.
+
+### Eval harness (`evals/`)
+
+The measuring stick for model/prompt changes. `evals/tasks.py` holds ~12 golden tasks asserting
+**observable** outcomes (file on disk, answer token, N files written) via declarative checks
+(`evals/checks.py`). `evals/harness.py` runs each prompt through `AgentCore.chat` in an isolated
+cwd and scores the suite; the harness logic is unit-tested offline (`tests/test_evals.py`) with a
+scripted LLM. The **live** run is `python -m evals.run` (needs Ollama; NOT part of `pytest`) —
+`--keep DIR`, `--min SCORE`, `--only ids`. Run it before/after a model or prompt change: the first
+baseline (qwen2.5-coder:7b) was 10/12 and immediately caught a real multi-file routing bug.
 
 ## Gotchas
 
-- **Tree-sitter is currently broken in this env.** `tree-sitter 0.25.2` + `tree-sitter-languages
-  1.10.2` are incompatible (`get_parser('python')` raises `TypeError: __init__() takes exactly 1
-  argument (2 given)`). `_chunk_with_tree_sitter` swallows this and silently falls back to
-  token-window chunking, so semantic chunking is **not** actually running. To restore it, either pin
-  `tree-sitter==0.21.3` or migrate to `tree-sitter-language-pack`. The symbol index (`symbols.py`)
-  sidesteps this entirely by using stdlib `ast` for Python.
+- **Tree-sitter semantic chunking is LIVE (pinned).** `tree-sitter==0.21.3` +
+  `tree-sitter-languages 1.10.2` — `get_parser('python')` works and `_chunk_with_tree_sitter`
+  emits real function/class chunks (verified by `tests/test_rag.py::test_chunk_python_is_semantic_not_token_fallback`,
+  which asserts 2 top-level defs → 2 chunks, i.e. NOT the token-window fallback). Do **not** bump
+  `tree-sitter` to 0.25.x: 0.25 + `tree-sitter-languages` 1.10.2 are incompatible
+  (`get_parser` raises `TypeError: __init__() takes exactly 1 argument (2 given)`), and
+  `_chunk_with_tree_sitter` silently swallows that into the token-window fallback — the failure is
+  invisible except via that regression test. If you must upgrade, migrate to
+  `tree-sitter-language-pack`. (You'll see a harmless `FutureWarning: Language(path, name) is
+  deprecated` from 0.21.3 — that is expected, not the breakage.) The symbol index (`symbols.py`)
+  uses stdlib `ast` and is unaffected either way.
 - **Import-time singletons.** Importing `app.database.vector_store` constructs the ChromaDB client
   (creates `.chroma_db/`), and `app.agent.tool_registry` builds the registry. Merely importing the
   package writes `.chroma_db/` / `.coder.db` into the cwd. Tests rely on this being side-effect-safe.
