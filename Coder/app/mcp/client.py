@@ -110,6 +110,8 @@ class MCPServerConnection:
                 parameters=params or {"type": "object", "properties": {}},
                 source=f"mcp:{self.name}",
                 handler=_make_handler(tool_name, conn),
+                # Deniable as a class via settings.denied_permissions
+                permissions=["mcp"],
             ))
 
         return defs

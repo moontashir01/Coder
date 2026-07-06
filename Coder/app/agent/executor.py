@@ -3,6 +3,7 @@ import inspect
 from typing import Any
 
 from app.agent.tool_registry import ToolRegistry
+from config.settings import settings
 
 
 def _validate_args(parameters: dict, arguments: dict) -> str | None:
@@ -33,6 +34,18 @@ class Executor:
             tool = self._registry.get(tool_name)
         except KeyError as e:
             return {"success": False, "result": "", "error": str(e)}
+
+        # Permission gating (Tier 3 #8): refuse before touching arguments.
+        denied = sorted(set(tool.permissions) & set(settings.denied_permissions))
+        if denied:
+            return {
+                "success": False,
+                "result": "",
+                "error": (
+                    f"Permission denied: tool '{tool_name}' requires {denied}, "
+                    "blocked by settings.denied_permissions"
+                ),
+            }
 
         error = _validate_args(tool.parameters, arguments)
         if error:

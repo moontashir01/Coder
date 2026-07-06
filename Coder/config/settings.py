@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     # content here first; undo_write restores the most recent backup.
     backups_dir: Path = Path(".coder_backups")
     max_write_backups: int = 20
+    # Permission gating (Tier 3 #8): the Executor refuses any tool whose
+    # ToolDefinition.permissions intersects this list. Tags in use:
+    # fs:read, fs:write, fs:delete, shell, git:read, git:write, mcp.
+    denied_permissions: list[str] = []
     allowed_commands: list[str] = [
         "python",
         "pip",

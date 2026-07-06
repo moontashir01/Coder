@@ -100,6 +100,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=read_file,
+            permissions=["fs:read"],
         ),
         ToolDefinition(
             name="write_file",
@@ -114,6 +115,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=write_file,
+            permissions=["fs:write"],
         ),
         ToolDefinition(
             name="edit_file",
@@ -132,6 +134,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=edit_file,
+            permissions=["fs:write"],
         ),
         ToolDefinition(
             name="create_file",
@@ -146,6 +149,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=create_file,
+            permissions=["fs:write"],
         ),
         ToolDefinition(
             name="delete_file",
@@ -163,6 +167,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=delete_file,
+            permissions=["fs:delete"],
         ),
         ToolDefinition(
             name="undo_write",
@@ -179,6 +184,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=undo_write,
+            permissions=["fs:write"],
         ),
         ToolDefinition(
             name="list_directory",
@@ -193,6 +199,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=list_directory,
+            permissions=["fs:read"],
         ),
         ToolDefinition(
             name="search_files",
@@ -210,6 +217,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=search_files,
+            permissions=["fs:read"],
         ),
         ToolDefinition(
             name="run_command",
@@ -232,6 +240,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=run_command,
+            permissions=["shell"],
         ),
         ToolDefinition(
             name="git_status",
@@ -243,6 +252,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=git_status,
+            permissions=["git:read"],
         ),
         ToolDefinition(
             name="git_diff",
@@ -260,6 +270,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=git_diff,
+            permissions=["git:read"],
         ),
         ToolDefinition(
             name="git_commit",
@@ -274,6 +285,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=git_commit,
+            permissions=["git:write"],
         ),
         ToolDefinition(
             name="git_log",
@@ -288,6 +300,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=git_log,
+            permissions=["git:read"],
         ),
         ToolDefinition(
             name="find_symbol",
@@ -301,6 +314,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=find_symbol,
+            permissions=["fs:read"],
         ),
         ToolDefinition(
             name="find_references",
@@ -314,6 +328,7 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=find_references,
+            permissions=["fs:read"],
         ),
     ]
 
