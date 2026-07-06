@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     conversation_buffer_size: int = 20
 
     # Safety
+    # Safe writes (Tier 3 #8): mutating file tools back up the previous
+    # content here first; undo_write restores the most recent backup.
+    backups_dir: Path = Path(".coder_backups")
+    max_write_backups: int = 20
     allowed_commands: list[str] = [
         "python",
         "pip",

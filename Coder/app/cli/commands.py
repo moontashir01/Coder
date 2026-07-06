@@ -24,6 +24,7 @@ HELP_TEXT = """
 
 [yellow]Tools & Context[/yellow]
   /tools                List all registered tools (builtin + MCP)
+  /undo [path]          Undo the last file write/edit/delete (restores backup)
   /history              Show recent conversation turns
   /clear                Clear conversation history
 
@@ -100,6 +101,17 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
         for t in tools:
             table.add_row(t.name, t.source, t.description)
         console.print(table)
+        return True
+
+    # ── /undo ──────────────────────────────────────────────────────────
+    if cmd == "undo":
+        from app.tools.filesystem import undo_write
+
+        res = undo_write(path=" ".join(args) if args else None)
+        if res["success"]:
+            console.print(f"[green]{res['result']}[/green]")
+        else:
+            console.print(f"[yellow]{res['error']}[/yellow]")
         return True
 
     # ── /clear ─────────────────────────────────────────────────────────

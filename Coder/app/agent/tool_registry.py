@@ -79,7 +79,7 @@ class ToolRegistry:
 def _build_builtin_tools() -> list[ToolDefinition]:
     from app.tools.filesystem import (create_file, delete_file, edit_file,
                                       list_directory, read_file, search_files,
-                                      write_file)
+                                      undo_write, write_file)
     from app.tools.git_tool import git_commit, git_diff, git_log, git_status
     from app.tools.symbols_tool import find_references, find_symbol
     from app.tools.terminal import run_command
@@ -163,6 +163,22 @@ def _build_builtin_tools() -> list[ToolDefinition]:
             },
             source="builtin",
             handler=delete_file,
+        ),
+        ToolDefinition(
+            name="undo_write",
+            description="Undo the most recent file write/edit/delete by restoring its backup. Optional path limits the undo to that file.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Only undo the latest change to this file (optional)",
+                    },
+                },
+                "required": [],
+            },
+            source="builtin",
+            handler=undo_write,
         ),
         ToolDefinition(
             name="list_directory",

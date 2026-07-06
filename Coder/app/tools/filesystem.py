@@ -1,6 +1,11 @@
 import re
+import time
+from itertools import count
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
+
+from config.settings import settings
 
 ToolResult = dict[str, Any]
 
@@ -11,6 +16,69 @@ def _ok(result: str) -> ToolResult:
 
 def _err(error: str) -> ToolResult:
     return {"success": False, "result": "", "error": error}
+
+
+# ---------------------------------------------------------------------------
+# Safe writes (Tier 3 #8): every mutating tool backs up the previous content
+# into settings.backups_dir before touching the file; undo_write restores and
+# consumes the most recent backup, so repeated undos walk back through history.
+# The original absolute path is URL-quoted into the backup filename after the
+# first "__" (quote() never emits "_", so "__" splits unambiguously).
+# ---------------------------------------------------------------------------
+
+_backup_seq = count()
+
+
+def _backup_file(p: Path) -> None:
+    """Snapshot p's current content. Raises on failure — callers must treat a
+    failed backup as a failed mutation rather than proceed and lose data."""
+    root = Path(settings.backups_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    encoded = quote(str(p.resolve()), safe="")
+    name = f"{time.time_ns():020d}-{next(_backup_seq) % 1_000_000:06d}__{encoded}"
+    (root / name).write_bytes(p.read_bytes())
+    _prune_backups(root)
+
+
+def _prune_backups(root: Path) -> None:
+    backups = sorted(root.iterdir(), key=lambda b: b.name)
+    excess = len(backups) - settings.max_write_backups
+    for old in backups[:excess] if excess > 0 else []:
+        try:
+            old.unlink()
+        except OSError:
+            pass  # pruning is best-effort; a stale backup is harmless
+
+
+def _original_path(backup: Path) -> str | None:
+    parts = backup.name.split("__", 1)
+    return unquote(parts[1]) if len(parts) == 2 else None
+
+
+def undo_write(path: str | None = None) -> ToolResult:
+    """Restore the most recent backup; with ``path``, the most recent backup
+    of that file. The used backup is deleted (undo again → previous state)."""
+    try:
+        root = Path(settings.backups_dir)
+        backups = (
+            sorted((b for b in root.iterdir() if _original_path(b)), key=lambda b: b.name)
+            if root.exists()
+            else []
+        )
+        if path is not None:
+            wanted = str(Path(path).resolve())
+            backups = [b for b in backups if _original_path(b) == wanted]
+        if not backups:
+            target = f" for {path}" if path else ""
+            return _err(f"No backup to undo{target}.")
+        latest = backups[-1]
+        original = Path(_original_path(latest))
+        original.parent.mkdir(parents=True, exist_ok=True)
+        original.write_bytes(latest.read_bytes())
+        latest.unlink()
+        return _ok(f"Restored {original} from backup.")
+    except Exception as e:
+        return _err(str(e))
 
 
 def read_file(path: str) -> ToolResult:
@@ -26,6 +94,8 @@ def read_file(path: str) -> ToolResult:
 def write_file(path: str, content: str) -> ToolResult:
     try:
         p = Path(path)
+        if p.is_file():
+            _backup_file(p)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return _ok(f"Written {len(content)} bytes to {path}")
@@ -46,6 +116,7 @@ def edit_file(path: str, old_str: str, new_str: str) -> ToolResult:
                 "Provide more context to make it unique."
             )
         updated = original.replace(old_str, new_str, 1)
+        _backup_file(p)  # only after validation — a rejected edit leaves no backup
         p.write_text(updated, encoding="utf-8")
         return _ok(f"Edited {path}: replaced 1 occurrence")
     except FileNotFoundError:
@@ -75,6 +146,8 @@ def delete_file(path: str, confirm: bool = False) -> ToolResult:
         p = Path(path)
         if not p.exists():
             return _err(f"File not found: {path}")
+        if p.is_file():
+            _backup_file(p)
         p.unlink()
         return _ok(f"Deleted {path}")
     except Exception as e:
