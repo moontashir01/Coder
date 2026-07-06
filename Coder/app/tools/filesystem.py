@@ -1,3 +1,4 @@
+import difflib
 import re
 import time
 from itertools import count
@@ -55,6 +56,33 @@ def _original_path(backup: Path) -> str | None:
     return unquote(parts[1]) if len(parts) == 2 else None
 
 
+def _attach_diff(res: ToolResult, old: str, new: str, path: str) -> ToolResult:
+    """Add a unified diff of a mutating write to the tool result (Tier 3 #8).
+
+    The diff rides on an extra "diff" key: the tool loop only feeds
+    result["result"] back to the model, so this is display-only for the REPL.
+    """
+    diff = "\n".join(
+        difflib.unified_diff(
+            old.splitlines(),
+            new.splitlines(),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            lineterm="",
+        )
+    )
+    if diff:
+        added = sum(
+            1 for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")
+        )
+        removed = sum(
+            1 for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")
+        )
+        res["diff"] = diff
+        res["result"] += f" (+{added}/-{removed} lines)"
+    return res
+
+
 def undo_write(path: str | None = None) -> ToolResult:
     """Restore the most recent backup; with ``path``, the most recent backup
     of that file. The used backup is deleted (undo again → previous state)."""
@@ -94,11 +122,16 @@ def read_file(path: str) -> ToolResult:
 def write_file(path: str, content: str) -> ToolResult:
     try:
         p = Path(path)
+        old_content: str | None = None
         if p.is_file():
+            old_content = p.read_text(encoding="utf-8", errors="replace")
             _backup_file(p)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        return _ok(f"Written {len(content)} bytes to {path}")
+        res = _ok(f"Written {len(content)} bytes to {path}")
+        if old_content is not None:
+            res = _attach_diff(res, old_content, content, path)
+        return res
     except Exception as e:
         return _err(str(e))
 
@@ -118,7 +151,9 @@ def edit_file(path: str, old_str: str, new_str: str) -> ToolResult:
         updated = original.replace(old_str, new_str, 1)
         _backup_file(p)  # only after validation — a rejected edit leaves no backup
         p.write_text(updated, encoding="utf-8")
-        return _ok(f"Edited {path}: replaced 1 occurrence")
+        return _attach_diff(
+            _ok(f"Edited {path}: replaced 1 occurrence"), original, updated, path
+        )
     except FileNotFoundError:
         return _err(f"File not found: {path}")
     except Exception as e:

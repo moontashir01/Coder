@@ -64,9 +64,20 @@ def _render_response(text: str) -> None:
         console.print(remainder)
 
 
-def _print_tool_step(tool_name: str, success: bool) -> None:
-    status = "[green]✓[/green]" if success else "[red]✗[/red]"
+_MAX_DIFF_LINES = 60
+
+
+def _print_tool_step(tool_name: str, result: dict) -> None:
+    status = "[green]✓[/green]" if result.get("success") else "[red]✗[/red]"
     console.print(f"  [dim cyan][Tool][/dim cyan] {tool_name} {status}", highlight=False)
+    diff = result.get("diff")
+    if diff:
+        lines = diff.splitlines()
+        console.print(
+            Syntax("\n".join(lines[:_MAX_DIFF_LINES]), "diff", theme="monokai")
+        )
+        if len(lines) > _MAX_DIFF_LINES:
+            console.print(f"  [dim]... {len(lines) - _MAX_DIFF_LINES} more diff lines[/dim]")
 
 
 class CoderREPL:
@@ -180,9 +191,9 @@ class CoderREPL:
 
                 answer, trace = await self.agent.chat(user_input, on_token=on_token)
 
-            # Show tool calls that were made
+            # Show tool calls that were made (with diff previews when present)
             for step in trace:
-                _print_tool_step(step["tool"], step["result"].get("success", False))
+                _print_tool_step(step["tool"], step["result"])
 
             console.print()
             _render_response(answer)
