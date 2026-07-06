@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coder"
+description = "Fully offline AI coding assistant powered by a local Ollama."
+readme = "CLAUDE.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dynamic = ["version"]
+dependencies = [
+    "aiosqlite>=0.22",
+    "chromadb>=1.5",
+    "GitPython>=3.1",
+    "httpx>=0.28",
+    "langchain-core>=1.4",
+    "langchain-ollama>=1.1",
+    "mcp>=1.28",
+    "prompt-toolkit>=3.0",
+    "pydantic>=2.13",
+    "pydantic-settings>=2.14",
+    "rich>=15.0",
+    "SQLAlchemy>=2.0",
+    "tiktoken>=0.13",
+    # Pinned: 0.25.x + tree-sitter-languages 1.10.2 silently disables semantic
+    # chunking (see CLAUDE.md gotcha). Migrate to tree-sitter-language-pack
+    # before ever bumping this.
+    "tree-sitter==0.21.3",
+    "tree-sitter-languages>=1.10.2",
+    "typer>=0.25",
+    "watchdog>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "pytest-asyncio>=1.4",
+    "black>=26.0",
+    "isort>=8.0",
+]
+
+[project.scripts]
+coder = "main:app"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["app*", "config*", "evals*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "app.__version__" }
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"

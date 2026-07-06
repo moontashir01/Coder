@@ -10,6 +10,7 @@ import typer
 # Ensure project root is on path when run directly
 sys.path.insert(0, str(Path(__file__).parent))
 
+from app import __version__
 from app.agent.core import AgentCore
 from app.cli.repl import CoderREPL
 from app.mcp.manager import MCPManager
@@ -19,6 +20,12 @@ from app.skills.loader import SkillLoader
 app = typer.Typer(help="Coder — offline AI coding assistant powered by Ollama.")
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"coder {__version__}")
+        raise typer.Exit()
+
+
 @app.command()
 def main(
     project: str = typer.Option(
@@ -26,6 +33,13 @@ def main(
     ),
     session: str = typer.Option(
         "default", "--session", "-s", help="Conversation session ID"
+    ),
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_version_callback,
+        is_eager=True,  # print-and-exit before the Ollama connection check
+        help="Show version and exit",
     ),
 ) -> None:
     """Start the Coder interactive assistant."""
