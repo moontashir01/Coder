@@ -12,7 +12,9 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.styles import Style as PTStyle
 from rich.console import Console
+from rich.live import Live
 from rich.panel import Panel
+from rich.spinner import Spinner
 from rich.syntax import Syntax
 from rich.text import Text
 
@@ -156,11 +158,27 @@ class CoderREPL:
             await self._agent_turn(user_input)
 
     async def _agent_turn(self, user_input: str) -> None:
-        """Send message to agent and display response with tool steps."""
+        """Send message to agent and display response with tool steps.
+
+        Direct answers stream token-by-token into a transient Live region;
+        on completion the region is erased and the final answer re-rendered
+        with syntax highlighting (so streamed text is never duplicated).
+        """
         console.print()  # blank line
         try:
-            with console.status("[cyan]Thinking...[/cyan]"):
-                answer, trace = await self.agent.chat(user_input)
+            streamed: list[str] = []
+            with Live(
+                Spinner("dots", text=Text("Thinking...", style="cyan")),
+                console=console,
+                refresh_per_second=12,
+                transient=True,
+            ) as live:
+
+                def on_token(token: str) -> None:
+                    streamed.append(token)
+                    live.update(Text("".join(streamed)))
+
+                answer, trace = await self.agent.chat(user_input, on_token=on_token)
 
             # Show tool calls that were made
             for step in trace:

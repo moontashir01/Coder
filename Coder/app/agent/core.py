@@ -2,7 +2,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
@@ -675,14 +675,31 @@ class AgentCore:
                 continue
         return "\n\n".join(blocks)
 
-    async def _direct_answer(self, user_message: str, extra_context: str = "") -> str:
-        """Single plain-language LLM call — no tool protocol, guaranteed prose/code."""
+    async def _direct_answer(
+        self,
+        user_message: str,
+        extra_context: str = "",
+        on_token: Callable[[str], None] | None = None,
+    ) -> str:
+        """Single plain-language LLM call — no tool protocol, guaranteed prose/code.
+
+        With ``on_token`` set, the answer streams through the streaming LLM and
+        the callback receives each non-empty token as it generates (Tier 3 #7).
+        """
         messages = await self._build_messages(
             user_message, extra_context=extra_context, include_tool_protocol=False
         )
         try:
-            response = self._llm_direct.invoke(messages)
-            return response.content
+            if on_token is None:
+                response = self._llm_direct.invoke(messages)
+                return response.content
+            parts: list[str] = []
+            async for chunk in self._llm_stream.astream(messages):
+                piece = chunk.content
+                if piece:
+                    parts.append(piece)
+                    on_token(piece)
+            return "".join(parts)
         except Exception as e:
             return f"LLM error: {e}"
 
@@ -1026,8 +1043,16 @@ class AgentCore:
         answer = f"Handled {len(ops)} file(s):\n" + "\n".join(summaries)
         return answer, trace
 
-    async def chat(self, user_message: str) -> tuple[str, list[dict]]:
-        """Process one user message. Returns (answer, tool_trace)."""
+    async def chat(
+        self,
+        user_message: str,
+        on_token: Callable[[str], None] | None = None,
+    ) -> tuple[str, list[dict]]:
+        """Process one user message. Returns (answer, tool_trace).
+
+        ``on_token`` (optional) receives answer tokens as they generate on the
+        direct-answer path; file/tool flows return the answer whole as before.
+        """
         # @path references: pull them out, then work with a cleaned message so the
         # classifier/model see plain paths rather than "@foo".
         at_refs = _extract_at_refs(user_message)
@@ -1052,24 +1077,14 @@ class AgentCore:
         else:
             # Plain answer; inject any @-referenced files as context.
             answer = await self._direct_answer(
-                clean_message, extra_context=self._read_refs(at_refs)
+                clean_message,
+                extra_context=self._read_refs(at_refs),
+                on_token=on_token,
             )
             trace = []
 
         await self.memory.add_ai(answer)
         return answer, trace
-
-    async def stream_chat(self, user_message: str) -> AsyncIterator[str]:
-        """Stream final answer tokens for simple (non-tool) responses."""
-        await self.memory.add_human(user_message)
-        messages = await self._build_messages(user_message)
-
-        answer, trace = await self._run_tool_loop(messages)
-        await self.memory.add_ai(answer)
-
-        # Stream the final answer token by token (word-level simulation)
-        for word in answer.split(" "):
-            yield word + " "
 
     def get_plan(self, user_message: str) -> dict:
         """Return the planner's task plan without executing it."""
