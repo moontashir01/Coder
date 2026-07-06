@@ -25,6 +25,8 @@ All Python work uses the venv (`.venv\Scripts\activate` on Windows, `source .ven
 python main.py                          # start the REPL
 python main.py --project /path/to/proj  # load + index a project on startup
 python main.py --session work           # named conversation session (persists in SQLite)
+pip install -e .                        # installable CLI: `coder` == `python main.py`
+coder --version                         # works without Ollama (eager typer callback)
 
 pytest tests/ -v                        # all tests (~28s, fully offline — no Ollama needed)
 pytest tests/test_tools.py -v           # one file
@@ -92,6 +94,10 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
   `<link href>`/`<script src>`/shared names line up.
 - **Genuine multi-step work in a loaded project → `_run_tool_loop`** (native tool calling).
 - **Everything else (write/explain code, Q&A) → `_direct_answer`** (one call, no tools).
+  This path streams: `chat()`/`_direct_answer` accept an optional `on_token` callback which,
+  when set, switches to `_llm_stream.astream()` and fires per token. The REPL passes one from
+  `_agent_turn` and shows tokens in a transient Rich `Live` region, then erases it and prints
+  the final syntax-highlighted render (never duplicated). File/tool flows don't stream.
 
 > **3B-era hardening — candidate for re-testing now that `qwen2.5-coder:7b` is the default.**
 > The following were tuned for the 3B model's unreliability, NOT yet re-validated on 7B. Behavior is
@@ -141,13 +147,24 @@ would fight native tool calls. What remains of the hardening:
 ### Tool registry & executor — the central hub
 
 - `app/agent/tool_registry.py` — every tool (builtin, MCP-discovered, skill-unlocked) must be
-  registered here. `create_registry()` builds the default with all 12 builtin tools; a
+  registered here. `create_registry()` builds the default with all 13 builtin tools; a
   module-level `registry` singleton exists. Tools carry `source` = `"builtin"` | `"mcp:<server>"`
-  | `"skill:<skill>"`; `unregister_by_source()` is how MCP disconnect cleans up.
-- `app/agent/executor.py` — async `execute()`: validates args against the tool's JSON Schema, then
-  awaits async handlers (MCP) or runs sync handlers in a thread pool. **Every tool handler must
-  return `{"success": bool, "result": str, "error": str | None}`** — this contract is assumed
-  everywhere (REPL tool-step rendering, the tool loop's result feedback).
+  | `"skill:<skill>"`; `unregister_by_source()` is how MCP disconnect cleans up. Every tool also
+  carries `permissions` tags — builtins use `fs:read` / `fs:write` / `fs:delete` / `shell` /
+  `git:read` / `git:write`; MCP tools are tagged `mcp` as a class.
+- `app/agent/executor.py` — async `execute()`: **refuses any tool whose `permissions` intersect
+  `settings.denied_permissions`** (default empty = allow all), then validates args against the
+  tool's JSON Schema, then awaits async handlers (MCP) or runs sync handlers in a thread pool.
+  **Every tool handler must return `{"success": bool, "result": str, "error": str | None}`** —
+  this contract is assumed everywhere (REPL tool-step rendering, the tool loop's result
+  feedback). Mutating file tools may add a display-only `"diff"` key (unified diff): the REPL
+  renders it under the tool step; the tool loop feeds only `result["result"]` to the model.
+- **Safe writes** (`app/tools/filesystem.py`): `write_file` (overwrite), `edit_file`, and
+  `delete_file` back up the previous content into `settings.backups_dir` before mutating — a
+  failed backup aborts the mutation. `undo_write` (builtin tool, also the `/undo` REPL command)
+  restores and consumes the newest backup (optionally per path); backups are pruned to
+  `settings.max_write_backups`. The original absolute path is URL-quoted into the backup
+  filename after the first `__`.
 
 ### RAG pipeline
 
@@ -174,6 +191,7 @@ symbols (graceful). Inject an in-memory index (`SymbolIndex(db_path=":memory:")`
 - `.coder.db` — SQLite: conversation turns + project summaries (SQLAlchemy async / aiosqlite)
 - `.symbols.db` — sqlite3: symbol/import/reference index (sync, separate from `.coder.db`)
 - `.coder_history` — prompt_toolkit history
+- `.coder_backups/` — pre-mutation snapshots for `undo_write` (pruned to `max_write_backups`)
 
 ### MCP servers (`app/mcp/`)
 
@@ -194,10 +212,13 @@ prompt block.
 ### Config
 
 `config/settings.py` — single pydantic-settings `Settings` instance reading `.env`. Import as
-`from config.settings import settings`. Only `blocked_commands` is enforced (in
-`app/tools/terminal.py`); `allowed_commands` is currently informational. `max_context_tokens` is
+`from config.settings import settings`. For shell commands only `blocked_commands` is enforced
+(in `app/tools/terminal.py`); `allowed_commands` is deliberately informational (an allowlist
+would break legitimate loop commands like `pytest`). Tool-level gating is
+`denied_permissions` (enforced in the Executor, default empty). `max_context_tokens` is
 the per-prompt token budget enforced by `app/agent/context_budget.py` (oldest history dropped
-first in `_build_messages`); `max_repair_attempts` caps the verify-and-repair loop.
+first in `_build_messages`); `max_repair_attempts` caps the verify-and-repair loop;
+`backups_dir` / `max_write_backups` configure safe-write snapshots.
 
 ### Eval harness (`evals/`)
 

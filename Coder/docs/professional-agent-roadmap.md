@@ -117,21 +117,45 @@ re-verified live 4/4. This is the "adjust with data, not guesswork" loop working
 
 ---
 
-## Tier 3 — Polish
+## Tier 3 — Polish — ✅ DONE 2026-07-07
 
-### 7. Wire up streaming
+### 7. Wire up streaming ✅
+> Shipped: `chat()`/`_direct_answer` take an optional `on_token` callback; when set, the
+> direct-answer path streams through `_llm_stream.astream()` (first real use). The REPL
+> renders tokens in a transient Rich `Live` region, then erases it and prints the final
+> syntax-highlighted answer. Dead `stream_chat()` word-split simulation deleted.
+> Tests: `tests/test_streaming.py`.
 `get_streaming_llm()` builds `self._llm_stream` (core.py) which is then **never used** — dead
 code. langchain_ollama streams via `.stream()` / `.astream()` at the call site. Wire it into
 REPL output so tokens stream as they generate. Pure UX win.
 
-### 8. Real permission gating + safe writes
+### 8. Real permission gating + safe writes ✅
+> Shipped in three slices:
+> - **Backups + undo** — `write_file` (overwrite), `edit_file`, `delete_file` snapshot the
+>   previous content into `settings.backups_dir` first (failed backup = failed mutation);
+>   `undo_write` (builtin tool + `/undo` REPL command) restores and consumes the newest
+>   backup, pruned to `max_write_backups`. Tests: `tests/test_safe_writes.py`.
+> - **Diff preview** — mutating writes attach a unified diff on a display-only `"diff"`
+>   result key (+N/-M summary in the result text); the REPL renders it under the tool step,
+>   capped at 60 lines. The model feedback path reads only `result["result"]`, so context
+>   stays lean. Tests: `tests/test_diff_preview.py`.
+> - **Permissions enforced** — builtins tagged (`fs:read/write/delete`, `shell`,
+>   `git:read/write`), MCP tools tagged `mcp`; the Executor refuses any tool whose tags
+>   intersect `settings.denied_permissions` (default empty). Tests: `tests/test_permissions.py`.
+> `allowed_commands` stays informational by design — enforcing an allowlist would break
+> legitimate loop commands (e.g. `pytest`).
 `ToolDefinition.permissions` exists but is unused; `allowed_commands` is informational only
 (only `blocked_commands` is enforced). `write_file` overwrites existing files freely. Add:
 - diff preview before a mutating write,
 - an undo / backup step,
 - actual enforcement of the `permissions` field.
 
-### 9. Packaging
+### 9. Packaging ✅
+> Shipped: `pyproject.toml` (setuptools) with direct deps incl. the critical
+> `tree-sitter==0.21.3` pin, `[project.scripts] coder = "main:app"`, version 0.1.0
+> single-sourced from `app.__version__`, and an eager `--version` flag that works without
+> Ollama. Verified live: `pip install -e .` → working `coder.exe`. Tests:
+> `tests/test_packaging.py`.
 Ship a `pyproject.toml` with a console entrypoint (`coder`) so it installs via `pipx install`
 instead of `python main.py`. Add versioning.
 
@@ -149,7 +173,7 @@ Do **#6 first** — it's the measuring stick for everything else.
 
 ## Known latent issues to fix along the way
 
-- `_llm_stream` is built but never invoked (dead streaming path). — Tier 3 #7
+- ~~`_llm_stream` is built but never invoked (dead streaming path).~~ — resolved by Tier 3 #7
 - `max_context_tokens` setting is unused. — Tier 2 #5
 - 3B-era small-model hardening (`_wants_file_op` routing, `_normalize_action`/`_coerce_args`,
   `_surgical_edit` retry-then-rewrite fallback) is untested on 7B and flagged in CLAUDE.md for
