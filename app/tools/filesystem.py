@@ -109,9 +109,30 @@ def undo_write(path: str | None = None) -> ToolResult:
         return _err(str(e))
 
 
+# Directories never worth searching/reading through (mirrors the indexer skips).
+_IGNORE_DIRS = {"__pycache__", "node_modules", ".git", ".venv"}
+
+
+def _is_binary(p: Path) -> bool:
+    """Heuristic: a NUL byte in the first 1 KiB means binary (mirrors git)."""
+    try:
+        with p.open("rb") as fh:
+            return b"\x00" in fh.read(1024)
+    except OSError:
+        return False
+
+
 def read_file(path: str) -> ToolResult:
     try:
-        content = Path(path).read_text(encoding="utf-8", errors="replace")
+        p = Path(path)
+        cap = settings.max_read_file_bytes
+        with p.open("rb") as fh:
+            data = fh.read(cap + 1)
+        truncated = len(data) > cap
+        content = data[:cap].decode("utf-8", errors="replace")
+        if truncated:
+            total = p.stat().st_size
+            content += f"\n... [truncated — file is {total} bytes, showing first {cap}]"
         return _ok(content)
     except FileNotFoundError:
         return _err(f"File not found: {path}")
@@ -218,10 +239,22 @@ def search_files(path: str, pattern: str) -> ToolResult:
         regex = re.compile(pattern)
         matches: list[str] = []
 
-        targets = root.rglob("*") if root.is_dir() else [root]
+        is_dir = root.is_dir()
+        targets = root.rglob("*") if is_dir else [root]
         for file in targets:
             if not file.is_file():
                 continue
+            # Skip vendored/hidden dirs and binary files (C4). When searching a
+            # single file directly, honor the caller and don't second-guess it.
+            if is_dir:
+                rel_parts = file.relative_to(root).parts
+                if any(
+                    part in _IGNORE_DIRS or part.startswith(".")
+                    for part in rel_parts[:-1]
+                ):
+                    continue
+                if _is_binary(file):
+                    continue
             try:
                 for i, line in enumerate(
                     file.read_text(encoding="utf-8", errors="replace").splitlines(), 1

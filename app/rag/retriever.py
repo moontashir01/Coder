@@ -26,6 +26,34 @@ def _chunk_id(file_path: str, chunk_index: int) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:32]
 
 
+def _file_content_hash(path: str | Path) -> str | None:
+    """SHA-256 of a file's raw bytes, or None if it can't be read."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _gitignore_spec(root: Path):
+    """Build a PathSpec from the project's root .gitignore, or None if there
+    isn't one (or pathspec is unavailable). Matching is best-effort."""
+    gitignore = root / ".gitignore"
+    if not gitignore.is_file():
+        return None
+    try:
+        import pathspec
+
+        lines = gitignore.read_text(encoding="utf-8", errors="replace").splitlines()
+        # "gitignore" is the current factory name; older pathspec only has the
+        # (now-deprecated) "gitwildmatch" alias — fall back to it.
+        try:
+            return pathspec.PathSpec.from_lines("gitignore", lines)
+        except (KeyError, ValueError, LookupError):
+            return pathspec.PathSpec.from_lines("gitwildmatch", lines)
+    except Exception:
+        return None
+
+
 class Retriever:
     def __init__(
         self,
@@ -55,36 +83,90 @@ class Retriever:
     # ------------------------------------------------------------------
 
     def index_project(self, project_path: str | Path) -> dict[str, int]:
-        """Chunk, embed, and store all indexable files under project_path."""
+        """Chunk, embed, and store all indexable files under project_path.
+
+        Incremental (Step 2 / P1): files whose content hash matches what's
+        already stored are skipped, so re-loading an unchanged repo re-embeds
+        nothing. Only changed/new files are re-chunked and re-embedded.
+        """
         self._current_project = str(project_path)
         col = self._store.get_or_create_collection(project_path)
         root = Path(project_path)
 
-        files = [
-            p
-            for p in root.rglob("*")
-            if p.is_file()
-            and p.suffix.lower() in _INDEXABLE_SUFFIXES
-            and not any(part.startswith(".") for part in p.parts)
-            and "__pycache__" not in p.parts
-            and "node_modules" not in p.parts
-        ]
+        spec = _gitignore_spec(root)
+        size_cap = settings.max_index_file_bytes
+        files = []
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in _INDEXABLE_SUFFIXES:
+                continue
+            if any(part.startswith(".") for part in p.parts):
+                continue
+            if "__pycache__" in p.parts or "node_modules" in p.parts:
+                continue
+            # .gitignore (P4): skip vendored/generated files the repo ignores.
+            if spec is not None:
+                try:
+                    rel = p.relative_to(root).as_posix()
+                except ValueError:
+                    rel = None
+                if rel is not None and spec.match_file(rel):
+                    continue
+            # Size cap (C4): don't try to embed huge/generated blobs.
+            try:
+                if p.stat().st_size > size_cap:
+                    continue
+            except OSError:
+                continue
+            files.append(p)
+
+        # Content hashes of already-indexed files, to skip unchanged ones.
+        # getattr keeps the retriever working with minimal test doubles that
+        # don't implement get_file_hashes (they just re-index everything).
+        existing_hashes: dict[str, str] = {}
+        get_hashes = getattr(self._store, "get_file_hashes", None)
+        if get_hashes is not None:
+            try:
+                existing_hashes = get_hashes(col) or {}
+            except Exception:
+                existing_hashes = {}
 
         total_chunks = 0
+        indexed = 0
+        skipped = 0
         for file_path in files:
-            total_chunks += self._index_single_file(col, file_path)
+            content_hash = _file_content_hash(file_path)
+            if (
+                content_hash is not None
+                and existing_hashes.get(str(file_path)) == content_hash
+            ):
+                skipped += 1
+                continue
+            total_chunks += self._index_single_file(col, file_path, content_hash)
+            indexed += 1
 
-        return {"files": len(files), "chunks": total_chunks}
+        return {
+            "files": len(files),
+            "chunks": total_chunks,
+            "indexed": indexed,
+            "skipped": skipped,
+        }
 
     def index_file(self, file_path: str | Path) -> int:
         """Re-embed a single file (call after edits)."""
         col = self._require_project()
         return self._index_single_file(col, Path(file_path))
 
-    def _index_single_file(self, col, file_path: Path) -> int:
+    def _index_single_file(
+        self, col, file_path: Path, content_hash: str | None = None
+    ) -> int:
         chunks: list[Chunk] = chunk_file(file_path)
         if not chunks:
             return 0
+
+        if content_hash is None:
+            content_hash = _file_content_hash(file_path)
 
         # Remove stale embeddings for this file before re-inserting
         self._store.delete_by_file(col, str(file_path))
@@ -99,6 +181,7 @@ class Retriever:
                 "start_line": c.start_line,
                 "end_line": c.end_line,
                 "language": c.language,
+                "content_hash": content_hash or "",
             }
             for c in chunks
         ]

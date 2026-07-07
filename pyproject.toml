@@ -22,6 +22,7 @@ dependencies = [
     "langchain-core>=1.4",
     "langchain-ollama>=1.1",
     "mcp>=1.28",
+    "pathspec>=0.12",
     "prompt-toolkit>=3.0",
     "pydantic>=2.13",
     "pydantic-settings>=2.14",

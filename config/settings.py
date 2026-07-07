@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     chroma_persist_dir: Path = Path(".chroma_db")
     sqlite_path: Path = Path(".coder.db")
     symbols_path: Path = Path(".symbols.db")
+    # Persistent embedding cache (Step 2 / P2): SHA-256(text) -> vector, so
+    # embeddings survive restarts. Relative, per-project (resolved against cwd).
+    embed_cache_dir: Path = Path(".coder_embed_cache")
+    # LRU bound on the on-disk embedding cache (number of cached vectors).
+    max_embed_cache_entries: int = 10000
+    # Indexer caps (Step 3 / P4, C4): skip files bigger than this when
+    # indexing; read_file truncates its output at the same ceiling.
+    max_index_file_bytes: int = 1_000_000
+    max_read_file_bytes: int = 1_000_000
 
     # Agent config
     # qwen2.5-coder:7b handles a larger context window than the old 3B default;

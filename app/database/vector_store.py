@@ -64,6 +64,27 @@ class VectorStore:
     def delete_by_file(self, collection: Collection, file_path: str) -> None:
         collection.delete(where={"file_path": file_path})
 
+    def get_file_hashes(self, collection: Collection) -> dict[str, str]:
+        """Map each indexed file_path to its stored content_hash.
+
+        Used by incremental indexing (Step 2 / P1) to skip files whose content
+        is unchanged. Files indexed before content hashing was added simply
+        won't appear here, so they get re-indexed once.
+        """
+        try:
+            got = collection.get(include=["metadatas"])
+        except Exception:
+            return {}
+        out: dict[str, str] = {}
+        for meta in got.get("metadatas") or []:
+            if not meta:
+                continue
+            fp = meta.get("file_path")
+            h = meta.get("content_hash")
+            if fp and h:
+                out[str(fp)] = str(h)
+        return out
+
     def query(
         self,
         collection: Collection,

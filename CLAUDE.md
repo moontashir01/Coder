@@ -171,8 +171,34 @@ would fight native tool calls. What remains of the hardening:
 `Retriever` ([app/rag/retriever.py](app/rag/retriever.py)) wraps `VectorStore` (ChromaDB) and the
 embedder. **One ChromaDB collection per project**, named after the folder. Tree-sitter chunker
 ([app/rag/chunker.py](app/rag/chunker.py)) emits semantic chunks (functions/classes), falling back
-to token-window sliding for non-code or oversized nodes. Embeddings are cached in-process by
-SHA-256 of the text.
+to token-window sliding for non-code or oversized nodes.
+
+**Incremental indexing (Step 2 / P1, P2):** `index_project` skips files whose SHA-256 content hash
+matches what's already stored — the hash rides in each chunk's `content_hash` metadata and is read
+back via `VectorStore.get_file_hashes()`. So re-loading an unchanged repo re-embeds **zero** chunks;
+`index_project` returns `indexed`/`skipped` counts alongside `files`/`chunks`. Test doubles that
+don't implement `get_file_hashes` degrade gracefully to full re-indexing (`getattr` guard). The
+embedder ([app/rag/embedder.py](app/rag/embedder.py)) is a **two-tier cache** keyed by SHA-256 of
+the text: an in-process LRU dict over a **persistent on-disk cache** (`settings.embed_cache_dir`,
+one JSON file per key, LRU-pruned to `settings.max_embed_cache_entries`), so embeddings survive
+restarts. The `OllamaEmbeddings` client is memoized (`functools.lru_cache`). `clear_cache()` wipes
+both tiers; the pytest `conftest.py` autouse fixture points `embed_cache_dir` at a tmp dir so tests
+never touch the repo cwd.
+
+**Skips & caps (Step 3 / P4, C4):** the indexer honors the project's root `.gitignore` (via
+`pathspec` — declared in `pyproject.toml`), skips files over `settings.max_index_file_bytes`, and
+keeps the existing dot/`__pycache__`/`node_modules` skips. `read_file` truncates at
+`settings.max_read_file_bytes` with a "truncated" note; `search_files` skips binary files (NUL byte
+in the first 1 KiB) and vendored/hidden dirs.
+
+**Live auto-reindex (Step 4 / P3):** `AgentCore.load_project` starts a `ProjectWatcher`
+([app/rag/watcher.py](app/rag/watcher.py)) — a debounced `watchdog` observer on the project root
+that feeds changes into `retriever.index_file`/`delete_file`. Its filtering (suffix, dotfile,
+`__pycache__`/`node_modules`, `.gitignore`, in-root) and debounce/dispatch (`on_event` → coalesce →
+`flush`) are decoupled from the Observer so they unit-test with synthetic events (no fs race).
+`AgentCore.close()` (called from `main.py`'s `finally`) stops it; a fresh `load_project` restarts
+it. Best-effort throughout: watcher failures never break project loading, and it silently no-ops if
+watchdog is unavailable.
 
 **Stale-index prevention (Step 1 / C1):** every successful mutating write — in `_file_op_flow`,
 `_surgical_edit`, and the native tool loop (`write_file`/`edit_file`/`create_file`) — calls
@@ -200,6 +226,8 @@ symbols (graceful). Inject an in-memory index (`SymbolIndex(db_path=":memory:")`
 - `.symbols.db` — sqlite3: symbol/import/reference index (sync, separate from `.coder.db`)
 - `.coder_history` — prompt_toolkit history
 - `.coder_backups/` — pre-mutation snapshots for `undo_write` (pruned to `max_write_backups`)
+- `.coder_embed_cache/` — persistent embedding cache, one JSON per SHA-256 (pruned to
+  `max_embed_cache_entries`); gitignored
 
 ### MCP servers (`app/mcp/`)
 
@@ -226,7 +254,9 @@ would break legitimate loop commands like `pytest`). Tool-level gating is
 `denied_permissions` (enforced in the Executor, default empty). `max_context_tokens` is
 the per-prompt token budget enforced by `app/agent/context_budget.py` (oldest history dropped
 first in `_build_messages`); `max_repair_attempts` caps the verify-and-repair loop;
-`backups_dir` / `max_write_backups` configure safe-write snapshots.
+`backups_dir` / `max_write_backups` configure safe-write snapshots. RAG knobs:
+`embed_cache_dir` / `max_embed_cache_entries` (persistent embedding cache),
+`max_index_file_bytes` (indexer size cap), `max_read_file_bytes` (`read_file` truncation cap).
 
 ### Eval harness (`evals/`)
 

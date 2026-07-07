@@ -3,11 +3,13 @@
 Ollama is never contacted — embeddings are monkeypatched with deterministic fakes.
 """
 
+from pathlib import Path
+
 import pytest
 
-from app.rag import chunker
-from app.rag import embedder
+from app.rag import chunker, embedder
 from app.rag.retriever import Retriever
+from config.settings import settings
 
 # ---------------------------------------------------------------------------
 # Chunker
@@ -132,6 +134,33 @@ def test_embed_query_cached(monkeypatch):
     assert fake.query_calls == 1
 
 
+def test_embed_cache_persists_across_restart(monkeypatch):
+    """A dropped in-memory layer is repopulated from the on-disk cache, so a
+    restart does not re-embed already-seen content (Step 2 / P2)."""
+    fake = _FakeEmbeddings()
+    monkeypatch.setattr(embedder, "_get_embeddings", lambda: fake)
+    embedder.clear_cache()
+
+    embedder.embed_documents(["persisted text"])
+    assert fake.doc_calls == 1
+
+    # Simulate a process restart: only the in-memory layer is gone.
+    embedder._cache.clear()
+    embedder.embed_documents(["persisted text"])
+    assert fake.doc_calls == 1  # served from disk, no new embedding
+
+
+def test_embed_cache_disk_lru_prunes(monkeypatch):
+    fake = _FakeEmbeddings()
+    monkeypatch.setattr(embedder, "_get_embeddings", lambda: fake)
+    monkeypatch.setattr(settings, "max_embed_cache_entries", 2)
+    embedder.clear_cache()
+
+    embedder.embed_documents(["a", "b", "c"])
+    on_disk = list(Path(settings.embed_cache_dir).glob("*.json"))
+    assert len(on_disk) <= 2
+
+
 # ---------------------------------------------------------------------------
 # Retriever (with an in-memory fake vector store)
 # ---------------------------------------------------------------------------
@@ -157,6 +186,15 @@ class _FakeStore:
         self.data = {
             k: v for k, v in self.data.items() if v[1].get("file_path") != file_path
         }
+
+    def get_file_hashes(self, col):
+        out = {}
+        for _doc, meta in self.data.values():
+            fp = meta.get("file_path")
+            h = meta.get("content_hash")
+            if fp and h:
+                out[str(fp)] = str(h)
+        return out
 
     def add_chunks(self, col, ids, embeddings, documents, metadatas):
         for i, doc, meta in zip(ids, documents, metadatas):
@@ -202,6 +240,42 @@ def test_index_project_and_query(tmp_path, fake_embed):
     assert "file_path" in results[0]["metadata"]
 
 
+def test_reindex_unchanged_project_embeds_nothing(tmp_path, monkeypatch):
+    """Second index of an unchanged repo re-embeds zero chunks (Step 2 / P1)."""
+    import app.rag.retriever as ret_mod
+
+    calls = {"n": 0}
+
+    def spy(texts):
+        calls["n"] += 1
+        return [[1.0, 0.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr(ret_mod, "embed_documents", spy)
+    monkeypatch.setattr(ret_mod, "embed_query", lambda q: [1.0, 0.0, 0.0])
+
+    (tmp_path / "a.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("def world():\n    return 2\n", encoding="utf-8")
+
+    store = _FakeStore()
+    retr = Retriever(store=store)
+    retr.index_project(tmp_path)
+    first = calls["n"]
+    assert first > 0
+
+    # Re-index with no changes → nothing re-embedded.
+    stats = retr.index_project(tmp_path)
+    assert calls["n"] == first
+    assert stats["indexed"] == 0
+    assert stats["skipped"] == 2
+
+    # Change one file → only that file is re-embedded.
+    (tmp_path / "a.py").write_text("def hello():\n    return 99\n", encoding="utf-8")
+    stats2 = retr.index_project(tmp_path)
+    assert calls["n"] == first + 1
+    assert stats2["indexed"] == 1
+    assert stats2["skipped"] == 1
+
+
 def test_index_skips_hidden_and_pycache(tmp_path, fake_embed):
     (tmp_path / "keep.py").write_text("x = 1\n", encoding="utf-8")
     hidden = tmp_path / ".secret"
@@ -210,6 +284,31 @@ def test_index_skips_hidden_and_pycache(tmp_path, fake_embed):
     cache = tmp_path / "__pycache__"
     cache.mkdir()
     (cache / "c.py").write_text("z = 3\n", encoding="utf-8")
+
+    store = _FakeStore()
+    retr = Retriever(store=store)
+    stats = retr.index_project(tmp_path)
+    assert stats["files"] == 1
+
+
+def test_index_respects_gitignore(tmp_path, fake_embed):
+    (tmp_path / "keep.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "generated.py").write_text("y = 2\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("generated.py\n", encoding="utf-8")
+
+    store = _FakeStore()
+    retr = Retriever(store=store)
+    stats = retr.index_project(tmp_path)
+    assert stats["files"] == 1
+    indexed_files = {m.get("file_path") for _d, m in store.data.values()}
+    assert any("keep.py" in f for f in indexed_files)
+    assert not any("generated.py" in f for f in indexed_files)
+
+
+def test_index_skips_oversized_files(tmp_path, fake_embed, monkeypatch):
+    monkeypatch.setattr(settings, "max_index_file_bytes", 50)
+    (tmp_path / "small.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "huge.py").write_text("# pad\n" * 100, encoding="utf-8")
 
     store = _FakeStore()
     retr = Retriever(store=store)

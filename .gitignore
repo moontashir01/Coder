@@ -8,6 +8,7 @@ __pycache__/
 .symbols.db
 .coder_history
 .coder_backups/
+.coder_embed_cache/
 models/*.gguf
 projects/
 *.egg-info/

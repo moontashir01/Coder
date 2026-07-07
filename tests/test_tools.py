@@ -2,9 +2,9 @@
 import pytest
 
 from app.tools import filesystem as fs
-from app.tools.terminal import run_command
 from app.tools import git_tool
-
+from app.tools.terminal import run_command
+from config.settings import settings
 
 # ---------------------------------------------------------------------------
 # Filesystem tools
@@ -104,6 +104,36 @@ def test_search_files_invalid_regex(tmp_path):
     res = fs.search_files(str(tmp_path), "([unclosed")
     assert res["success"] is False
     assert "regex" in res["error"].lower()
+
+
+def test_read_file_truncates_over_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "max_read_file_bytes", 10)
+    target = tmp_path / "big.txt"
+    target.write_text("0123456789ABCDEFGHIJ", encoding="utf-8")
+    res = fs.read_file(str(target))
+    assert res["success"] is True
+    assert res["result"].startswith("0123456789")
+    assert "truncated" in res["result"].lower()
+    assert "ABCDEF" not in res["result"]
+
+
+def test_search_files_skips_binary(tmp_path):
+    (tmp_path / "code.py").write_text("needle here\n", encoding="utf-8")
+    (tmp_path / "blob.bin").write_bytes(b"needle\x00\x00binary")
+    res = fs.search_files(str(tmp_path), "needle")
+    assert res["success"] is True
+    assert "code.py" in res["result"]
+    assert "blob.bin" not in res["result"]
+
+
+def test_search_files_skips_vendored_dirs(tmp_path):
+    (tmp_path / "app.py").write_text("token = 1\n", encoding="utf-8")
+    vendor = tmp_path / "node_modules"
+    vendor.mkdir()
+    (vendor / "lib.py").write_text("token = 2\n", encoding="utf-8")
+    res = fs.search_files(str(tmp_path), "token")
+    assert "app.py" in res["result"]
+    assert "node_modules" not in res["result"]
 
 
 # ---------------------------------------------------------------------------

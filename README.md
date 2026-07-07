@@ -73,8 +73,11 @@ That starts the interactive assistant scoped to the current folder. Useful thing
 - Load the project for retrieval + symbol search: `/load .`
 - List commands: `/help`
 
-Coder writes its per-project state (`.chroma_db/`, `.coder.db`, `.symbols.db`, `.coder_backups/`)
-into the folder you launch it from, so each project stays isolated.
+Coder writes its per-project state (`.chroma_db/`, `.coder.db`, `.symbols.db`, `.coder_backups/`,
+`.coder_embed_cache/`) into the folder you launch it from, so each project stays isolated. The
+embedding cache persists across restarts and files honored by `.gitignore` are skipped, so the
+second load of an unchanged repo is near-instant. Once a project is loaded, edits on disk are
+re-indexed automatically within about a second — no manual `/index` needed.
 
 Other entry points:
 
