@@ -174,6 +174,14 @@ embedder. **One ChromaDB collection per project**, named after the folder. Tree-
 to token-window sliding for non-code or oversized nodes. Embeddings are cached in-process by
 SHA-256 of the text.
 
+**Stale-index prevention (Step 1 / C1):** every successful mutating write — in `_file_op_flow`,
+`_surgical_edit`, and the native tool loop (`write_file`/`edit_file`/`create_file`) — calls
+`AgentCore._reindex_after_write` (→ `retriever.index_file`), and `delete_file` calls
+`_reindex_after_delete` (→ `retriever.delete_file`). So a follow-up query reflects the edit, not
+the pre-edit content, without a manual `/index`. The deterministic flows reindex *after*
+`_verify_and_repair`, so the index holds the repaired content. Both hooks are **no-ops without a
+loaded project** and **best-effort** — a reindex failure never fails the underlying write.
+
 ### Symbol index & dependency graph
 
 `app/rag/symbols.py` — an **AST-based** (stdlib `ast`, **not** tree-sitter) index of Python

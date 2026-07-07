@@ -479,6 +479,31 @@ class AgentCore:
     def set_skills_context(self, skills_text: str) -> None:
         self._skills_context = skills_text
 
+    def _reindex_after_write(self, path: str | Path) -> None:
+        """Refresh the RAG + symbol index for a just-written file so retrieval
+        isn't stale (roadmap Step 1 / C1).
+
+        No-op when no project is loaded (the retriever has no active collection
+        then). Best-effort: a reindex failure must never fail the underlying
+        write, so it is swallowed here.
+        """
+        if not self._project_path:
+            return
+        try:
+            self.retriever.index_file(path)
+        except Exception:
+            pass  # keeping the index fresh must not break a successful write
+
+    def _reindex_after_delete(self, path: str | Path) -> None:
+        """Drop a just-deleted file from the RAG + symbol index. No-op without
+        a loaded project; best-effort (see _reindex_after_write)."""
+        if not self._project_path:
+            return
+        try:
+            self.retriever.delete_file(path)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Context building
     # ------------------------------------------------------------------
@@ -587,6 +612,15 @@ class AgentCore:
                 tool_trace.append(
                     {"tool": tool_name, "arguments": arguments, "result": result}
                 )
+
+                # Step 1 / C1: keep retrieval fresh after mutations made by the
+                # tool loop, so a follow-up query sees the edit, not stale content.
+                if result.get("success"):
+                    _p = arguments.get("path")
+                    if _p and tool_name in ("write_file", "edit_file", "create_file"):
+                        self._reindex_after_write(_p)
+                    elif _p and tool_name == "delete_file":
+                        self._reindex_after_delete(_p)
 
                 error = result.get("error") or ""
                 if not result.get("success") and "Tool not found" in error:
@@ -794,6 +828,8 @@ class AgentCore:
             trace.extend(extra)
             if note:
                 answer += f" — {note}"
+            # Reindex the final content (after any repair) so retrieval is fresh.
+            self._reindex_after_write(out_path)
         else:
             answer = f"Failed to write {name}: {result.get('error')}"
         return answer, trace
@@ -879,6 +915,8 @@ class AgentCore:
             trace.extend(extra)
             if note:
                 answer += f" — {note}"
+            # Reindex the final content (after any repair) so retrieval is fresh.
+            self._reindex_after_write(target_path)
         else:
             answer = f"Failed to write {filename}: {result.get('error')}"
         return answer, trace
