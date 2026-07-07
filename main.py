@@ -56,9 +56,12 @@ def main(
     repl = CoderREPL(agent=agent, mcp_manager=mcp_manager, skill_loader=skill_loader)
 
     async def _run() -> None:
-        if project:
-            await repl.load_project(project)
-        await repl.run()
+        try:
+            if project:
+                await repl.load_project(project)
+            await repl.run()
+        finally:
+            agent.close()  # stop the live-reindex file watcher
 
     asyncio.run(_run())
 

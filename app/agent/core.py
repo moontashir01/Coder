@@ -465,6 +465,7 @@ class AgentCore:
         self._skills_context: str = ""
         self.mcp_manager = mcp_manager
         self.skill_loader = skill_loader  # SkillLoader | None
+        self._watcher = None  # ProjectWatcher for live reindex (Step 4)
 
     # ------------------------------------------------------------------
     # Project management
@@ -474,7 +475,29 @@ class AgentCore:
         self._project_path = project_path
         index_stats = self.retriever.index_project(project_path)
         await self.pm.index_project(project_path)
+        self._start_watching(project_path)
         return index_stats
+
+    def _start_watching(self, project_path: str) -> None:
+        """Start (or restart) the live-reindex watcher for project_path.
+        Best-effort: watcher problems must never break project loading."""
+        try:
+            from app.rag.watcher import ProjectWatcher
+
+            if self._watcher is not None:
+                self._watcher.stop()
+            self._watcher = ProjectWatcher(project_path, self.retriever)
+            self._watcher.start()
+        except Exception:
+            self._watcher = None
+
+    def close(self) -> None:
+        """Release background resources (the file watcher). Idempotent."""
+        if self._watcher is not None:
+            try:
+                self._watcher.stop()
+            finally:
+                self._watcher = None
 
     def set_skills_context(self, skills_text: str) -> None:
         self._skills_context = skills_text
