@@ -1,6 +1,17 @@
+import os
 from pathlib import Path
 
 from pydantic_settings import BaseSettings
+
+# Install base: the directory that ships with Coder's bundled resources
+# (prompts/, skills/, config/). Resolved once, independent of the current
+# working directory, so a globally-installed `coder` finds its own resources
+# no matter which project folder it is run from. Order of precedence:
+#   1. $CODER_HOME (explicit override)
+#   2. the source tree — this file lives at <base>/config/settings.py
+# NB: runtime STATE paths below (chroma/sqlite/symbols/backups/history) stay
+# relative so they land in the *current* project folder, per-project.
+_BASE = Path(os.environ.get("CODER_HOME") or Path(__file__).resolve().parent.parent)
 
 
 class Settings(BaseSettings):
@@ -12,15 +23,20 @@ class Settings(BaseSettings):
     # keep a generous per-request timeout so longer generations aren't cut off.
     llm_request_timeout_seconds: int = 120
 
-    # Paths
+    # Bundled-resource paths — anchored to the install base (see _BASE above)
+    # so they resolve identically from any working directory.
+    skills_dir: Path = _BASE / "skills"
+    prompts_dir: Path = _BASE / "prompts"
+    mcp_config: Path = _BASE / "config" / "mcp_servers.json"
+
+    # Per-project paths — relative on purpose (resolved against cwd) so state
+    # is created in whatever project folder `coder` is launched from.
     project_root: Path = Path(".")
-    skills_dir: Path = Path("skills")
     projects_dir: Path = Path("projects")
     models_dir: Path = Path("models")
     chroma_persist_dir: Path = Path(".chroma_db")
     sqlite_path: Path = Path(".coder.db")
     symbols_path: Path = Path(".symbols.db")
-    mcp_config: Path = Path("config/mcp_servers.json")
 
     # Agent config
     # qwen2.5-coder:7b handles a larger context window than the old 3B default;

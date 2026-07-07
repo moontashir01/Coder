@@ -32,7 +32,7 @@ def _get_mcp_manager_class():
     return _MCPManager
 
 
-_SYSTEM_PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "system.md"
+_SYSTEM_PROMPT_PATH = settings.prompts_dir / "system.md"
 
 
 def _tool_guidance(workdir: str) -> str:

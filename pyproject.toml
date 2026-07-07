@@ -5,8 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "coder"
 description = "Fully offline AI coding assistant powered by a local Ollama."
-readme = "CLAUDE.md"
-requires-python = ">=3.11"
+readme = "README.md"
+# Upper bound is deliberate: tree-sitter-languages 1.10.2 ships wheels only for
+# CPython 3.8–3.12 (no 3.13+), and tree-sitter is pinned to 0.21.3 (see the
+# tree-sitter gotcha in CLAUDE.md). Installing on 3.13+ fails with a confusing
+# "No matching distribution for tree-sitter-languages" — the cap makes pip
+# report a clear Python-version error instead.
+requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
 dynamic = ["version"]
 dependencies = [

@@ -1,0 +1,16 @@
+# Normalize text in the repo to LF; check out platform-appropriate endings.
+* text=auto eol=lf
+
+# Shell scripts MUST stay LF — a CRLF shebang breaks them on macOS/Linux.
+*.sh text eol=lf
+
+# Windows scripts stay CRLF.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Binary / non-text
+*.db binary
+*.gguf binary
+*.png binary
+*.jpg binary
