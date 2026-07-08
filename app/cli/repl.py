@@ -93,6 +93,10 @@ class CoderREPL:
         self.agent.skill_loader = skill_loader   # keep agent in sync
         self.running = True
         self._session: PromptSession | None = None   # created lazily in run()
+        # Approval gate (Step 6 / S3): tool names the user approved for the
+        # whole session, and the Live region to pause while prompting.
+        self._session_allows: set[str] = set()
+        self._active_live: Live | None = None
 
     # ------------------------------------------------------------------
     # Project loading
@@ -121,6 +125,12 @@ class CoderREPL:
             auto_suggest=AutoSuggestFromHistory(),
             style=_PT_STYLE,
         )
+
+        # Approval gate (Step 6 / S3): only prompt when there's a real TTY and
+        # the user hasn't opted into --yolo (auto_approve). Non-interactive runs
+        # leave the hook unset so the executor's default policy applies.
+        if sys.stdin.isatty() and not settings.auto_approve:
+            self.agent.executor.set_approval_hook(self._approve_tool)
 
         # Auto-load MCP servers from config
         if self.mcp_manager is not None:
@@ -184,12 +194,18 @@ class CoderREPL:
                 refresh_per_second=12,
                 transient=True,
             ) as live:
+                self._active_live = live  # so the approval prompt can pause it
 
                 def on_token(token: str) -> None:
                     streamed.append(token)
                     live.update(Text("".join(streamed)))
 
-                answer, trace = await self.agent.chat(user_input, on_token=on_token)
+                try:
+                    answer, trace = await self.agent.chat(
+                        user_input, on_token=on_token
+                    )
+                finally:
+                    self._active_live = None
 
             # Show tool calls that were made (with diff previews when present)
             for step in trace:
@@ -204,3 +220,43 @@ class CoderREPL:
         except Exception as e:
             console.print(f"\n[red]Agent error:[/red] {e}")
             console.print("[dim]Type /clear to reset if the conversation is stuck.[/dim]")
+
+    async def _approve_tool(
+        self, tool_name: str, arguments: dict, permissions: list[str]
+    ) -> bool:
+        """Interactive approval hook for gated tools (Step 6 / S3).
+
+        Returns True to run the call. `[s]ession` remembers the tool for the
+        rest of the session so repeated calls aren't re-prompted.
+        """
+        if tool_name in self._session_allows:
+            return True
+
+        live = self._active_live
+        if live is not None:
+            live.stop()  # release the terminal so the prompt renders cleanly
+        try:
+            arg_preview = ", ".join(
+                f"{k}={str(v)[:60]!r}" for k, v in arguments.items()
+            )
+            console.print(
+                f"\n[bold yellow]Approve tool call?[/bold yellow] "
+                f"[cyan]{tool_name}[/cyan] [dim]({', '.join(permissions)})[/dim]"
+            )
+            if arg_preview:
+                console.print(f"  [dim]{arg_preview}[/dim]")
+            loop = asyncio.get_event_loop()
+            choice = await loop.run_in_executor(
+                None,
+                lambda: console.input(
+                    "  [a]llow / allow [s]ession / [d]eny: "
+                ).strip().lower(),
+            )
+        finally:
+            if live is not None:
+                live.start()
+
+        if choice in ("s", "session"):
+            self._session_allows.add(tool_name)
+            return True
+        return choice in ("a", "allow", "y", "yes")

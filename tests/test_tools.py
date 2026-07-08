@@ -180,6 +180,59 @@ def test_run_command_timeout():
     assert "timed out" in res["error"].lower()
 
 
+# --- Step 7: allowlist, network gating ---
+
+
+def test_allowlist_blocks_unlisted(monkeypatch):
+    monkeypatch.setattr(settings, "command_allowlist", ["git", "python"])
+    res = run_command("echo hi")
+    assert res["success"] is False
+    assert "allowlist" in res["error"].lower()
+
+
+def test_allowlist_permits_listed(monkeypatch):
+    monkeypatch.setattr(settings, "command_allowlist", ["echo"])
+    res = run_command("echo allowed_marker")
+    assert res["success"] is True
+    assert "allowed_marker" in res["result"]
+
+
+def test_allowlist_checks_every_chained_binary(monkeypatch):
+    monkeypatch.setattr(settings, "command_allowlist", ["echo"])
+    res = run_command("echo hi && curl http://x")
+    assert res["success"] is False
+    assert "allowlist" in res["error"].lower()
+
+
+def test_network_command_blocked_by_default(monkeypatch):
+    monkeypatch.setattr(settings, "allow_network", False)
+    res = run_command("curl http://example.com")
+    assert res["success"] is False
+    assert "network" in res["error"].lower()
+
+
+def test_pip_install_flagged_as_network(monkeypatch):
+    monkeypatch.setattr(settings, "allow_network", False)
+    res = run_command("pip install requests")
+    assert res["success"] is False
+    assert "network" in res["error"].lower()
+
+
+def test_network_allowed_with_flag(monkeypatch):
+    # With allow_network the gate is off; the command may still fail to run,
+    # but it must not be rejected by the network check.
+    monkeypatch.setattr(settings, "allow_network", True)
+    res = run_command("curl --bogus-flag-xyz")
+    assert "network" not in (res["error"] or "").lower()
+
+
+def test_chained_network_command_blocked(monkeypatch):
+    monkeypatch.setattr(settings, "allow_network", False)
+    res = run_command("echo hi | wget http://x")
+    assert res["success"] is False
+    assert "network" in res["error"].lower()
+
+
 # ---------------------------------------------------------------------------
 # Git tool
 # ---------------------------------------------------------------------------

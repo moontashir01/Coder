@@ -16,6 +16,7 @@ from app.cli.repl import CoderREPL
 from app.mcp.manager import MCPManager
 from app.models.llm import test_connection
 from app.skills.loader import SkillLoader
+from config.settings import settings
 
 app = typer.Typer(help="Coder — offline AI coding assistant powered by Ollama.")
 
@@ -34,6 +35,22 @@ def main(
     session: str = typer.Option(
         "default", "--session", "-s", help="Conversation session ID"
     ),
+    allow_outside_root: bool = typer.Option(
+        False,
+        "--allow-outside-root",
+        help="Let file tools read/write outside the project root (Step 5)",
+    ),
+    yolo: bool = typer.Option(
+        False, "--yolo", help="Auto-approve all writes, deletes, and commands"
+    ),
+    safe: bool = typer.Option(
+        False,
+        "--safe",
+        help="Deny shell and file deletes unless interactively approved",
+    ),
+    allow_network: bool = typer.Option(
+        False, "--allow-network", help="Permit network-reaching shell commands"
+    ),
     version: bool = typer.Option(
         False,
         "--version",
@@ -43,6 +60,14 @@ def main(
     ),
 ) -> None:
     """Start the Coder interactive assistant."""
+    # Security profile (Phase B). Default the path jail to cwd; if --project is
+    # given, load_project narrows it to the project dir.
+    settings.sandbox_root = Path.cwd().resolve()
+    settings.allow_outside_root = allow_outside_root
+    settings.auto_approve = yolo
+    settings.safe_mode = safe
+    settings.allow_network = allow_network
+
     try:
         test_connection()
     except RuntimeError as e:

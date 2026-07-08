@@ -20,6 +20,31 @@ def _err(error: str) -> ToolResult:
 
 
 # ---------------------------------------------------------------------------
+# Path jail (Step 5 / S2): resolve every caller-supplied path and reject any
+# that escapes settings.sandbox_root, unless allow_outside_root is set. The
+# jail is inert when sandbox_root is None (tests / library use) so importing
+# the tools imposes no policy; main.py + load_project set the root at runtime.
+# ---------------------------------------------------------------------------
+
+
+def _jail_check(path: str) -> str | None:
+    """Return an error string if ``path`` escapes the sandbox root, else None."""
+    if settings.allow_outside_root or settings.sandbox_root is None:
+        return None
+    root = Path(settings.sandbox_root).resolve()
+    try:
+        resolved = Path(path).resolve()
+    except OSError as e:
+        return f"Cannot resolve path {path}: {e}"
+    if resolved == root or root in resolved.parents:
+        return None
+    return (
+        f"Path escapes the project root: {path}\n"
+        f"(root: {root}). Launch with --allow-outside-root to permit this."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Safe writes (Tier 3 #8): every mutating tool backs up the previous content
 # into settings.backups_dir before touching the file; undo_write restores and
 # consumes the most recent backup, so repeated undos walk back through history.
@@ -123,6 +148,9 @@ def _is_binary(p: Path) -> bool:
 
 
 def read_file(path: str) -> ToolResult:
+    jail = _jail_check(path)
+    if jail:
+        return _err(jail)
     try:
         p = Path(path)
         cap = settings.max_read_file_bytes
@@ -141,6 +169,9 @@ def read_file(path: str) -> ToolResult:
 
 
 def write_file(path: str, content: str) -> ToolResult:
+    jail = _jail_check(path)
+    if jail:
+        return _err(jail)
     try:
         p = Path(path)
         old_content: str | None = None
@@ -158,6 +189,9 @@ def write_file(path: str, content: str) -> ToolResult:
 
 
 def edit_file(path: str, old_str: str, new_str: str) -> ToolResult:
+    jail = _jail_check(path)
+    if jail:
+        return _err(jail)
     try:
         p = Path(path)
         original = p.read_text(encoding="utf-8", errors="replace")
@@ -182,6 +216,9 @@ def edit_file(path: str, old_str: str, new_str: str) -> ToolResult:
 
 
 def create_file(path: str, content: str = "") -> ToolResult:
+    jail = _jail_check(path)
+    if jail:
+        return _err(jail)
     try:
         p = Path(path)
         if p.exists():
@@ -198,6 +235,9 @@ def delete_file(path: str, confirm: bool = False) -> ToolResult:
         return _err(
             f"delete_file requires confirm=True to prevent accidental deletion of {path}"
         )
+    jail = _jail_check(path)
+    if jail:
+        return _err(jail)
     try:
         p = Path(path)
         if not p.exists():
@@ -211,6 +251,9 @@ def delete_file(path: str, confirm: bool = False) -> ToolResult:
 
 
 def list_directory(path: str, recursive: bool = False) -> ToolResult:
+    jail = _jail_check(path)
+    if jail:
+        return _err(jail)
     try:
         p = Path(path)
         if not p.exists():
@@ -231,6 +274,9 @@ def list_directory(path: str, recursive: bool = False) -> ToolResult:
 
 
 def search_files(path: str, pattern: str) -> ToolResult:
+    jail = _jail_check(path)
+    if jail:
+        return _err(jail)
     try:
         root = Path(path)
         if not root.exists():

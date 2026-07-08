@@ -1,5 +1,6 @@
-import subprocess
+import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,23 @@ from config.settings import settings
 
 ToolResult = dict[str, Any]
 MAX_OUTPUT = 4000
+
+# Shell operators that chain commands. We split on these so the allowlist and
+# network gate inspect EVERY binary in a compound command (e.g. `ok && curl x`),
+# not just the first — this is the "gate shell metacharacters" half of Step 7:
+# shell=True stays for Windows usability, but chained binaries can't smuggle a
+# denied/network command past the checks.
+_SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|\||;|&|\n")
+
+# Package managers reaching a remote index, and network-y git subcommands.
+_INSTALL_NETWORK_RE = re.compile(
+    r"\b(pip|pip3|pipx|npm|pnpm|yarn|poetry|conda|apt|apt-get|brew|choco|gem|cargo)\b"
+    r".*\b(install|add|download|fetch)\b",
+    re.IGNORECASE,
+)
+_GIT_NETWORK_RE = re.compile(
+    r"\bgit\b.*\b(clone|pull|fetch|push|remote\s+(add|set-url))\b", re.IGNORECASE
+)
 
 
 def _ok(result: str) -> ToolResult:
@@ -43,6 +61,54 @@ def _is_blocked(command: str) -> bool:
     return False
 
 
+def _segments(command: str) -> list[str]:
+    return [s.strip() for s in _SEGMENT_SPLIT_RE.split(command) if s.strip()]
+
+
+def _binary_name(segment: str) -> str:
+    """Best-effort name of the binary a segment invokes (no path, no .exe)."""
+    toks = segment.split()
+    if not toks:
+        return ""
+    name = Path(toks[0]).name.lower()
+    return name[:-4] if name.endswith(".exe") else name
+
+
+def _allowlist_violation(command: str) -> str | None:
+    """When settings.command_allowlist is non-empty, every chained binary must
+    be on it (Step 7 / S1). Empty allowlist = disabled (denylist still applies)."""
+    allow = {a.lower() for a in settings.command_allowlist}
+    if not allow:
+        return None
+    for seg in _segments(command):
+        name = _binary_name(seg)
+        if name and name not in allow:
+            return (
+                f"Command {name!r} is not in the allowlist "
+                f"({sorted(allow)}); blocked."
+            )
+    return None
+
+
+def _network_violation(command: str) -> str | None:
+    """Refuse commands that reach the network unless allow_network (Step 7 / S4)."""
+    if settings.allow_network:
+        return None
+    net = {c.lower() for c in settings.network_commands}
+    for seg in _segments(command):
+        if _binary_name(seg) in net:
+            return (
+                f"Network command {_binary_name(seg)!r} is blocked; "
+                "launch with --allow-network to permit it."
+            )
+    if _INSTALL_NETWORK_RE.search(command) or _GIT_NETWORK_RE.search(command):
+        return (
+            "Network-reaching command blocked; launch with --allow-network "
+            "to permit it."
+        )
+    return None
+
+
 def _truncate(text: str) -> str:
     if len(text) > MAX_OUTPUT:
         return text[:MAX_OUTPUT] + f"\n... [truncated — {len(text) - MAX_OUTPUT} more chars]"
@@ -56,6 +122,14 @@ def run_command(
 ) -> ToolResult:
     if _is_blocked(command):
         return _err(f"Command blocked by safety rules: {command!r}")
+
+    allow_err = _allowlist_violation(command)
+    if allow_err:
+        return _err(allow_err)
+
+    net_err = _network_violation(command)
+    if net_err:
+        return _err(net_err)
 
     timeout = timeout or settings.command_timeout_seconds
     cwd_path = Path(cwd).resolve() if cwd else None

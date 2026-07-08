@@ -87,6 +87,22 @@ coder --session work           # named, persistent conversation session
 coder --version
 ```
 
+### Safety & permissions
+
+By default Coder **jails file tools to the project root** (or the folder you launch it in) and, in
+an interactive session, **asks before each write, delete, or shell command**. Flags to tune this:
+
+```bash
+coder --yolo                 # auto-approve all writes/deletes/commands (no prompts)
+coder --safe                 # deny shell + file deletes unless you approve them
+coder --allow-outside-root   # let file tools touch paths outside the project root
+coder --allow-network        # permit network-reaching commands (curl/wget/pip install/…)
+```
+
+At the approval prompt, choose `[a]llow` once, allow `[s]ession` (remember this tool for the
+session), or `[d]eny`. Network-reaching and out-of-root actions are blocked by default — Coder is
+offline-first, so nothing reaches the network unless you opt in.
+
 ---
 
 ## Manual install (no script)

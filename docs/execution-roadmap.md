@@ -263,7 +263,7 @@ invoked at the end of the installer for a guided first run (optional).
 | Phase | Steps | Status |
 |-------|-------|--------|
 | A — Retrieval | 1–4 | ☑ (done) |
-| B — Security | 5–8 | ☐ |
+| B — Security | 5–8 | ☑ (done) |
 | C — Robustness | 9–12 | ☐ |
 | D — Packaging/UX | 13–15 | ☐ |
 

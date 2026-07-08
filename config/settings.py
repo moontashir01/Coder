@@ -68,6 +68,44 @@ class Settings(BaseSettings):
     # ToolDefinition.permissions intersects this list. Tags in use:
     # fs:read, fs:write, fs:delete, shell, git:read, git:write, mcp.
     denied_permissions: list[str] = []
+
+    # Path jail (Step 5 / S2): file tools reject paths that resolve outside
+    # sandbox_root. None disables the jail (tests / library use); main.py sets
+    # it to cwd at startup and load_project narrows it to the project dir.
+    # allow_outside_root (or the --allow-outside-root flag) turns it off.
+    sandbox_root: Path | None = None
+    allow_outside_root: bool = False
+
+    # Human-in-the-loop approval (Step 6 / S3, S6): the Executor consults an
+    # approval hook before running any tool whose permissions intersect
+    # approval_gated_permissions. auto_approve (--yolo) skips the gate;
+    # safe_mode (--safe) denies safe_deny_permissions when there is no
+    # interactive approver (e.g. a non-TTY run). No hook + not safe = allow,
+    # so tests and piped/eval runs never block.
+    auto_approve: bool = False
+    safe_mode: bool = False
+    approval_gated_permissions: list[str] = ["fs:write", "fs:delete", "shell"]
+    safe_deny_permissions: list[str] = ["shell", "fs:delete"]
+
+    # Shell hardening (Step 7 / S1, S4). command_allowlist, when non-empty,
+    # restricts run_command to those invoked binaries (denylist stays a
+    # backstop). Network-reaching commands are refused unless allow_network
+    # (--allow-network); network_commands lists the gated binaries.
+    command_allowlist: list[str] = []
+    allow_network: bool = False
+    network_commands: list[str] = [
+        "curl",
+        "wget",
+        "nc",
+        "ncat",
+        "netcat",
+        "telnet",
+        "ssh",
+        "scp",
+        "sftp",
+        "ftp",
+        "rsync",
+    ]
     allowed_commands: list[str] = [
         "python",
         "pip",
