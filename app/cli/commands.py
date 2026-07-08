@@ -9,6 +9,8 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
+from config.settings import settings
+
 if TYPE_CHECKING:
     from app.cli.repl import CoderREPL
 
@@ -24,6 +26,7 @@ HELP_TEXT = """
 
 [yellow]Tools & Context[/yellow]
   /tools                List all registered tools (builtin + MCP)
+  /model [name]         Show or switch the Ollama model (e.g. qwen2.5-coder:14b)
   /undo [path]          Undo the last file write/edit/delete (restores backup)
   /history              Show recent conversation turns
   /clear                Clear conversation history
@@ -101,6 +104,21 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
         for t in tools:
             table.add_row(t.name, t.source, t.description)
         console.print(table)
+        return True
+
+    # ── /model ─────────────────────────────────────────────────────────
+    if cmd == "model":
+        if not args:
+            console.print(f"[green]Current model:[/green] {settings.llm_model}")
+            console.print(
+                "[dim]Switch with: /model <name> — e.g. qwen2.5-coder:14b or "
+                "qwen2.5-coder:32b (must be pulled: ollama pull <name>).[/dim]"
+            )
+            return True
+        new_model = args[0]
+        previous = repl.agent.set_model(new_model)
+        console.print(f"[green]Model switched:[/green] {previous} → {new_model}")
+        console.print(f"[dim]If it isn't pulled yet: ollama pull {new_model}[/dim]")
         return True
 
     # ── /undo ──────────────────────────────────────────────────────────

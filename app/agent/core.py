@@ -527,6 +527,19 @@ class AgentCore:
     def set_skills_context(self, skills_text: str) -> None:
         self._skills_context = skills_text
 
+    def set_model(self, model_name: str) -> str:
+        """Switch the Ollama LLM at runtime (Step 15 / U5). Rebuilds every cached
+        LLM (agent + planner) so they use the new model. Returns the previous
+        model name. The embedding model is unchanged."""
+        previous = settings.llm_model
+        settings.llm_model = model_name
+        self._llm = get_llm(temperature=0.1, json_mode=False)
+        self._llm_direct = get_llm(temperature=0.2, json_mode=False)
+        self._llm_edit = get_llm(temperature=0.0, json_mode=False)
+        self._llm_stream = get_streaming_llm(temperature=0.1)
+        self.planner = Planner()
+        return previous
+
     def _reindex_after_write(self, path: str | Path) -> None:
         """Refresh the RAG + symbol index for a just-written file so retrieval
         isn't stale (roadmap Step 1 / C1).
