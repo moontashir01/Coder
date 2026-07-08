@@ -265,7 +265,7 @@ invoked at the end of the installer for a guided first run (optional).
 | A — Retrieval | 1–4 | ☑ (done) |
 | B — Security | 5–8 | ☑ (done) |
 | C — Robustness | 9–12 | ☑ (done) |
-| D — Packaging/UX | 13–15 | ☐ |
+| D — Packaging/UX | 13–15 | ☑ (done) |
 
 *Tick a step only when its Definition of Done (tests green + fresh-install smoke test passing +
 docs updated) holds.*

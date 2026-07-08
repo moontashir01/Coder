@@ -100,13 +100,17 @@ def main(
         False, "--allow-network", help="Permit network-reaching shell commands"
     ),
     no_index: bool = typer.Option(
-        False, "--no-index", help="Don't auto-load/index the current directory on startup"
+        False,
+        "--no-index",
+        help="Don't auto-load/index the current directory on startup",
     ),
     update: bool = typer.Option(
         False, "--update", help="Update Coder to the latest version and exit"
     ),
     dry_run: bool = typer.Option(
-        False, "--dry-run", help="With --update: print the actions instead of running them"
+        False,
+        "--dry-run",
+        help="With --update: print the actions instead of running them",
     ),
     version: bool = typer.Option(
         False,
@@ -209,7 +213,9 @@ def init(
     """Create a .env with common settings and print first-run steps."""
     env_path = Path(".env")
     if env_path.exists() and not force:
-        typer.echo(f".env already exists at {env_path.resolve()} (use --force to overwrite).")
+        typer.echo(
+            f".env already exists at {env_path.resolve()} (use --force to overwrite)."
+        )
     else:
         env_path.write_text(_ENV_TEMPLATE, encoding="utf-8")
         typer.echo(f"Wrote {env_path.resolve()}")

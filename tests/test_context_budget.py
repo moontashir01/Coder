@@ -100,7 +100,7 @@ def test_split_returns_kept_and_dropped():
     history = _history(10)
     kept, dropped = split_history_at_budget("sys", history, "latest", max_tokens=300)
     assert kept and dropped
-    assert kept + [] == history[len(dropped):]
+    assert kept + [] == history[len(dropped) :]
     assert dropped == history[: len(dropped)]
     # dropped is the oldest prefix
     assert dropped[0].content.startswith("H0")
