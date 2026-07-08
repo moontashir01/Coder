@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
-from app.agent.context_budget import trim_history_to_budget
+from app.agent.context_budget import render_transcript, split_history_at_budget
 from app.agent.executor import Executor
 from app.agent.planner import Planner, _extract_json
 from app.agent.recovery import classify_error, recovery_hint
@@ -618,16 +618,44 @@ class AgentCore:
 
         system_text = "\n".join(parts)
 
-        # Conversation history — trimmed to the token budget (oldest dropped),
-        # so long sessions don't silently overflow the model's context window.
+        # Conversation history — trimmed to the token budget so long sessions
+        # don't overflow the context window. Instead of silently forgetting the
+        # dropped oldest turns, summarize them into the system prompt (U6).
         history = await self.memory.get_messages()
-        history = trim_history_to_budget(
+        kept, dropped = split_history_at_budget(
             system_text, history, user_message, settings.max_context_tokens
         )
+        if dropped and settings.summarize_history:
+            summary = self._summarize_history(dropped)
+            if summary:
+                system_text += f"\n\n## Earlier conversation (summary)\n{summary}"
+
         msgs = [SystemMessage(content=system_text)]
-        msgs.extend(history)
+        msgs.extend(kept)
         msgs.append(HumanMessage(content=user_message))
         return msgs
+
+    def _summarize_history(self, messages: list) -> str:
+        """Condense dropped history into a short note (U6). Best-effort: a failed
+        or unreachable LLM degrades to no summary rather than blocking the turn."""
+        if not messages:
+            return ""
+        prompt = (
+            "Summarize the earlier conversation below into a few concise bullet "
+            "points, preserving key facts, decisions, file names, and unfinished "
+            "tasks. Output only the summary.\n\n" + render_transcript(messages)
+        )
+        try:
+            resp = self._llm_direct.invoke(
+                [
+                    SystemMessage(content="You summarize conversations tersely."),
+                    HumanMessage(content=prompt),
+                ]
+            )
+            return str(getattr(resp, "content", "") or "").strip()
+        except Exception as e:
+            logger.debug("history summarization failed: %s", e)
+            return ""
 
     # ------------------------------------------------------------------
     # Tool-call loop (native function calling)

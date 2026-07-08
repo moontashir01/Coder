@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     max_repair_attempts: int = 2
     retrieval_top_k: int = 5
     conversation_buffer_size: int = 20
+    # U6: when history overflows max_context_tokens, summarize the dropped
+    # oldest turns into a compact note instead of silently forgetting them.
+    summarize_history: bool = True
 
     # Safety
     # Safe writes (Tier 3 #8): mutating file tools back up the previous

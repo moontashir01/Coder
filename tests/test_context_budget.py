@@ -5,7 +5,12 @@ Fully offline: tiktoken is local, no Ollama.
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.agent.context_budget import count_tokens, trim_history_to_budget
+from app.agent.context_budget import (
+    count_tokens,
+    render_transcript,
+    split_history_at_budget,
+    trim_history_to_budget,
+)
 
 
 def test_count_tokens_positive_and_monotonic():
@@ -73,6 +78,7 @@ async def test_build_messages_trims_history(tmp_path, monkeypatch):
         await a.memory.add_ai(f"A{i} " + "word " * 200)
 
     monkeypatch.setattr(settings, "max_context_tokens", 500)
+    monkeypatch.setattr(settings, "summarize_history", False)  # pure trimming here
     msgs = await a._build_messages("latest question", include_tool_protocol=False)
 
     assert msgs[0].__class__.__name__ == "SystemMessage"
@@ -83,3 +89,72 @@ async def test_build_messages_trims_history(tmp_path, monkeypatch):
     joined = " ".join(m.content for m in history_msgs)
     assert "H0" not in joined  # oldest dropped
     assert "A9" in joined  # newest kept
+
+
+# ---------------------------------------------------------------------------
+# U6 — summarize dropped turns instead of forgetting them
+# ---------------------------------------------------------------------------
+
+
+def test_split_returns_kept_and_dropped():
+    history = _history(10)
+    kept, dropped = split_history_at_budget("sys", history, "latest", max_tokens=300)
+    assert kept and dropped
+    assert kept + [] == history[len(dropped):]
+    assert dropped == history[: len(dropped)]
+    # dropped is the oldest prefix
+    assert dropped[0].content.startswith("H0")
+
+
+def test_render_transcript_labels_roles():
+    text = render_transcript([HumanMessage(content="hi"), AIMessage(content="yo")])
+    assert "User: hi" in text
+    assert "Assistant: yo" in text
+
+
+class _SummaryLLM:
+    def __init__(self, summary):
+        self._summary = summary
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        return AIMessage(content=self._summary)
+
+
+async def test_build_messages_summarizes_dropped_history(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    from app.agent.core import AgentCore
+    from config.settings import settings
+
+    a = AgentCore(session_id="pytest_summary_build")
+    for i in range(10):
+        await a.memory.add_human(f"H{i} " + "word " * 200)
+        await a.memory.add_ai(f"A{i} " + "word " * 200)
+
+    fake = _SummaryLLM("- earlier: user asked about H0/H1 tasks")
+    a._llm_direct = fake
+    monkeypatch.setattr(settings, "max_context_tokens", 500)
+    monkeypatch.setattr(settings, "summarize_history", True)
+
+    msgs = await a._build_messages("latest question", include_tool_protocol=False)
+    system_text = msgs[0].content
+
+    assert fake.calls == 1
+    assert "Earlier conversation (summary)" in system_text
+    assert "earlier: user asked about H0/H1 tasks" in system_text
+
+
+async def test_summarize_history_degrades_when_llm_fails(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    from app.agent.core import AgentCore
+
+    a = AgentCore(session_id="pytest_summary_fail")
+
+    class _BoomLLM:
+        def invoke(self, messages):
+            raise RuntimeError("no ollama")
+
+    a._llm_direct = _BoomLLM()
+    out = a._summarize_history([HumanMessage(content="hi")])
+    assert out == ""  # best-effort: failure yields no summary, not an exception

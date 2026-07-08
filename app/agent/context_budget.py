@@ -31,18 +31,19 @@ def _message_tokens(message: BaseMessage) -> int:
     return count_tokens(str(message.content)) + _PER_MESSAGE_OVERHEAD
 
 
-def trim_history_to_budget(
+def split_history_at_budget(
     system_text: str,
     history: list[BaseMessage],
     latest_text: str,
     max_tokens: int,
-) -> list[BaseMessage]:
-    """Return the newest suffix of ``history`` that fits within ``max_tokens``.
+) -> tuple[list[BaseMessage], list[BaseMessage]]:
+    """Split ``history`` into ``(kept, dropped)`` at the token budget.
 
-    The system prompt and the latest user message are the irreducible core of
-    the turn and are always counted but never dropped — if they alone exceed the
-    budget, history is trimmed to empty (never raises). History order is
-    preserved; only the oldest messages are removed.
+    ``kept`` is the newest suffix that fits alongside the system prompt and the
+    latest user message; ``dropped`` is the oldest prefix that didn't fit (in
+    original order). The system prompt and latest message are always counted but
+    never dropped. Never raises — if the fixed core alone exceeds the budget, all
+    history lands in ``dropped``.
     """
     fixed = (
         count_tokens(system_text)
@@ -50,7 +51,32 @@ def trim_history_to_budget(
         + 2 * _PER_MESSAGE_OVERHEAD
     )
     kept = list(history)
+    dropped: list[BaseMessage] = []
     running = fixed + sum(_message_tokens(m) for m in kept)
     while kept and running > max_tokens:
-        running -= _message_tokens(kept.pop(0))
+        m = kept.pop(0)
+        running -= _message_tokens(m)
+        dropped.append(m)
+    return kept, dropped
+
+
+def trim_history_to_budget(
+    system_text: str,
+    history: list[BaseMessage],
+    latest_text: str,
+    max_tokens: int,
+) -> list[BaseMessage]:
+    """Return the newest suffix of ``history`` that fits within ``max_tokens``
+    (the ``kept`` half of :func:`split_history_at_budget`)."""
+    kept, _ = split_history_at_budget(system_text, history, latest_text, max_tokens)
     return kept
+
+
+def render_transcript(messages: list[BaseMessage]) -> str:
+    """Render messages into a compact ``Role: content`` transcript for an LLM to
+    summarize (Step 15 / U6). Pure/offline — the LLM call lives in the agent."""
+    lines: list[str] = []
+    for m in messages:
+        role = "User" if m.__class__.__name__ == "HumanMessage" else "Assistant"
+        lines.append(f"{role}: {str(m.content)}")
+    return "\n".join(lines)

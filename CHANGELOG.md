@@ -30,6 +30,9 @@ All notable changes to Coder are documented here. The format follows
   untrusted data the model must not treat as instructions.
 
 ### Changed
+- **Conversation summarization** — when history overflows the token budget, the
+  dropped oldest turns are summarized into the prompt instead of being silently
+  forgotten (`summarize_history`, on by default).
 - **Faster loads** — incremental, content-hash indexing skips unchanged files
   and a persistent on-disk embedding cache survives restarts; the indexer
   honors `.gitignore` and size/binary caps.
