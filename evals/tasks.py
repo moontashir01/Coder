@@ -7,8 +7,13 @@ quality. Add tasks here as new behaviors ship.
 
 from __future__ import annotations
 
-from evals.checks import (answer_contains, file_contains, file_excludes,
-                          file_exists, min_files_written)
+from evals.checks import (
+    answer_contains,
+    file_contains,
+    file_excludes,
+    file_exists,
+    min_files_written,
+)
 from evals.harness import EvalTask
 
 GOLDEN_TASKS: list[EvalTask] = [
@@ -73,6 +78,33 @@ GOLDEN_TASKS: list[EvalTask] = [
         checks=[
             file_contains("index.html", "<link"),
             file_excludes("index.html", "<style>"),
+        ],
+    ),
+    # --- multi-task compliance (M1: several instructions in one prompt) ---
+    EvalTask(
+        id="multitask_two_files",
+        prompt=(
+            "Create a file alpha.py with a function a() that returns 1, and "
+            "create a file beta.py with a function b() that returns 2."
+        ),
+        checks=[
+            file_exists("alpha.py"),
+            file_contains("alpha.py", "def a"),
+            file_exists("beta.py"),
+            file_contains("beta.py", "def b"),
+            min_files_written(2),
+        ],
+    ),
+    EvalTask(
+        id="multitask_sequence",
+        prompt=(
+            "First create notes.md with a top-level heading, then create "
+            "todo.md with a markdown bullet list of two items."
+        ),
+        checks=[
+            file_exists("notes.md"),
+            file_exists("todo.md"),
+            min_files_written(2),
         ],
     ),
     # --- plain Q&A (no file, answer content) ------------------------------

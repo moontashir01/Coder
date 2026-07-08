@@ -1,4 +1,5 @@
 """Slash-command handlers for the Coder REPL."""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,8 +7,8 @@ import shlex
 from typing import TYPE_CHECKING
 
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
+from rich.table import Table
 
 from config.settings import settings
 
@@ -26,6 +27,7 @@ HELP_TEXT = """
 
 [yellow]Tools & Context[/yellow]
   /tools                List all registered tools (builtin + MCP)
+  /plan <task>          Preview how a task decomposes into steps (no execution)
   /model [name]         Show or switch the Ollama model (e.g. qwen2.5-coder:14b)
   /undo [path]          Undo the last file write/edit/delete (restores backup)
   /history              Show recent conversation turns
@@ -106,6 +108,34 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
         console.print(table)
         return True
 
+    # ── /plan ──────────────────────────────────────────────────────────
+    if cmd == "plan":
+        if not args:
+            console.print("[red]Usage: /plan <task description>[/red]")
+            return True
+        task = " ".join(args)
+        # Cheap regex decomposition first (what chat() would auto-split).
+        cheap = repl.agent.split_tasks(task)
+        if len(cheap) > 1:
+            console.print("[bold]Detected sub-tasks:[/bold]")
+            for i, t in enumerate(cheap, 1):
+                console.print(f"  [cyan]{i}.[/cyan] {t}")
+        # Then the LLM planner's ordered steps (for a single multi-step task).
+        plan = repl.agent.get_plan(task)
+        steps = plan.get("steps", [])
+        table = Table(title=f"Planner ({plan.get('task_type', '?')})", show_lines=False)
+        table.add_column("#", style="cyan")
+        table.add_column("Step")
+        table.add_column("Tool", style="yellow")
+        for i, s in enumerate(steps, 1):
+            table.add_row(
+                str(i),
+                str(s.get("step_description", "")),
+                str(s.get("suggested_tool") or "-"),
+            )
+        console.print(table)
+        return True
+
     # ── /model ─────────────────────────────────────────────────────────
     if cmd == "model":
         if not args:
@@ -152,7 +182,9 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
     # ── /mcp ───────────────────────────────────────────────────────────
     if cmd == "mcp":
         if not args:
-            console.print("[red]Usage: /mcp list | /mcp add <name> <cmd> [...] | /mcp remove <name>[/red]")
+            console.print(
+                "[red]Usage: /mcp list | /mcp add <name> <cmd> [...] | /mcp remove <name>[/red]"
+            )
             return True
         sub = args[0].lower()
 
@@ -164,8 +196,14 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
             if not servers:
                 console.print("[yellow]No MCP servers configured.[/yellow]")
             for s in servers:
-                status = "[green]connected[/green]" if s.get("connected") else "[red]disconnected[/red]"
-                console.print(f"  {s['name']} — {status} — {s.get('tool_count', 0)} tools")
+                status = (
+                    "[green]connected[/green]"
+                    if s.get("connected")
+                    else "[red]disconnected[/red]"
+                )
+                console.print(
+                    f"  {s['name']} — {status} — {s.get('tool_count', 0)} tools"
+                )
             return True
 
         if sub == "add":
@@ -198,7 +236,9 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
     # ── /skills ────────────────────────────────────────────────────────
     if cmd == "skills":
         if not args:
-            console.print("[red]Usage: /skills list | /skills enable <name> | /skills disable <name>[/red]")
+            console.print(
+                "[red]Usage: /skills list | /skills enable <name> | /skills disable <name>[/red]"
+            )
             return True
         sub = args[0].lower()
         loader = _get_skill_loader(repl)
@@ -215,7 +255,9 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
             table.add_column("Status", style="yellow")
             table.add_column("Keywords")
             for s in skills:
-                status = "[green]enabled[/green]" if s.enabled else "[dim]disabled[/dim]"
+                status = (
+                    "[green]enabled[/green]" if s.enabled else "[dim]disabled[/dim]"
+                )
                 table.add_row(s.name, status, ", ".join(s.trigger_keywords[:5]))
             console.print(table)
             return True
@@ -239,7 +281,7 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
         console.print(f"[red]Unknown skills sub-command: {sub}[/red]")
         return True
 
-    return False   # unknown command
+    return False  # unknown command
 
 
 def _get_mcp_manager(repl: CoderREPL):

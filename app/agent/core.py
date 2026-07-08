@@ -48,7 +48,12 @@ def _tool_guidance(workdir: str) -> str:
 You have access to real tools via native function calling. Use a tool when the
 task needs file or command access; answer directly (in plain text) when it does not.
 When asked to create or save a file, you MUST call write_file (or create_file)
-with a relative path like "index.html" — do not just print the code."""
+with a relative path like "index.html" — do not just print the code.
+
+The user's message may contain SEVERAL distinct requests. First enumerate every
+one of them, then use tools to complete ALL of them before you give a final
+answer. Do not stop after the first — a text response with no tool call is only
+final once every requested task is done."""
 
 
 def _load_system_prompt() -> str:
@@ -156,6 +161,126 @@ def wants_multifile(message: str) -> bool:
     return len(types) >= 2
 
 
+# --- Compound-request decomposition (M1) ----------------------------------
+# One prompt may hold several instructions ("create the page, add a test, and
+# write a README"). _split_compound turns that into an ordered list of
+# sub-tasks so chat() can route and complete EACH — instead of only the first.
+
+# Imperative action verbs that mark the start of a distinct instruction.
+_ACTION_VERBS = (
+    "create",
+    "make",
+    "write",
+    "build",
+    "generate",
+    "scaffold",
+    "add",
+    "append",
+    "insert",
+    "update",
+    "change",
+    "modify",
+    "edit",
+    "refactor",
+    "rewrite",
+    "fix",
+    "implement",
+    "put",
+    "delete",
+    "remove",
+    "rename",
+    "move",
+    "split",
+    "separate",
+    "extract",
+    "run",
+    "execute",
+    "install",
+    "test",
+    "explain",
+    "describe",
+    "show",
+    "list",
+    "find",
+    "search",
+    "commit",
+    "format",
+    "document",
+    "convert",
+    "replace",
+    "set",
+)
+# Optional ordinal / politeness lead-ins that can precede the verb.
+_LEADIN = (
+    r"(?:(?:please|then|also|now|next|first|firstly|second|secondly|third|"
+    r"thirdly|finally|lastly|afterwards?)\s+|and\s+)*"
+)
+_ACTION_VERB_RE = re.compile(
+    r"^" + _LEADIN + r"(?:" + "|".join(_ACTION_VERBS) + r")\b",
+    re.IGNORECASE,
+)
+
+# Explicit sequence separators — deliberately NOT a bare " and " (that would
+# wrongly split "a function that adds a and b"). Only comma-lists and sequence
+# words ("then", "after that", "also", "and then").
+_TASK_SEPARATOR_RE = re.compile(
+    r"""
+      \s*[;\n]+\s*                 # semicolons / newlines
+    | \s+and\s+then\s+            # "... and then ..."
+    | \s+and\s+also\s+           # "... and also ..."
+    | \s+after\s+that,?\s+       # "... after that ..."
+    | \s+then\s+                 # "... then ..."
+    | \s+also\s+                 # "... also ..."
+    | \s*,\s*(?:and\s+|then\s+)?  # comma, optional trailing "and"/"then"
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_NUMBERED_ITEM_RE = re.compile(r"(?:^|\s)\d+[.)]\s+")
+_BULLET_ITEM_RE = re.compile(r"(?m)^\s*[-*•]\s+")
+
+
+def _fragments_to_tasks(fragments: list[str]) -> list[str]:
+    """Reduce ordered fragments to tasks: a fragment that STARTS with an
+    imperative verb opens a new task; any other fragment is glued back onto the
+    previous task (it's a continuation, not a new instruction). A leading
+    non-imperative fragment with no task yet is dropped as lead-in prose."""
+    tasks: list[str] = []
+    for frag in fragments:
+        if _ACTION_VERB_RE.match(frag):
+            tasks.append(frag)
+        elif tasks:
+            tasks[-1] = f"{tasks[-1]}; {frag}"
+    return tasks
+
+
+def _split_compound(message: str) -> list[str]:
+    """Split a compound request into ordered sub-tasks (M1).
+
+    Cheap, LLM-free, and deliberately conservative: a fragment only counts as a
+    separate task when it *starts* with an imperative action verb, so noun lists
+    ("a navbar, footer and hero") and relative clauses ("a function that adds a
+    and b") are NOT split. Returns ``[message]`` when the request isn't compound.
+    """
+    text = message.strip()
+    if not text:
+        return [text]
+
+    # 1) Explicit enumerations win outright — a 2+ item numbered or bulleted list.
+    for item_re in (_BULLET_ITEM_RE, _NUMBERED_ITEM_RE):
+        parts = [p.strip() for p in item_re.split(text) if p.strip()]
+        if len(parts) >= 2:
+            tasks = _fragments_to_tasks(parts)
+            if len(tasks) >= 2:
+                return tasks
+
+    # 2) Otherwise split on sequence separators and keep only verb-led fragments
+    #    as independent tasks (continuations merge back — see _fragments_to_tasks).
+    fragments = [f.strip() for f in _TASK_SEPARATOR_RE.split(text) if f and f.strip()]
+    tasks = _fragments_to_tasks(fragments)
+    return tasks if len(tasks) >= 2 else [text]
+
+
 _FILENAME_IN_MSG_RE = re.compile(r"\b([\w./-]+\.\w{1,6})\b")
 
 # keyword → default filename when the user names no explicit file
@@ -175,7 +300,9 @@ _INFER_FILENAME_TABLE: list[tuple[str, str]] = [
 _FILE_GEN_INSTRUCTIONS = """
 
 ## File generation mode
-You are creating or updating exactly ONE file on disk. Respond in EXACTLY this format, nothing else:
+You are creating or updating exactly ONE file on disk (the caller splits a
+multi-file request into separate per-file calls before reaching here, so never
+try to cram several files into this one). Respond in EXACTLY this format, nothing else:
 FILENAME: <relative filename, e.g. index.html>
 <the complete file contents>
 
@@ -607,9 +734,7 @@ class AgentCore:
                 logger.debug("RAG context retrieval failed: %s", e)
 
         if extra_context:
-            parts.append(
-                "\n## Additional Context\n" + _frame_untrusted(extra_context)
-            )
+            parts.append("\n## Additional Context\n" + _frame_untrusted(extra_context))
 
         # Tool-loop guidance (workdir + when to use tools; schemas come from bind_tools)
         if include_tool_protocol:
@@ -664,14 +789,19 @@ class AgentCore:
     async def _run_tool_loop(
         self,
         messages: list,
-        max_steps: int = 8,
+        max_steps: int | None = None,
     ) -> tuple[str, list[dict]]:
         """Async tool-call loop via native function calling.
 
         The model emits structured tool calls through ChatOllama.bind_tools —
         no hand-rolled JSON protocol, no output parsing/repair. A response
         without tool calls is the final answer. Returns (final_answer, trace).
+
+        ``max_steps`` caps the tool-call rounds; it defaults to
+        ``settings.max_tool_steps`` (M4) so multi-part work has room to finish.
         """
+        if max_steps is None:
+            max_steps = settings.max_tool_steps
         tool_trace: list[dict] = []
         current_messages = list(messages)
         fail_counts: dict[str, int] = {}  # §11: bail out of doomed retries
@@ -760,7 +890,16 @@ class AgentCore:
             if give_up:
                 return give_up, tool_trace
 
-        return "Reached maximum steps without a final answer.", tool_trace
+        # M4: ran out of rounds. Report what happened instead of an opaque
+        # "reached maximum steps" so a partially-completed multi-part request is
+        # visible rather than silently truncated.
+        acted = sum(1 for t in tool_trace if (t.get("result") or {}).get("success"))
+        return (
+            f"Stopped after {max_steps} tool-call rounds ({acted} action(s) "
+            f"completed) — the request may not be fully finished. Re-run any "
+            f"remaining parts, or raise settings.max_tool_steps.",
+            tool_trace,
+        )
 
     # ------------------------------------------------------------------
     # Public interface
@@ -1192,6 +1331,92 @@ class AgentCore:
         answer = f"Handled {len(ops)} file(s):\n" + "\n".join(summaries)
         return answer, trace
 
+    async def _route_one(
+        self,
+        message: str,
+        at_refs: list[str],
+        task_type: str | None = None,
+        extra_context: str = "",
+        on_token: Callable[[str], None] | None = None,
+    ) -> tuple[str, list[dict]]:
+        """Route ONE (already-decomposed) request through a single flow.
+
+        This is the original chat() branch ladder, factored out (M1) so chat()
+        can call it once per sub-task. ``task_type`` is classified here when not
+        supplied by the caller (chat() passes it to avoid a double classify).
+        """
+        if task_type is None:
+            task_type = self.planner.classify(message)
+
+        if wants_multifile(message):
+            # Plan + execute several file operations in one turn.
+            return await self._multi_file_flow(message, refs=at_refs)
+        if _wants_file_op(message) or task_type == "file_edit":
+            # Create/update a single file deterministically; an @ref pins the target.
+            target = self._resolve_ref(at_refs)
+            return await self._file_op_flow(
+                message,
+                target=target,
+                extra_context=extra_context,
+                on_token=on_token,
+            )
+        if task_type == "multi_step":
+            # Genuine multi-step work → native tool loop. M2: no longer gated on
+            # a loaded project — the tool loop's file tools default to cwd, so
+            # multi-step work runs in a bare folder too.
+            messages = await self._build_messages(message, extra_context=extra_context)
+            return await self._run_tool_loop(messages)
+
+        # Plain answer; inject any @-referenced files (plus caller context).
+        refs_ctx = self._read_refs(at_refs)
+        combined = "\n\n".join(c for c in (extra_context, refs_ctx) if c)
+        answer = await self._direct_answer(
+            message, extra_context=combined, on_token=on_token
+        )
+        return answer, []
+
+    async def _run_subtasks(
+        self, subtasks: list[str], at_refs: list[str]
+    ) -> tuple[str, list[dict]]:
+        """Execute decomposed sub-tasks in order (M1).
+
+        Each sub-task is routed independently, and a short summary of the work
+        already done is threaded forward as context so later steps stay
+        consistent (matching filenames/imports) — the same trick
+        _multi_file_flow uses for siblings. Streaming is disabled here: like the
+        multi-file path, the combined answer is returned whole.
+        """
+        trace: list[dict] = []
+        summaries: list[str] = []
+        done: list[str] = []
+        for i, sub in enumerate(subtasks, 1):
+            extra = ""
+            if done:
+                extra = (
+                    "## Already done earlier in this same request\n"
+                    "Keep names, paths, and imports consistent with these:\n"
+                    + "\n".join(f"- {d}" for d in done)
+                )
+            # Only apply an @ref to the sub-task that actually names its path, so
+            # "edit @a.py and create b.py" doesn't target a.py for both steps.
+            sub_refs = [r for r in at_refs if r in sub]
+            ans, sub_trace = await self._route_one(sub, sub_refs, extra_context=extra)
+            trace.extend(sub_trace)
+            summaries.append(f"{i}. {sub}\n   → {ans}")
+            done.append(f"{sub} → {ans[:100]}")
+
+        header = f"Completed {len(subtasks)} tasks:\n"
+        return header + "\n".join(summaries), trace
+
+    def split_tasks(self, user_message: str) -> list[str]:
+        """Public preview of how a compound message decomposes (M1/M6).
+
+        Cheap and LLM-free: strips @refs so paths read cleanly, then applies the
+        regex splitter. Returns a single-element list when it isn't compound.
+        The REPL uses this to show the plan before executing.
+        """
+        return _split_compound(_strip_at_refs(user_message))
+
     async def chat(
         self,
         user_message: str,
@@ -1199,9 +1424,11 @@ class AgentCore:
     ) -> tuple[str, list[dict]]:
         """Process one user message. Returns (answer, tool_trace).
 
-        ``on_token`` (optional) receives answer tokens as they generate on the
-        direct-answer path and while a single file is generated (U7); the
-        multi-file and tool-loop paths still return their answer whole.
+        A compound request ("do A, then B, and C") is split into ordered
+        sub-tasks and each is routed and completed (M1); a single request routes
+        through one flow as before. ``on_token`` streams answer tokens on the
+        direct-answer and single-file paths (U7); the multi-task, multi-file and
+        tool-loop paths return their answer whole.
         """
         # @path references: pull them out, then work with a cleaned message so the
         # classifier/model see plain paths rather than "@foo".
@@ -1211,29 +1438,27 @@ class AgentCore:
         self._update_skills_context(clean_message)
         await self.memory.add_human(user_message)
 
-        task_type = self.planner.classify(clean_message)
-
-        if wants_multifile(clean_message):
-            # Plan + execute several file operations in one turn.
-            answer, trace = await self._multi_file_flow(clean_message, refs=at_refs)
-        elif _wants_file_op(clean_message) or task_type == "file_edit":
-            # Create/update a single file deterministically; an @ref pins the target.
-            target = self._resolve_ref(at_refs)
-            answer, trace = await self._file_op_flow(
-                clean_message, target=target, on_token=on_token
-            )
-        elif task_type == "multi_step" and self._project_path is not None:
-            # Genuine multi-step work in a loaded project → ReAct tool loop.
-            messages = await self._build_messages(clean_message)
-            answer, trace = await self._run_tool_loop(messages)
+        # M1: split a compound request into ordered sub-tasks so each is routed
+        # and completed, instead of only handling the first.
+        subtasks = _split_compound(clean_message)
+        if len(subtasks) >= 2:
+            answer, trace = await self._run_subtasks(subtasks, at_refs)
         else:
-            # Plain answer; inject any @-referenced files as context.
-            answer = await self._direct_answer(
-                clean_message,
-                extra_context=self._read_refs(at_refs),
-                on_token=on_token,
+            # One task per the cheap splitter. Classify once; a genuine
+            # multi_step request the splitter couldn't parse is decomposed by
+            # the LLM planner (M1 robust pass). Otherwise route it as one task.
+            task_type = self.planner.classify(clean_message)
+            planned = (
+                self.planner.decompose(clean_message)
+                if settings.decompose_multitask and task_type == "multi_step"
+                else []
             )
-            trace = []
+            if len(planned) >= 2:
+                answer, trace = await self._run_subtasks(planned, at_refs)
+            else:
+                answer, trace = await self._route_one(
+                    clean_message, at_refs, task_type=task_type, on_token=on_token
+                )
 
         await self.memory.add_ai(answer)
         return answer, trace

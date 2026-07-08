@@ -1,4 +1,5 @@
 """Main REPL loop — Rich + prompt_toolkit."""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,8 +9,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style as PTStyle
 from rich.console import Console
 from rich.live import Live
@@ -40,9 +41,11 @@ _BANNER = """[bold cyan]
 [/bold cyan][dim]  Offline AI Coding Assistant  •  powered by {model}[/dim]
 """.format(model=settings.llm_model)
 
-_PT_STYLE = PTStyle.from_dict({
-    "prompt": "ansicyan bold",
-})
+_PT_STYLE = PTStyle.from_dict(
+    {
+        "prompt": "ansicyan bold",
+    }
+)
 
 _CODE_FENCE_RE = re.compile(r"```(\w*)\n(.*?)```", re.DOTALL)
 
@@ -52,7 +55,7 @@ def _render_response(text: str) -> None:
     last = 0
     for m in _CODE_FENCE_RE.finditer(text):
         # Print prose before the fence
-        before = text[last:m.start()].strip()
+        before = text[last : m.start()].strip()
         if before:
             console.print(before)
         lang = m.group(1) or "text"
@@ -69,7 +72,9 @@ _MAX_DIFF_LINES = 60
 
 def _print_tool_step(tool_name: str, result: dict) -> None:
     status = "[green]✓[/green]" if result.get("success") else "[red]✗[/red]"
-    console.print(f"  [dim cyan][Tool][/dim cyan] {tool_name} {status}", highlight=False)
+    console.print(
+        f"  [dim cyan][Tool][/dim cyan] {tool_name} {status}", highlight=False
+    )
     diff = result.get("diff")
     if diff:
         lines = diff.splitlines()
@@ -77,7 +82,9 @@ def _print_tool_step(tool_name: str, result: dict) -> None:
             Syntax("\n".join(lines[:_MAX_DIFF_LINES]), "diff", theme="monokai")
         )
         if len(lines) > _MAX_DIFF_LINES:
-            console.print(f"  [dim]... {len(lines) - _MAX_DIFF_LINES} more diff lines[/dim]")
+            console.print(
+                f"  [dim]... {len(lines) - _MAX_DIFF_LINES} more diff lines[/dim]"
+            )
 
 
 class CoderREPL:
@@ -90,9 +97,9 @@ class CoderREPL:
         self.agent = agent
         self.mcp_manager = mcp_manager
         self.skill_loader = skill_loader
-        self.agent.skill_loader = skill_loader   # keep agent in sync
+        self.agent.skill_loader = skill_loader  # keep agent in sync
         self.running = True
-        self._session: PromptSession | None = None   # created lazily in run()
+        self._session: PromptSession | None = None  # created lazily in run()
         # Approval gate (Step 6 / S3): tool names the user approved for the
         # whole session, and the Live region to pause while prompting.
         self._session_allows: set[str] = set()
@@ -137,9 +144,13 @@ class CoderREPL:
             try:
                 result = await self.mcp_manager.load_from_config(self.agent.registry)
                 if result.get("connected"):
-                    console.print(f"[dim]MCP servers connected: {result['connected']}[/dim]")
+                    console.print(
+                        f"[dim]MCP servers connected: {result['connected']}[/dim]"
+                    )
                 if result.get("failed"):
-                    console.print(f"[yellow]MCP servers failed: {result['failed']}[/yellow]")
+                    console.print(
+                        f"[yellow]MCP servers failed: {result['failed']}[/yellow]"
+                    )
             except Exception as e:
                 console.print(f"[yellow]MCP load warning: {e}[/yellow]")
 
@@ -170,7 +181,9 @@ class CoderREPL:
                 try:
                     handled = await handle_command(user_input, self)
                     if not handled:
-                        console.print(f"[red]Unknown command: {user_input.split()[0]}[/red]  Type /help for the list.")
+                        console.print(
+                            f"[red]Unknown command: {user_input.split()[0]}[/red]  Type /help for the list."
+                        )
                 except Exception as e:
                     console.print(f"[red]Command error:[/red] {e}")
                 continue
@@ -186,6 +199,19 @@ class CoderREPL:
         with syntax highlighting (so streamed text is never duplicated).
         """
         console.print()  # blank line
+
+        # M6: when the request decomposes into several tasks, show the derived
+        # to-do list before executing so partial completion isn't a mystery.
+        split = getattr(self.agent, "split_tasks", None)
+        tasks = split(user_input) if callable(split) else []
+        if len(tasks) > 1:
+            plan_lines = "\n".join(
+                f"  [cyan]{i}.[/cyan] {t}" for i, t in enumerate(tasks, 1)
+            )
+            console.print(
+                Panel(plan_lines, title="[bold]Plan[/bold]", border_style="cyan")
+            )
+
         try:
             streamed: list[str] = []
             with Live(
@@ -201,9 +227,7 @@ class CoderREPL:
                     live.update(Text("".join(streamed)))
 
                 try:
-                    answer, trace = await self.agent.chat(
-                        user_input, on_token=on_token
-                    )
+                    answer, trace = await self.agent.chat(user_input, on_token=on_token)
                 finally:
                     self._active_live = None
 
@@ -219,7 +243,9 @@ class CoderREPL:
             console.print("\n[yellow](interrupted)[/yellow]")
         except Exception as e:
             console.print(f"\n[red]Agent error:[/red] {e}")
-            console.print("[dim]Type /clear to reset if the conversation is stuck.[/dim]")
+            console.print(
+                "[dim]Type /clear to reset if the conversation is stuck.[/dim]"
+            )
 
     async def _approve_tool(
         self, tool_name: str, arguments: dict, permissions: list[str]
@@ -248,9 +274,9 @@ class CoderREPL:
             loop = asyncio.get_event_loop()
             choice = await loop.run_in_executor(
                 None,
-                lambda: console.input(
-                    "  [a]llow / allow [s]ession / [d]eny: "
-                ).strip().lower(),
+                lambda: console.input("  [a]llow / allow [s]ession / [d]eny: ")
+                .strip()
+                .lower(),
             )
         finally:
             if live is not None:

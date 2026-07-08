@@ -58,6 +58,15 @@ class Settings(BaseSettings):
     max_context_tokens: int = 8192
     max_tool_retries: int = 3
     max_tool_failures: int = 2  # §11: give up a tool after this many failures
+    # M4: how many tool-call rounds the native tool loop may take before it
+    # stops. Raised from the old hard-coded 8 so genuinely multi-part work has
+    # room to finish every step.
+    max_tool_steps: int = 12
+    # M1: split a compound request ("do A, then B, and C") into ordered
+    # sub-tasks and route each one, instead of only handling the first. When the
+    # cheap regex splitter sees a single task but the planner classifies it as
+    # multi_step, fall back to the LLM planner to decompose it.
+    decompose_multitask: bool = True
     # Verify-and-repair: how many LLM repair passes to run when a just-written
     # file fails its syntax/structure check.
     max_repair_attempts: int = 2

@@ -68,6 +68,32 @@ class Planner:
         except Exception:
             return "simple_qa"
 
+    def decompose(self, user_message: str) -> list[str]:
+        """Break a multi-step request into ordered step descriptions (M1).
+
+        Runs ONLY the planning LLM call — the caller has already decided this is
+        multi_step, so classify() is skipped. Returns the ordered
+        step_description strings, or [] when it can't produce 2+ steps (so the
+        caller falls back to routing the whole message as one task).
+        """
+        try:
+            messages = [
+                SystemMessage(content=_PLAN_PROMPT),
+                HumanMessage(content=f"Task: {user_message}"),
+            ]
+            data = _extract_json(self._llm_plan.invoke(messages).content)
+            steps = data.get("steps") if isinstance(data, dict) else None
+            if not isinstance(steps, list):
+                return []
+            out = [
+                str(s.get("step_description") or "").strip()
+                for s in steps
+                if isinstance(s, dict) and str(s.get("step_description") or "").strip()
+            ]
+            return out if len(out) >= 2 else []
+        except Exception:
+            return []
+
     def plan(self, user_message: str) -> dict[str, Any]:
         """Return a full plan dict. For non-multi_step tasks returns minimal plan."""
         task_type = self.classify(user_message)
