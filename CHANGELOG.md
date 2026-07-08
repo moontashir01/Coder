@@ -7,6 +7,8 @@ All notable changes to Coder are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Streaming file generation** — creating/rewriting a single file now streams
+  the model's tokens live (previously only plain answers streamed).
 - **`/model` command** — show or switch the Ollama model at runtime (rebuilds
   the agent + planner LLMs); larger models like `qwen2.5-coder:14b`/`:32b` work.
 - **`coder init` / `coder config`** — write a `.env` template with first-run

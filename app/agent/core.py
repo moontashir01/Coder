@@ -807,6 +807,25 @@ class AgentCore:
                 continue
         return "\n\n".join(blocks)
 
+    async def _stream_or_invoke(
+        self, messages: list, on_token: Callable[[str], None] | None
+    ) -> str:
+        """Run an LLM call, streaming tokens through ``on_token`` when provided.
+
+        With no callback it's a plain invoke; with one it streams via the
+        streaming LLM and fires the callback per non-empty token. Shared by the
+        direct-answer and deterministic file-generation paths (U7).
+        """
+        if on_token is None:
+            return str(self._llm_direct.invoke(messages).content)
+        parts: list[str] = []
+        async for chunk in self._llm_stream.astream(messages):
+            piece = chunk.content
+            if piece:
+                parts.append(piece)
+                on_token(piece)
+        return "".join(parts)
+
     async def _direct_answer(
         self,
         user_message: str,
@@ -822,16 +841,7 @@ class AgentCore:
             user_message, extra_context=extra_context, include_tool_protocol=False
         )
         try:
-            if on_token is None:
-                response = self._llm_direct.invoke(messages)
-                return response.content
-            parts: list[str] = []
-            async for chunk in self._llm_stream.astream(messages):
-                piece = chunk.content
-                if piece:
-                    parts.append(piece)
-                    on_token(piece)
-            return "".join(parts)
+            return await self._stream_or_invoke(messages, on_token)
         except Exception as e:
             return f"LLM error: {e}"
 
@@ -840,6 +850,7 @@ class AgentCore:
         user_message: str,
         target: str | None = None,
         extra_context: str = "",
+        on_token: Callable[[str], None] | None = None,
     ) -> tuple[str, list[dict]]:
         """Deterministically create/update a single file on disk.
 
@@ -900,7 +911,9 @@ class AgentCore:
             HumanMessage(content=ctx),
         ]
         try:
-            raw = self._llm_direct.invoke(messages).content
+            # Stream generation tokens when a callback is set (U7): the user sees
+            # the file being generated, then the REPL replaces it with the summary.
+            raw = await self._stream_or_invoke(messages, on_token)
         except Exception as e:
             return f"LLM error while generating the file: {e}", []
 
@@ -1187,7 +1200,8 @@ class AgentCore:
         """Process one user message. Returns (answer, tool_trace).
 
         ``on_token`` (optional) receives answer tokens as they generate on the
-        direct-answer path; file/tool flows return the answer whole as before.
+        direct-answer path and while a single file is generated (U7); the
+        multi-file and tool-loop paths still return their answer whole.
         """
         # @path references: pull them out, then work with a cleaned message so the
         # classifier/model see plain paths rather than "@foo".
@@ -1205,7 +1219,9 @@ class AgentCore:
         elif _wants_file_op(clean_message) or task_type == "file_edit":
             # Create/update a single file deterministically; an @ref pins the target.
             target = self._resolve_ref(at_refs)
-            answer, trace = await self._file_op_flow(clean_message, target=target)
+            answer, trace = await self._file_op_flow(
+                clean_message, target=target, on_token=on_token
+            )
         elif task_type == "multi_step" and self._project_path is not None:
             # Genuine multi-step work in a loaded project → ReAct tool loop.
             messages = await self._build_messages(clean_message)

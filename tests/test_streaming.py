@@ -127,6 +127,51 @@ async def test_chat_without_on_token_unchanged(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# U7 — file-generation flow streams too
+# ---------------------------------------------------------------------------
+
+
+async def test_file_op_flow_streams_generation(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_fileop_stream")
+    a._llm_stream = StreamLLM(["FILENAME: hello.py\n", "print('hi')\n"])
+
+    got: list[str] = []
+    answer, trace = await a._file_op_flow("make hello.py", on_token=got.append)
+
+    assert (tmp_path / "hello.py").is_file()
+    assert "".join(got) == "FILENAME: hello.py\nprint('hi')\n"
+    assert a._llm_stream.astream_calls == 1
+    assert "Created" in answer
+
+
+async def test_file_op_flow_without_callback_uses_invoke(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_fileop_plain")
+    a._llm_direct = ScriptedLLM(["FILENAME: note.txt\nhello there\n"])
+    a._llm_stream = None  # must not be streamed without a callback
+
+    answer, trace = await a._file_op_flow("make note.txt")
+
+    assert (tmp_path / "note.txt").read_text(encoding="utf-8") == "hello there"
+    assert "Created" in answer
+
+
+async def test_chat_threads_on_token_into_file_op(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_fileop_chat")
+    monkeypatch.setattr(a.planner, "classify", lambda msg: "code_generation")
+    a._llm_stream = StreamLLM(["FILENAME: app.py\n", "x = 1\n"])
+
+    got: list[str] = []
+    answer, trace = await a.chat("create app.py", on_token=got.append)
+
+    assert (tmp_path / "app.py").is_file()
+    assert "".join(got).startswith("FILENAME: app.py")
+    assert any(step["tool"] == "write_file" for step in trace)
+
+
+# ---------------------------------------------------------------------------
 # REPL wiring — _agent_turn passes an on_token callback and renders the answer
 # ---------------------------------------------------------------------------
 
