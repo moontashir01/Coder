@@ -75,3 +75,29 @@ def test_pyproject_declares_resource_package_data():
     pkg_data = data["tool"]["setuptools"]["package-data"]
     globs = pkg_data.get("app", [])
     assert any("resources" in g for g in globs), globs
+
+
+# ---------------------------------------------------------------------------
+# Step 14 / D4 — coder --update
+# ---------------------------------------------------------------------------
+
+
+def test_update_dry_run_prints_actions_without_ollama():
+    from typer.testing import CliRunner
+
+    import main
+
+    result = CliRunner().invoke(main.app, ["--update", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "would run" in result.output
+    # From a git checkout it plans a pull + reinstall; otherwise a pipx upgrade.
+    assert ("pull" in result.output and "pip install" in result.output) or (
+        "pipx upgrade" in result.output
+    )
+
+
+def test_changelog_exists_and_has_unreleased():
+    text = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "# Changelog" in text
+    assert "Unreleased" in text

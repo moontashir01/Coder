@@ -85,6 +85,8 @@ Other entry points:
 coder --project path/to/proj   # load + index a project on startup
 coder --session work           # named, persistent conversation session
 coder --version
+coder --update                 # pull the latest version and reinstall in place
+coder --update --dry-run       # show what --update would do, without doing it
 ```
 
 ### Safety & permissions
