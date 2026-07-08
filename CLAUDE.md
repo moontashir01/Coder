@@ -147,8 +147,9 @@ would fight native tool calls. What remains of the hardening:
 ### Tool registry & executor — the central hub
 
 - `app/agent/tool_registry.py` — every tool (builtin, MCP-discovered, skill-unlocked) must be
-  registered here. `create_registry()` builds the default with all 13 builtin tools; a
-  module-level `registry` singleton exists. Tools carry `source` = `"builtin"` | `"mcp:<server>"`
+  registered here. `create_registry()` builds the default with all 13 builtin tools; `get_registry()`
+  is a **lazy** cached accessor (Step 12 / A1 — no eager import-time singleton). Tools carry
+  `source` = `"builtin"` | `"mcp:<server>"`
   | `"skill:<skill>"`; `unregister_by_source()` is how MCP disconnect cleans up. Every tool also
   carries `permissions` tags — builtins use `fs:read` / `fs:write` / `fs:delete` / `shell` /
   `git:read` / `git:write`; MCP tools are tagged `mcp` as a class.
@@ -239,14 +240,21 @@ holds) — the framing note is behavioral guidance, not tool protocol.
 
 ### Symbol index & dependency graph
 
-`app/rag/symbols.py` — an **AST-based** (stdlib `ast`, **not** tree-sitter) index of Python
-definitions, imports, and call sites, in a standalone sync sqlite3 DB (`.symbols.db`). Built during
-the same file walk as embedding: `Retriever._index_single_file()` calls `symbol_index.index_file()`
-(best-effort, never blocks embedding); `delete_file()` removes its rows. `index_file()` replaces a
-file's rows wholesale, so it is the incremental-reindex primitive. Tables: `symbols` (defs),
-`imports` (file→file dependency edges, resolved against project root), `refs` (call sites). Exposed
-to the agent via the `find_symbol` / `find_references` builtin tools. Non-Python files yield no
-symbols (graceful). Inject an in-memory index (`SymbolIndex(db_path=":memory:")`) for tests.
+`app/rag/symbols.py` — a symbol + dependency index in a standalone sync sqlite3 DB (`.symbols.db`).
+**Python is parsed with stdlib `ast`** (accurate names, imports, call sites, and the import→file
+dependency edges the graph needs); **other languages (JS/TS/JSX/TSX/Go/Rust/Java/C/C++) are parsed
+with tree-sitter** (Step 11 / A3), reusing the parsers the chunker pins — `extract_symbols()` routes
+`.py` to `_extract_symbols_py` and the rest to `_extract_symbols_ts` (definition-node-type → kind
+maps in `_TS_DEFS`, name via the `name` field or first non-body identifier, call sites via
+`call_expression`/`method_invocation`). Non-Python **imports are not resolved**, so the dependency
+graph (`dependencies`/`dependents`) stays Python-only; `symbols`/`refs` are multi-language. Built
+during the same file walk as embedding: `Retriever._index_single_file()` calls
+`symbol_index.index_file()` (best-effort, never blocks embedding); `delete_file()` removes its rows.
+`index_file()` replaces a file's rows wholesale, so it is the incremental-reindex primitive. Tables:
+`symbols` (defs), `imports` (file→file dependency edges, resolved against project root), `refs` (call
+sites). Exposed to the agent via the `find_symbol` / `find_references` builtin tools. Unsupported
+languages yield no symbols (graceful). Inject an in-memory index (`SymbolIndex(db_path=":memory:")`)
+for tests.
 
 ### Persistence
 
@@ -254,7 +262,10 @@ symbols (graceful). Inject an in-memory index (`SymbolIndex(db_path=":memory:")`
 - `.coder.db` — SQLite: conversation turns + project summaries (SQLAlchemy async / aiosqlite)
 - `.symbols.db` — sqlite3: symbol/import/reference index (sync, separate from `.coder.db`)
 - `.coder_history` — prompt_toolkit history
-- `.coder_backups/` — pre-mutation snapshots for `undo_write` (pruned to `max_write_backups`)
+- `.coder_backups/` — pre-mutation snapshots for `undo_write` (pruned to `max_write_backups`).
+  **Per-project (Step 10 / C3):** when a project is loaded these live under
+  `<sandbox_root>/.coder_backups/`, so `/undo` never restores a file from another project; without a
+  loaded project the relative default resolves against cwd.
 - `.coder_embed_cache/` — persistent embedding cache, one JSON per SHA-256 (pruned to
   `max_embed_cache_entries`); gitignored
 
@@ -289,6 +300,11 @@ verify-and-repair loop; `backups_dir` / `max_write_backups` configure safe-write
 knobs: `embed_cache_dir` / `max_embed_cache_entries` (persistent embedding cache),
 `max_index_file_bytes` (indexer size cap), `max_read_file_bytes` (`read_file` truncation cap).
 
+**Observability (Step 9 / C2):** best-effort paths that used to `except Exception: pass` now log via
+a module-level `logging.getLogger(__name__)` (`retriever`, `core`, `vector_store`, `project_memory`)
+at `debug`/`warning` — behavior is unchanged (still best-effort) but failures are visible. There's
+no global logging config; if one is added later, route these through it.
+
 ### Eval harness (`evals/`)
 
 The measuring stick for model/prompt changes. `evals/tasks.py` holds ~12 golden tasks asserting
@@ -312,9 +328,13 @@ baseline (qwen2.5-coder:7b) was 10/12 and immediately caught a real multi-file r
   `tree-sitter-language-pack`. (You'll see a harmless `FutureWarning: Language(path, name) is
   deprecated` from 0.21.3 — that is expected, not the breakage.) The symbol index (`symbols.py`)
   uses stdlib `ast` and is unaffected either way.
-- **Import-time singletons.** Importing `app.database.vector_store` constructs the ChromaDB client
-  (creates `.chroma_db/`), and `app.agent.tool_registry` builds the registry. Merely importing the
-  package writes `.chroma_db/` / `.coder.db` into the cwd. Tests rely on this being side-effect-safe.
+- **Lazy singletons (Step 12 / A1).** Importing the package no longer creates `.chroma_db/` or
+  `.symbols.db`: the ChromaDB client, symbol index, retriever, and registry are built on first use
+  via `get_vector_store()` / `get_symbol_index()` / `get_retriever()` / `get_registry()` (each a
+  cached module-level accessor), **not** at import. `tests/test_no_import_side_effects.py` guards
+  this by importing the modules in a subprocess and asserting no state files appear. Do not
+  reintroduce eager `X = VectorStore()`-style module singletons. (`.coder.db` is still created lazily
+  by the async SQLAlchemy layer on first DB use, not at import.)
 - **Blocked-command matching** (`_is_blocked`): bare executable names (`format`, `mkfs`) match only
   the *invoked* command (first token), while multi-token/path patterns (`rm -rf /`, `dd if=/dev/zero`)
   substring-match anywhere. Don't revert to plain substring matching — it falsely blocks args like

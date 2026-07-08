@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.sqlite_db import Base, AsyncSessionLocal, init_db
 from app.rag.chunker import LANGUAGE_MAP
+
+logger = logging.getLogger(__name__)
 
 
 class ProjectSummaryRow(Base):
@@ -167,16 +170,16 @@ class ProjectMemory:
             observer.start()
             self._observer = observer
             self._watch_path = watch_path
-        except Exception:
-            pass   # watchdog unavailable — silent degradation
+        except Exception as e:
+            logger.debug("project-summary watcher unavailable: %s", e)
 
     def stop_watching(self) -> None:
         if self._observer is not None:
             try:
                 self._observer.stop()
                 self._observer.join(timeout=2)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("stopping project-summary watcher failed: %s", e)
             self._observer = None
             self._watch_path = None
 

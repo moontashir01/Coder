@@ -1,13 +1,15 @@
 import hashlib
+import logging
 from pathlib import Path
 from typing import Any
 
-from app.database.vector_store import VectorStore, vector_store
+from app.database.vector_store import VectorStore, get_vector_store
 from app.rag.chunker import LANGUAGE_MAP, Chunk, chunk_file
 from app.rag.embedder import embed_documents, embed_query
-from app.rag.symbols import SymbolIndex
-from app.rag.symbols import symbol_index as _default_symbol_index
+from app.rag.symbols import SymbolIndex, get_symbol_index
 from config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 # Extensions we attempt to index
 _INDEXABLE_SUFFIXES = set(LANGUAGE_MAP.keys()) | {
@@ -60,9 +62,31 @@ class Retriever:
         store: VectorStore | None = None,
         symbol_index: SymbolIndex | None = None,
     ) -> None:
-        self._store = store or vector_store
-        self._symbols = symbol_index or _default_symbol_index
+        # Store/symbols are resolved lazily (Step 12 / A1): building a Retriever
+        # must not construct the ChromaDB client or open .symbols.db, so those
+        # defaults are deferred to first use via the properties below. An
+        # injected store/index (tests) is used verbatim.
+        self._store_override = store
+        self._symbols_override = symbol_index
+        self._store_cached: VectorStore | None = None
+        self._symbols_cached: SymbolIndex | None = None
         self._current_project: str | None = None
+
+    @property
+    def _store(self) -> VectorStore:
+        if self._store_override is not None:
+            return self._store_override
+        if self._store_cached is None:
+            self._store_cached = get_vector_store()
+        return self._store_cached
+
+    @property
+    def _symbols(self) -> SymbolIndex:
+        if self._symbols_override is not None:
+            return self._symbols_override
+        if self._symbols_cached is None:
+            self._symbols_cached = get_symbol_index()
+        return self._symbols_cached
 
     # ------------------------------------------------------------------
     # Project management
@@ -191,8 +215,8 @@ class Retriever:
         # Symbol index + dependency graph (best-effort; never block embedding).
         try:
             self._symbols.index_file(file_path, project_root=self._current_project)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("symbol index failed for %s: %s", file_path, e)
 
         return len(chunks)
 
@@ -201,8 +225,8 @@ class Retriever:
         self._store.delete_by_file(col, str(file_path))
         try:
             self._symbols.remove_file(str(file_path))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("symbol index removal failed for %s: %s", file_path, e)
 
     def clear_collection(self) -> None:
         if self._current_project:
@@ -249,5 +273,13 @@ class Retriever:
         }
 
 
-# Module-level singleton
-retriever = Retriever()
+# Lazy singleton (Step 12 / A1): a Retriever is cheap to build now (store/symbols
+# are deferred), but keep a shared instance so the whole app uses one.
+_retriever: Retriever | None = None
+
+
+def get_retriever() -> Retriever:
+    global _retriever
+    if _retriever is None:
+        _retriever = Retriever()
+    return _retriever

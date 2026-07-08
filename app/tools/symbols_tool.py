@@ -5,7 +5,16 @@ exact file:line instead of guessing from RAG chunks. Handlers follow the
 universal tool contract: return {"success": bool, "result": str, "error": str|None}.
 """
 
-from app.rag.symbols import symbol_index
+from app.rag.symbols import get_symbol_index
+
+# Tests monkeypatch this module attribute to inject an in-memory index; when it
+# is None (normal use) we lazily resolve the shared singleton, so importing this
+# module doesn't open .symbols.db (Step 12 / A1).
+symbol_index = None
+
+
+def _index():
+    return symbol_index if symbol_index is not None else get_symbol_index()
 
 
 def _ok(result: str) -> dict:
@@ -18,13 +27,14 @@ def _fail(error: str) -> dict:
 
 def find_symbol(name: str) -> dict:
     """Locate where a function/class/method named `name` is defined."""
+    idx = _index()
     try:
-        hits = symbol_index.lookup(name)
+        hits = idx.lookup(name)
     except Exception as e:  # pragma: no cover - defensive
         return _fail(f"symbol lookup failed: {e}")
 
     if not hits:
-        near = symbol_index.search(name, limit=5)
+        near = idx.search(name, limit=5)
         if near:
             names = ", ".join(sorted({h["name"] for h in near}))
             return _ok(f"No symbol named '{name}'. Similar: {names}")
@@ -40,8 +50,9 @@ def find_symbol(name: str) -> dict:
 
 def find_references(name: str) -> dict:
     """List call/usage sites of `name` across the indexed project."""
+    idx = _index()
     try:
-        refs = symbol_index.references(name)
+        refs = idx.references(name)
     except Exception as e:  # pragma: no cover - defensive
         return _fail(f"reference lookup failed: {e}")
 

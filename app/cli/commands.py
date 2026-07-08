@@ -75,19 +75,19 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
 
     # ── /project ───────────────────────────────────────────────────────
     if cmd == "project":
-        if repl.agent._project_path:
-            console.print(f"[green]Active project:[/green] {repl.agent._project_path}")
+        if repl.agent.project_path:
+            console.print(f"[green]Active project:[/green] {repl.agent.project_path}")
         else:
             console.print("[yellow]No project loaded. Use /load <path>[/yellow]")
         return True
 
     # ── /index ─────────────────────────────────────────────────────────
     if cmd == "index":
-        if not repl.agent._project_path:
+        if not repl.agent.project_path:
             console.print("[red]No project loaded.[/red]")
             return True
         console.print("[cyan]Re-indexing...[/cyan]")
-        stats = await repl.agent.load_project(repl.agent._project_path)
+        stats = await repl.agent.load_project(repl.agent.project_path)
         console.print(f"[green]Indexed:[/green] {stats}")
         return True
 

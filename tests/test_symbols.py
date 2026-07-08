@@ -1,6 +1,7 @@
-"""Tests for the AST-based symbol index + dependency graph (slice 1).
+"""Tests for the symbol index + dependency graph.
 
-Pure stdlib `ast` extraction — no Ollama, no tree-sitter, fully offline.
+Python via stdlib `ast`, other languages via tree-sitter (Step 11) — no Ollama,
+fully offline.
 """
 
 from pathlib import Path
@@ -256,3 +257,94 @@ def test_find_symbol_registered_as_builtin():
     reg = create_registry()
     assert "find_symbol" in reg.names()
     assert "find_references" in reg.names()
+
+
+# ----------------------------------------------------------------------
+# Multi-language extraction via tree-sitter (Step 11 / A3)
+# ----------------------------------------------------------------------
+
+
+def test_javascript_function_class_and_method(tmp_path, index):
+    f = _write(
+        tmp_path,
+        "app.js",
+        "function greet(name) {\n"
+        "  return hello(name);\n"
+        "}\n"
+        "class Widget {\n"
+        "  render() { return draw(); }\n"
+        "}\n",
+    )
+    index.index_file(f)
+
+    greet = index.lookup("greet")
+    assert len(greet) == 1 and greet[0]["kind"] == "function"
+
+    widget = index.lookup("Widget")
+    assert widget and widget[0]["kind"] == "class"
+
+    render = index.lookup("render")
+    assert render and render[0]["kind"] == "method"
+    assert render[0]["parent"] == "Widget"
+
+    # Call sites are captured too.
+    assert index.references("hello")
+    assert index.references("draw")
+
+
+def test_go_function_and_type(tmp_path, index):
+    f = _write(
+        tmp_path,
+        "srv.go",
+        "package main\n"
+        "func Add(a int, b int) int {\n"
+        "\treturn compute(a, b)\n"
+        "}\n"
+        "type Server struct {\n"
+        "\tport int\n"
+        "}\n",
+    )
+    index.index_file(f)
+
+    add = index.lookup("Add")
+    assert add and add[0]["kind"] == "function"
+
+    server = index.lookup("Server")
+    assert server and server[0]["kind"] == "type"
+
+    assert index.references("compute")
+
+
+def test_python_still_uses_ast(tmp_path, index):
+    """The Python path is unchanged: names, parents, and imports still work."""
+    f = _write(
+        tmp_path,
+        "svc.py",
+        "import os\n\nclass Service:\n    def handle(self):\n        return helper()\n",
+    )
+    index.index_file(f, project_root=tmp_path)
+
+    handle = index.lookup("handle")
+    assert handle and handle[0]["kind"] == "method"
+    assert handle[0]["parent"] == "Service"
+    assert index.references("helper")
+
+
+def test_unsupported_language_yields_no_symbols(tmp_path, index):
+    f = _write(tmp_path, "notes.txt", "just some prose, not code\n")
+    assert index.index_file(f) == 0
+    assert index.lookup("prose") == []
+
+
+def test_find_symbol_tool_works_for_javascript(tmp_path, monkeypatch):
+    import app.tools.symbols_tool as st
+
+    idx = SymbolIndex(db_path=":memory:")
+    f = _write(tmp_path, "widget.js", "function mount() { return 1; }\n")
+    idx.index_file(f)
+    monkeypatch.setattr(st, "symbol_index", idx)
+
+    out = st.find_symbol(name="mount")
+    assert out["success"] is True
+    assert "mount" in out["result"]
+    assert "widget.js" in out["result"]

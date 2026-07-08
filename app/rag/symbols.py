@@ -1,10 +1,11 @@
-"""AST-based symbol index and dependency graph.
+"""Symbol index and dependency graph.
 
-Why stdlib `ast` and not tree-sitter: the installed tree-sitter-languages
-(1.10.2) is incompatible with tree-sitter 0.25.x in this environment, so the
-parser is unavailable. `ast` is always present, deterministic, fully offline,
-and more accurate than tree-sitter for Python (real names, imports, call
-sites). Non-Python files degrade to no symbols rather than crashing.
+Python is parsed with stdlib `ast` — deterministic, offline, and more accurate
+than tree-sitter for Python (real names, imports, and call sites, plus the
+import→file dependency edges the graph depends on). Other languages (JS/TS/
+Go/Rust/Java/C/C++) are parsed with tree-sitter (Step 11 / A3), reusing the
+parsers the chunker already pins (tree-sitter 0.21.3 + tree-sitter-languages
+1.10.2). Files in an unsupported language degrade to no symbols, never crash.
 
 Storage is a standalone synchronous sqlite3 DB (default `.symbols.db`). This
 matches the *synchronous* retriever indexing path and avoids contending with
@@ -18,7 +19,15 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.rag.chunker import LANGUAGE_MAP
 from config.settings import settings
+
+try:
+    from tree_sitter_languages import get_parser
+
+    _TS_AVAILABLE = True
+except Exception:  # pragma: no cover - environment without tree-sitter
+    _TS_AVAILABLE = False
 
 
 @dataclass
@@ -116,15 +125,9 @@ class _Walker(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def extract_symbols(file_path: str | Path) -> FileSymbols:
-    """Parse a Python file into symbols, imports, and references.
-
-    Returns an empty FileSymbols on syntax errors, unreadable files, or
-    non-Python extensions — never raises.
-    """
+def _extract_symbols_py(file_path: str | Path) -> FileSymbols:
+    """Python path: stdlib `ast` (names, imports, and call sites)."""
     path = Path(file_path)
-    if path.suffix.lower() != ".py":
-        return FileSymbols()
     try:
         source = path.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(source)
@@ -135,6 +138,189 @@ def extract_symbols(file_path: str | Path) -> FileSymbols:
     for node in ast.iter_child_nodes(tree):
         walker.visit(node)
     return walker.result
+
+
+# ----------------------------------------------------------------------
+# Tree-sitter path for non-Python languages (Step 11 / A3)
+# ----------------------------------------------------------------------
+
+# Definition node types → symbol kind, per tree-sitter language.
+_TS_TYPESCRIPT_DEFS = {
+    "function_declaration": "function",
+    "generator_function_declaration": "function",
+    "class_declaration": "class",
+    "abstract_class_declaration": "class",
+    "method_definition": "method",
+    "interface_declaration": "interface",
+    "enum_declaration": "enum",
+}
+_TS_JAVASCRIPT_DEFS = {
+    "function_declaration": "function",
+    "generator_function_declaration": "function",
+    "class_declaration": "class",
+    "method_definition": "method",
+}
+_TS_DEFS: dict[str, dict[str, str]] = {
+    "javascript": _TS_JAVASCRIPT_DEFS,
+    "typescript": _TS_TYPESCRIPT_DEFS,
+    "tsx": _TS_TYPESCRIPT_DEFS,
+    "go": {
+        "function_declaration": "function",
+        "method_declaration": "method",
+        "type_declaration": "type",
+    },
+    "rust": {
+        "function_item": "function",
+        "struct_item": "struct",
+        "enum_item": "enum",
+        "trait_item": "trait",
+    },
+    "java": {
+        "method_declaration": "method",
+        "constructor_declaration": "method",
+        "class_declaration": "class",
+        "interface_declaration": "interface",
+        "enum_declaration": "enum",
+    },
+    "c": {"function_definition": "function", "struct_specifier": "struct"},
+    "cpp": {
+        "function_definition": "function",
+        "class_specifier": "class",
+        "struct_specifier": "struct",
+    },
+}
+
+# Kinds that open a scope, so nested methods record the enclosing name.
+_TS_SCOPE_KINDS = {"class", "struct", "interface", "trait", "impl"}
+
+_ID_TYPES = {
+    "identifier",
+    "type_identifier",
+    "field_identifier",
+    "property_identifier",
+}
+# Body/list nodes whose identifiers are members, not the definition's own name.
+_SKIP_INTO = {
+    "block",
+    "statement_block",
+    "field_declaration_list",
+    "declaration_list",
+    "class_body",
+    "enum_body",
+    "compound_statement",
+    "parameter_list",
+    "parameters",
+    "formal_parameters",
+}
+_CALL_TYPES = {"call_expression", "method_invocation", "macro_invocation"}
+
+
+def _node_text(node) -> str:
+    return node.text.decode("utf-8", "replace")
+
+
+def _find_name(node) -> str | None:
+    """The declared name of a definition node — the `name` field when present,
+    else the first identifier reached without descending into bodies/params."""
+    nm = node.child_by_field_name("name")
+    if nm is not None and nm.type in _ID_TYPES:
+        return _node_text(nm)
+    for child in node.children:
+        if child.type in _SKIP_INTO:
+            continue
+        if child.type in _ID_TYPES:
+            return _node_text(child)
+    for child in node.children:
+        if child.type in _SKIP_INTO:
+            continue
+        got = _find_name(child)
+        if got:
+            return got
+    return None
+
+
+def _call_name(node) -> str | None:
+    fn = node.child_by_field_name("function")
+    if fn is None:
+        fn = node.child_by_field_name("name")  # java method_invocation
+    target = fn if fn is not None else node
+    if target.type in _ID_TYPES:
+        return _node_text(target)
+    for field_name in ("property", "field", "name"):
+        sub = target.child_by_field_name(field_name)
+        if sub is not None and sub.type in _ID_TYPES:
+            return _node_text(sub)
+    ids = [c for c in target.children if c.type in _ID_TYPES]
+    return _node_text(ids[-1]) if ids else None
+
+
+def _extract_symbols_ts(source: str, language: str, file_path: str) -> FileSymbols:
+    result = FileSymbols()
+    try:
+        parser = get_parser(language)
+        tree = parser.parse(source.encode("utf-8"))
+    except Exception:
+        return result
+
+    defs = _TS_DEFS.get(language, {})
+    class_stack: list[str] = []
+
+    def visit(node) -> None:
+        pushed = False
+        kind = defs.get(node.type)
+        if kind:
+            name = _find_name(node)
+            if name:
+                parent = class_stack[-1] if class_stack else None
+                result.symbols.append(
+                    Symbol(
+                        name=name,
+                        kind=kind,
+                        file_path=file_path,
+                        start_line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                        parent=parent,
+                    )
+                )
+                if kind in _TS_SCOPE_KINDS:
+                    class_stack.append(name)
+                    pushed = True
+        if node.type in _CALL_TYPES:
+            cn = _call_name(node)
+            if cn:
+                result.references.append(Reference(cn, node.start_point[0] + 1))
+        for child in node.children:
+            visit(child)
+        if pushed:
+            class_stack.pop()
+
+    visit(tree.root_node)
+    return result
+
+
+def extract_symbols(file_path: str | Path) -> FileSymbols:
+    """Parse a file into symbols, imports, and references.
+
+    Python uses stdlib `ast`; other supported languages use tree-sitter. Returns
+    an empty FileSymbols on syntax errors, unreadable files, or unsupported
+    languages — never raises.
+    """
+    path = Path(file_path)
+    suffix = path.suffix.lower()
+    if suffix == ".py":
+        return _extract_symbols_py(path)
+
+    language = LANGUAGE_MAP.get(suffix)
+    if language and _TS_AVAILABLE and language in _TS_DEFS:
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return FileSymbols()
+        if not source.strip():
+            return FileSymbols()
+        return _extract_symbols_ts(source, language, str(file_path))
+
+    return FileSymbols()
 
 
 def _resolve_import(
@@ -325,5 +511,14 @@ class SymbolIndex:
         return self._conn.execute("SELECT COUNT(*) AS c FROM symbols").fetchone()["c"]
 
 
-# Module-level singleton (uses the configured on-disk path)
-symbol_index = SymbolIndex()
+# Lazy singleton (Step 12 / A1): constructing a SymbolIndex opens (and creates)
+# the on-disk .symbols.db, so we don't do it at import time. get_symbol_index()
+# builds it on first real use and caches it.
+_symbol_index: SymbolIndex | None = None
+
+
+def get_symbol_index() -> SymbolIndex:
+    global _symbol_index
+    if _symbol_index is None:
+        _symbol_index = SymbolIndex()
+    return _symbol_index

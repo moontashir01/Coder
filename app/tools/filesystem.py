@@ -46,19 +46,31 @@ def _jail_check(path: str) -> str | None:
 
 # ---------------------------------------------------------------------------
 # Safe writes (Tier 3 #8): every mutating tool backs up the previous content
-# into settings.backups_dir before touching the file; undo_write restores and
+# into the backup root before touching the file; undo_write restores and
 # consumes the most recent backup, so repeated undos walk back through history.
 # The original absolute path is URL-quoted into the backup filename after the
 # first "__" (quote() never emits "_", so "__" splits unambiguously).
+#
+# Per-project scoping (Step 10 / C3): when a project is loaded, backups live in
+# `<sandbox_root>/.coder_backups/` so `/undo` in one project can never restore a
+# file from another. Without a loaded project (or an absolute backups_dir) the
+# relative default resolves against cwd, preserving the old behavior.
 # ---------------------------------------------------------------------------
 
 _backup_seq = count()
 
 
+def _backup_root() -> Path:
+    base = Path(settings.backups_dir)
+    if settings.sandbox_root is not None and not base.is_absolute():
+        return Path(settings.sandbox_root) / base
+    return base
+
+
 def _backup_file(p: Path) -> None:
     """Snapshot p's current content. Raises on failure — callers must treat a
     failed backup as a failed mutation rather than proceed and lose data."""
-    root = Path(settings.backups_dir)
+    root = _backup_root()
     root.mkdir(parents=True, exist_ok=True)
     encoded = quote(str(p.resolve()), safe="")
     name = f"{time.time_ns():020d}-{next(_backup_seq) % 1_000_000:06d}__{encoded}"
@@ -112,7 +124,7 @@ def undo_write(path: str | None = None) -> ToolResult:
     """Restore the most recent backup; with ``path``, the most recent backup
     of that file. The used backup is deleted (undo again → previous state)."""
     try:
-        root = Path(settings.backups_dir)
+        root = _backup_root()
         backups = (
             sorted((b for b in root.iterdir() if _original_path(b)), key=lambda b: b.name)
             if root.exists()
@@ -123,13 +135,13 @@ def undo_write(path: str | None = None) -> ToolResult:
             backups = [b for b in backups if _original_path(b) == wanted]
         if not backups:
             target = f" for {path}" if path else ""
-            return _err(f"No backup to undo{target}.")
+            return _err(f"No backup to undo{target} in {root}.")
         latest = backups[-1]
         original = Path(_original_path(latest))
         original.parent.mkdir(parents=True, exist_ok=True)
         original.write_bytes(latest.read_bytes())
         latest.unlink()
-        return _ok(f"Restored {original} from backup.")
+        return _ok(f"Restored {original} from backup ({root}).")
     except Exception as e:
         return _err(str(e))
 

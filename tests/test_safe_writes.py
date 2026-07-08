@@ -166,6 +166,50 @@ def test_backups_pruned_to_max(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Per-project scoping (Step 10 / C3)
+# ---------------------------------------------------------------------------
+
+
+def test_backups_land_under_project_root(tmp_path, monkeypatch):
+    proj = tmp_path / "A"
+    proj.mkdir()
+    monkeypatch.setattr(settings, "sandbox_root", proj)
+    f = proj / "x.txt"
+    f.write_text("old", encoding="utf-8")
+
+    write_file(str(f), "new")
+
+    assert (proj / settings.backups_dir).exists()
+    # Not in the parent (cwd-relative) location.
+    assert not (tmp_path / settings.backups_dir).exists()
+
+
+def test_undo_scoped_to_active_project(tmp_path, monkeypatch):
+    proj_a = tmp_path / "A"
+    proj_b = tmp_path / "B"
+    proj_a.mkdir()
+    proj_b.mkdir()
+    f = proj_a / "x.txt"
+    f.write_text("old", encoding="utf-8")
+
+    monkeypatch.setattr(settings, "sandbox_root", proj_a)
+    write_file(str(f), "new")
+
+    # A different project can't see (or undo) project A's backup.
+    monkeypatch.setattr(settings, "sandbox_root", proj_b)
+    other = undo_write()
+    assert other["success"] is False
+    assert "no backup" in other["error"].lower()
+
+    # Back in project A, undo works and the confirmation names the restored file.
+    monkeypatch.setattr(settings, "sandbox_root", proj_a)
+    res = undo_write()
+    assert res["success"] is True
+    assert "x.txt" in res["result"]
+    assert f.read_text(encoding="utf-8") == "old"
+
+
+# ---------------------------------------------------------------------------
 # Registry wiring
 # ---------------------------------------------------------------------------
 

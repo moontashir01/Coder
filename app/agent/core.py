@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,8 +16,7 @@ from app.agent.verify import check_file, is_verifiable
 from app.memory.conversation import ConversationMemory
 from app.memory.project_memory import ProjectMemory, project_memory
 from app.models.llm import get_llm, get_streaming_llm
-from app.rag.retriever import Retriever
-from app.rag.retriever import retriever as _default_retriever
+from app.rag.retriever import Retriever, get_retriever
 from config.settings import settings
 
 # Imported lazily to avoid circular deps at module init
@@ -31,6 +31,8 @@ def _get_mcp_manager_class():
         _MCPManager = MCPManager
     return _MCPManager
 
+
+logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT_PATH = settings.prompts_dir / "system.md"
 
@@ -462,7 +464,7 @@ class AgentCore:
         skill_loader=None,
     ) -> None:
         self.registry = registry or create_registry()
-        self.retriever = retriever or _default_retriever
+        self.retriever = retriever or get_retriever()
         self.pm = pm or project_memory
         self.memory = ConversationMemory(session_id=session_id)
         self.executor = Executor(self.registry)
@@ -485,6 +487,12 @@ class AgentCore:
     # Project management
     # ------------------------------------------------------------------
 
+    @property
+    def project_path(self) -> str | None:
+        """Path of the loaded project, or None (public accessor for the REPL /
+        commands so they don't reach into `_project_path` — Step 12 / A4)."""
+        return self._project_path
+
     async def load_project(self, project_path: str) -> dict[str, Any]:
         self._project_path = project_path
         # Narrow the file-tool path jail (Step 5 / S2) to the loaded project.
@@ -504,7 +512,8 @@ class AgentCore:
                 self._watcher.stop()
             self._watcher = ProjectWatcher(project_path, self.retriever)
             self._watcher.start()
-        except Exception:
+        except Exception as e:
+            logger.warning("live-reindex watcher failed to start: %s", e)
             self._watcher = None
 
     def close(self) -> None:
@@ -530,8 +539,10 @@ class AgentCore:
             return
         try:
             self.retriever.index_file(path)
-        except Exception:
-            pass  # keeping the index fresh must not break a successful write
+        except Exception as e:
+            # Keeping the index fresh must not break a successful write, but a
+            # silent failure hides stale-retrieval bugs — so log it.
+            logger.warning("re-index after write of %s failed: %s", path, e)
 
     def _reindex_after_delete(self, path: str | Path) -> None:
         """Drop a just-deleted file from the RAG + symbol index. No-op without
@@ -540,8 +551,8 @@ class AgentCore:
             return
         try:
             self.retriever.delete_file(path)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("re-index after delete of %s failed: %s", path, e)
 
     # ------------------------------------------------------------------
     # Context building
@@ -577,8 +588,10 @@ class AgentCore:
                         "\n## Relevant Code\n"
                         + _frame_untrusted(_truncate_context(rag_ctx))
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                # Retrieval is an enhancement, not a hard requirement — degrade
+                # to no RAG context, but log so a broken index is visible.
+                logger.debug("RAG context retrieval failed: %s", e)
 
         if extra_context:
             parts.append(

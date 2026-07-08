@@ -1,3 +1,4 @@
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -6,6 +7,8 @@ import chromadb
 from chromadb import Collection
 
 from config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _chroma_client() -> chromadb.PersistentClient:
@@ -40,8 +43,10 @@ class VectorStore:
         name = _safe_name(project_path)
         try:
             self._client.delete_collection(name)
-        except Exception:
-            pass
+        except Exception as e:
+            # Best-effort: a missing/already-deleted collection is fine, but
+            # log so a real failure (locked DB, corruption) is observable.
+            logger.debug("delete_collection(%s) failed: %s", name, e)
 
     def list_collections(self) -> list[str]:
         return [c.name for c in self._client.list_collections()]
@@ -73,7 +78,8 @@ class VectorStore:
         """
         try:
             got = collection.get(include=["metadatas"])
-        except Exception:
+        except Exception as e:
+            logger.debug("get_file_hashes failed; will re-index everything: %s", e)
             return {}
         out: dict[str, str] = {}
         for meta in got.get("metadatas") or []:
@@ -108,5 +114,14 @@ class VectorStore:
         return collection.count()
 
 
-# Module-level singleton
-vector_store = VectorStore()
+# Lazy singleton (Step 12 / A1): constructing a VectorStore builds the ChromaDB
+# PersistentClient, which creates .chroma_db/ on disk — so we DON'T build it at
+# import time. get_vector_store() constructs it on first real use and caches it.
+_vector_store: VectorStore | None = None
+
+
+def get_vector_store() -> VectorStore:
+    global _vector_store
+    if _vector_store is None:
+        _vector_store = VectorStore()
+    return _vector_store
