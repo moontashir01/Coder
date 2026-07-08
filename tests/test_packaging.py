@@ -101,3 +101,18 @@ def test_changelog_exists_and_has_unreleased():
     text = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert "# Changelog" in text
     assert "Unreleased" in text
+
+
+# ---------------------------------------------------------------------------
+# Step 15 / U2 — auto-load the current directory
+# ---------------------------------------------------------------------------
+
+
+def test_startup_project_auto_loads_cwd():
+    import main
+
+    assert main._startup_project(None, no_index=False) == str(Path.cwd())
+    assert main._startup_project(None, no_index=True) is None
+    # Explicit --project always wins, regardless of --no-index.
+    assert main._startup_project("/some/proj", no_index=False) == "/some/proj"
+    assert main._startup_project("/some/proj", no_index=True) == "/some/proj"

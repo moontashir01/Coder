@@ -66,11 +66,13 @@ cd path/to/your/project
 coder
 ```
 
-That starts the interactive assistant scoped to the current folder. Useful things to try:
+That starts the interactive assistant scoped to the current folder — Coder
+**auto-loads and indexes the current directory** on startup (pass `--no-index`
+to skip). Useful things to try:
 
 - Ask a question: `explain what @src/app.py does`
 - Create a file: `make an index.html landing page`
-- Load the project for retrieval + symbol search: `/load .`
+- Re-index or switch projects: `/index`, `/load ../other-project`
 - List commands: `/help`
 
 Coder writes its per-project state (`.chroma_db/`, `.coder.db`, `.symbols.db`, `.coder_backups/`,

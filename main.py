@@ -28,6 +28,19 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+def _startup_project(project: str | None, no_index: bool) -> str | None:
+    """Which project to load on startup (Step 15 / U2).
+
+    Explicit --project wins; otherwise auto-load the current directory unless
+    --no-index was passed.
+    """
+    if project:
+        return project
+    if no_index:
+        return None
+    return str(Path.cwd())
+
+
 def _run_update(dry_run: bool) -> None:
     """`coder --update` (Step 14 / D4): pull the latest source and reinstall.
 
@@ -85,6 +98,9 @@ def main(
     allow_network: bool = typer.Option(
         False, "--allow-network", help="Permit network-reaching shell commands"
     ),
+    no_index: bool = typer.Option(
+        False, "--no-index", help="Don't auto-load/index the current directory on startup"
+    ),
     update: bool = typer.Option(
         False, "--update", help="Update Coder to the latest version and exit"
     ),
@@ -125,10 +141,12 @@ def main(
     agent = AgentCore(session_id=session, mcp_manager=mcp_manager, skill_loader=skill_loader)
     repl = CoderREPL(agent=agent, mcp_manager=mcp_manager, skill_loader=skill_loader)
 
+    startup_project = _startup_project(project, no_index)
+
     async def _run() -> None:
         try:
-            if project:
-                await repl.load_project(project)
+            if startup_project:
+                await repl.load_project(startup_project)
             await repl.run()
         finally:
             agent.close()  # stop the live-reindex file watcher
