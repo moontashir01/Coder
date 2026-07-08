@@ -74,8 +74,9 @@ def _run_update(dry_run: bool) -> None:
     typer.echo("Update complete — restart coder to load the new version.")
 
 
-@app.command()
+@app.callback(invoke_without_command=True)
 def main(
+    ctx: typer.Context,
     project: str = typer.Option(
         None, "--project", "-p", help="Project folder to load on startup"
     ),
@@ -121,6 +122,10 @@ def main(
         _run_update(dry_run)
         raise typer.Exit()
 
+    # A subcommand (coder init / coder config) handles the invocation itself.
+    if ctx.invoked_subcommand is not None:
+        return
+
     # Security profile (Phase B). Default the path jail to cwd; if --project is
     # given, load_project narrows it to the project dir.
     settings.sandbox_root = Path.cwd().resolve()
@@ -152,6 +157,83 @@ def main(
             agent.close()  # stop the live-reindex file watcher
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# First-run setup / settings (Step 15 / U3)
+# ---------------------------------------------------------------------------
+
+_ENV_TEMPLATE = """\
+# Coder configuration. Uncomment and edit to override the defaults, then
+# restart coder. Keys are case-insensitive and map to config/settings.py fields.
+# LLM_MODEL=qwen2.5-coder:7b
+# EMBEDDING_MODEL=nomic-embed-text
+# OLLAMA_BASE_URL=http://localhost:11434
+# MAX_CONTEXT_TOKENS=8192
+# RETRIEVAL_TOP_K=5
+"""
+
+# Settings surfaced by `coder config` (name → the live value).
+_CONFIG_KEYS = (
+    "llm_model",
+    "embedding_model",
+    "ollama_base_url",
+    "max_context_tokens",
+    "retrieval_top_k",
+)
+
+
+def _set_env_var(env_path: Path, key: str, value: str) -> None:
+    """Insert or replace a KEY=VALUE line in a .env file."""
+    key = key.upper()
+    lines = (
+        env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    )
+    out, replaced = [], False
+    for line in lines:
+        stripped = line.lstrip("# ").strip()
+        if stripped.upper().startswith(key + "="):
+            out.append(f"{key}={value}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"{key}={value}")
+    env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+@app.command()
+def init(
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing .env"),
+) -> None:
+    """Create a .env with common settings and print first-run steps."""
+    env_path = Path(".env")
+    if env_path.exists() and not force:
+        typer.echo(f".env already exists at {env_path.resolve()} (use --force to overwrite).")
+    else:
+        env_path.write_text(_ENV_TEMPLATE, encoding="utf-8")
+        typer.echo(f"Wrote {env_path.resolve()}")
+    typer.echo("\nNext steps:")
+    typer.echo("  1. ollama serve")
+    typer.echo(f"  2. ollama pull {settings.llm_model}")
+    typer.echo(f"  3. ollama pull {settings.embedding_model}")
+    typer.echo("  4. coder")
+
+
+@app.command()
+def config(
+    key: str = typer.Argument(None, help="Setting to change (e.g. llm_model)"),
+    value: str = typer.Argument(None, help="New value"),
+) -> None:
+    """Show the current settings, or `coder config KEY VALUE` to set one in .env."""
+    if key and value is not None:
+        _set_env_var(Path(".env"), key, value)
+        typer.echo(f"Set {key.upper()}={value} in {Path('.env').resolve()}")
+        return
+    typer.echo("Current configuration:")
+    for k in _CONFIG_KEYS:
+        typer.echo(f"  {k} = {getattr(settings, k)}")
+    typer.echo(f"\nEdit {Path('.env').resolve()} or run: coder config <KEY> <VALUE>")
 
 
 if __name__ == "__main__":

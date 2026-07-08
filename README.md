@@ -89,6 +89,10 @@ coder --session work           # named, persistent conversation session
 coder --version
 coder --update                 # pull the latest version and reinstall in place
 coder --update --dry-run       # show what --update would do, without doing it
+
+coder init                     # write a .env template and print first-run steps
+coder config                   # show the current settings
+coder config llm_model qwen2.5-coder:14b   # set a value in .env
 ```
 
 ### Safety & permissions

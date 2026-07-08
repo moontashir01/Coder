@@ -7,6 +7,10 @@ All notable changes to Coder are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`coder init` / `coder config`** — write a `.env` template with first-run
+  steps, and show or set individual settings.
+- **Auto-load the current directory** as the project on startup (`--no-index`
+  opts out).
 - **`coder --update`** — pull the latest source and reinstall in place
   (`--dry-run` prints the actions first). Non-git installs are pointed at
   `pipx upgrade coder`.

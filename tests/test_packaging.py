@@ -116,3 +116,45 @@ def test_startup_project_auto_loads_cwd():
     # Explicit --project always wins, regardless of --no-index.
     assert main._startup_project("/some/proj", no_index=False) == "/some/proj"
     assert main._startup_project("/some/proj", no_index=True) == "/some/proj"
+
+
+# ---------------------------------------------------------------------------
+# Step 15 / U3 — coder init / coder config
+# ---------------------------------------------------------------------------
+
+
+def test_init_writes_env_and_config_roundtrip(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    import main
+
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    r = runner.invoke(main.app, ["init"])
+    assert r.exit_code == 0
+    assert (tmp_path / ".env").is_file()
+    assert "Next steps" in r.output
+
+    r2 = runner.invoke(main.app, ["config", "llm_model", "qwen2.5-coder:14b"])
+    assert r2.exit_code == 0
+    assert "LLM_MODEL=qwen2.5-coder:14b" in (tmp_path / ".env").read_text(
+        encoding="utf-8"
+    )
+
+    r3 = runner.invoke(main.app, ["config"])
+    assert r3.exit_code == 0
+    assert "llm_model" in r3.output
+
+
+def test_init_does_not_clobber_without_force(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    import main
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("LLM_MODEL=custom\n", encoding="utf-8")
+    r = CliRunner().invoke(main.app, ["init"])
+    assert r.exit_code == 0
+    assert "already exists" in r.output
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == "LLM_MODEL=custom\n"
