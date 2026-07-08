@@ -55,6 +55,12 @@ py-modules = ["main"]
 [tool.setuptools.packages.find]
 include = ["app*", "config*", "evals*"]
 
+# Ship bundled prompts/skills/default-MCP-config as package data (Step 13 / D1)
+# so a non-editable `pipx`/wheel install includes them. They live under
+# app/resources/ and load via settings._RESOURCES.
+[tool.setuptools.package-data]
+app = ["resources/**/*", "resources/**/*.md", "resources/*.json"]
+
 [tool.setuptools.dynamic]
 version = { attr = "app.__version__" }
 

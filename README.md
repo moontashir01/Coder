@@ -127,6 +127,18 @@ ollama pull qwen2.5-coder:7b
 ollama pull nomic-embed-text
 ```
 
+### Or install with pipx
+
+Coder ships its prompts, skills, and default MCP config as package data, so an
+isolated [pipx](https://pipx.pypa.io) install works too (Python 3.11/3.12):
+
+```bash
+pipx install "git+https://github.com/moontashir01/Coder.git"
+coder            # available on your PATH, in its own isolated environment
+```
+
+You still need Ollama running with the two models pulled (see above).
+
 ---
 
 ## Uninstall

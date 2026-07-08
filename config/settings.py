@@ -3,15 +3,19 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings
 
-# Install base: the directory that ships with Coder's bundled resources
-# (prompts/, skills/, config/). Resolved once, independent of the current
-# working directory, so a globally-installed `coder` finds its own resources
-# no matter which project folder it is run from. Order of precedence:
-#   1. $CODER_HOME (explicit override)
-#   2. the source tree — this file lives at <base>/config/settings.py
+# Install base: the directory that ships with Coder's bundled resources.
+# Bundled prompts/skills/default-MCP-config now live INSIDE the `app` package
+# (app/resources/, Step 13 / D1) so they install as package data and a
+# `pipx`/wheel install ships them — no reliance on the repo layout. Resolved
+# once, independent of cwd, so a globally-installed `coder` finds its own
+# resources from any project folder. Order of precedence:
+#   1. $CODER_HOME (explicit override — expects <home>/app/resources/…)
+#   2. the source tree / site-packages — this file lives at <base>/config/settings.py,
+#      so <base>/app/resources holds the data in both editable and wheel installs.
 # NB: runtime STATE paths below (chroma/sqlite/symbols/backups/history) stay
 # relative so they land in the *current* project folder, per-project.
 _BASE = Path(os.environ.get("CODER_HOME") or Path(__file__).resolve().parent.parent)
+_RESOURCES = _BASE / "app" / "resources"
 
 
 class Settings(BaseSettings):
@@ -23,11 +27,12 @@ class Settings(BaseSettings):
     # keep a generous per-request timeout so longer generations aren't cut off.
     llm_request_timeout_seconds: int = 120
 
-    # Bundled-resource paths — anchored to the install base (see _BASE above)
-    # so they resolve identically from any working directory.
-    skills_dir: Path = _BASE / "skills"
-    prompts_dir: Path = _BASE / "prompts"
-    mcp_config: Path = _BASE / "config" / "mcp_servers.json"
+    # Bundled-resource paths — anchored to the package's resources dir (see
+    # _RESOURCES above) so they resolve identically from any working directory
+    # and ship as package data in a wheel/pipx install.
+    skills_dir: Path = _RESOURCES / "skills"
+    prompts_dir: Path = _RESOURCES / "prompts"
+    mcp_config: Path = _RESOURCES / "mcp_servers.json"
 
     # Per-project paths — relative on purpose (resolved against cwd) so state
     # is created in whatever project folder `coder` is launched from.

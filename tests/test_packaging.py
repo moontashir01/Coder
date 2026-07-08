@@ -50,3 +50,28 @@ def test_cli_version_flag_works_offline():
 
     assert result.exit_code == 0
     assert app.__version__ in result.output
+
+
+# ---------------------------------------------------------------------------
+# Step 13 / D1 — bundled resources ship as package data
+# ---------------------------------------------------------------------------
+
+
+def test_bundled_resources_live_in_app_package():
+    """Prompts/skills/default-MCP-config are inside the app package so a wheel
+    ships them; settings resolves to that location."""
+    from config.settings import settings
+
+    assert (settings.prompts_dir / "system.md").is_file()
+    assert (settings.skills_dir / "example_skill" / "SKILL.md").is_file()
+    assert settings.mcp_config.is_file()
+    # ...and that location is under app/resources, not the repo root.
+    assert settings.prompts_dir.parent.name == "resources"
+    assert settings.prompts_dir.parent.parent.name == "app"
+
+
+def test_pyproject_declares_resource_package_data():
+    data = _pyproject()
+    pkg_data = data["tool"]["setuptools"]["package-data"]
+    globs = pkg_data.get("app", [])
+    assert any("resources" in g for g in globs), globs
