@@ -13,6 +13,7 @@ from app.agent.planner import Planner, _extract_json
 from app.agent.recovery import classify_error, recovery_hint
 from app.agent.references import (
     REF_SCANNED_EXTS,
+    extract_nav_block,
     find_dead_references,
     is_creatable,
 )
@@ -1117,6 +1118,78 @@ class AgentCore:
                 continue
         return "\n\n".join(blocks)
 
+    def _sibling_context(self, written: list[str]) -> str:
+        """Context block describing files already written this turn.
+
+        Replaces "paste the first 2500 chars of every sibling". That grew
+        linearly with the number of pages — a six-page build sent ~12 KB of
+        markup, overflowing the context window so the earliest pages (the ones
+        defining the nav) were evicted, and each page's copy was cut at a fixed
+        offset that could land mid-element. Instead:
+
+          * lift the navigation block out of the first page that has one and
+            state it ONCE as the canonical markup to reuse verbatim, and
+          * cap the remaining per-file excerpts against a single TOTAL budget
+            (settings.max_sibling_context_chars) rather than per file.
+        """
+        if not written:
+            return ""
+        workdir = Path(self._project_path or Path.cwd())
+        budget = settings.max_sibling_context_chars
+
+        nav: str | None = None
+        nav_source = ""
+        bodies: list[tuple[str, str]] = []
+        for rel in written:
+            p = workdir / rel
+            try:
+                if not p.is_file():
+                    continue
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if nav is None and p.suffix.lower() in (".html", ".htm"):
+                found = extract_nav_block(text)
+                if found:
+                    nav, nav_source = found, rel
+            bodies.append((rel, text))
+
+        parts: list[str] = []
+        if nav:
+            nav = nav[:budget]
+            parts.append(
+                "## Site navigation — reuse EXACTLY\n"
+                f"Every page in this build shares one nav. Copy this block from "
+                f"`{nav_source}` verbatim (only the current page's link may be "
+                f"marked active); do not reorder, rename or re-style it:\n\n"
+                f"{nav}"
+            )
+            budget -= len(nav)
+
+        if bodies and budget > 0:
+            # An excerpt below ~400 chars tells the model nothing, so cap how
+            # many files are quoted rather than slicing the budget ever thinner.
+            # Keep the most recent — the nav above already covers what they share.
+            bodies = bodies[-max(1, budget // 400) :]
+            share = budget // len(bodies)
+            excerpts: list[str] = []
+            for rel, text in bodies:
+                header = f"### {rel}\n"
+                take = min(share, budget) - len(header)
+                if take <= 0:
+                    break
+                body = text[:take]
+                if len(text) > take:
+                    body += "\n... [truncated]"
+                excerpts.append(header + body)
+                budget -= len(header) + take
+            parts.append(
+                "## Files already written in this request\n"
+                "Reference them EXACTLY (paths, links, ids, selectors, function "
+                "names) — do not invent new names:\n\n" + "\n\n".join(excerpts)
+            )
+        return "\n\n".join(parts)
+
     async def _stream_or_invoke(
         self, messages: list, on_token: Callable[[str], None] | None
     ) -> str:
@@ -1511,13 +1584,9 @@ class AgentCore:
             # edit on an existing file → surgical SEARCH/REPLACE then rewrite.
             sub_msg = op.instruction or user_message
             extra = f"{extra_context}\n\n{manifest}" if extra_context else manifest
-            siblings = self._read_refs(written, max_chars=2500)
+            siblings = self._sibling_context(written)
             if siblings:
-                extra += (
-                    "\n\n## Already-written files in this change\n"
-                    "Make every reference to them (paths, selectors, ids, "
-                    "function names) match EXACTLY:\n\n" + siblings
-                )
+                extra += "\n\n" + siblings
             ans, sub_trace = await self._file_op_flow(
                 sub_msg, target=op.filename, extra_context=extra
             )
@@ -1637,13 +1706,9 @@ class AgentCore:
         written: list[str] = []
         for i, sub in enumerate(subtasks, 1):
             extra = manifest
-            siblings = self._read_refs(written, max_chars=2500) if written else ""
+            siblings = self._sibling_context(written)
             if siblings:
-                extra += (
-                    "\n\n## Files already created/edited in this request\n"
-                    "Reference them EXACTLY (paths, links, ids, selectors, "
-                    "function names) — do not invent new names:\n\n" + siblings
-                )
+                extra += "\n\n" + siblings
             # Only apply an @ref to the sub-task that actually names its path, so
             # "edit @a.py and create b.py" doesn't target a.py for both steps.
             sub_refs = [r for r in at_refs if r in sub]

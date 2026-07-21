@@ -88,6 +88,12 @@ class Settings(BaseSettings):
     # caps how many files one turn will auto-create.
     check_references: bool = True
     max_reference_repairs: int = 10
+    # TOTAL characters of already-written sibling files threaded into the next
+    # step of a multi-file build. Previously capped per file, so the prompt grew
+    # linearly with the page count and pushed the earliest pages out of the
+    # context window. The shared nav block is lifted out and stated once within
+    # this same budget.
+    max_sibling_context_chars: int = 6000
     retrieval_top_k: int = 5
     conversation_buffer_size: int = 20
     # U6: when history overflows max_context_tokens, summarize the dropped

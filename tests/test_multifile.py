@@ -404,3 +404,76 @@ async def test_multi_file_flow_edit_sees_generated_siblings(tmp_path, monkeypatc
     assert "styles.css" in a._llm_edit.prompts[0]
     # And the edit actually landed
     assert 'href="styles.css"' in index.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# _sibling_context — one nav, one TOTAL budget
+# ---------------------------------------------------------------------------
+
+
+def _page(nav: str, filler_kb: int = 0) -> str:
+    return (
+        "<!DOCTYPE html><html><head><style>"
+        + ("/* pad */" * (filler_kb * 100))
+        + "</style></head><body>"
+        + nav
+        + "<main>content</main></body></html>"
+    )
+
+
+def test_sibling_context_states_the_nav_once(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    nav = '<nav><a href="index.html">Home</a><a href="about.html">About</a></nav>'
+    (tmp_path / "index.html").write_text(_page(nav), encoding="utf-8")
+    (tmp_path / "about.html").write_text(_page(nav), encoding="utf-8")
+
+    a = AgentCore(session_id="pytest_sibctx")
+    ctx = a._sibling_context(["index.html", "about.html"])
+
+    assert "Site navigation — reuse EXACTLY" in ctx
+    assert nav in ctx
+    assert "index.html" in ctx  # attributed to the page it came from
+
+
+def test_sibling_context_finds_nav_past_the_old_2500_char_cutoff(
+    tmp_path, monkeypatch
+):
+    """The nav used to be lost behind a long <head>: the per-file excerpt was
+    cut at a fixed 2500 chars, so later pages never saw it."""
+    monkeypatch.chdir(tmp_path)
+    nav = '<nav><a href="index.html">Home</a></nav>'
+    page = _page(nav, filler_kb=40)  # nav sits ~4 KB into the file
+    assert page.index(nav) > 2500
+    (tmp_path / "index.html").write_text(page, encoding="utf-8")
+
+    a = AgentCore(session_id="pytest_sibctx_deep")
+    ctx = a._sibling_context(["index.html"])
+
+    assert nav in ctx
+
+
+def test_sibling_context_total_budget_does_not_grow_with_page_count(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "max_sibling_context_chars", 3000)
+    nav = "<nav><a href='index.html'>Home</a></nav>"
+    names = [f"page{i}.html" for i in range(8)]
+    for n in names:
+        (tmp_path / n).write_text(_page(nav, filler_kb=20), encoding="utf-8")
+
+    a = AgentCore(session_id="pytest_sibctx_budget")
+    two = a._sibling_context(names[:2])
+    eight = a._sibling_context(names)
+
+    # Old behavior: 8 pages sent 4x the text of 2. Now both fit one budget.
+    assert len(eight) <= 3000 + 500  # + the framing prose
+    assert len(eight) < len(two) * 2
+
+
+def test_sibling_context_empty_without_written_files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_sibctx_empty")
+    assert a._sibling_context([]) == ""

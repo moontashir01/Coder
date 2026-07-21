@@ -125,8 +125,15 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
   separate/split/extract… + plural "files" or ≥2 languages). One `_plan_file_ops` LLM call returns
   `{"files": [{filename, action, instruction}]}` (`_parse_file_plan`, tolerant), then each op runs
   through `_file_op_flow`. **Cross-file consistency:** every per-file call gets the full plan
-  manifest as `extra_context`, plus the content of already-written siblings, so
-  `<link href>`/`<script src>`/shared names line up.
+  manifest as `extra_context`, plus `_sibling_context(written)`, so
+  `<link href>`/`<script src>`/shared names line up. **`_sibling_context` is the shared threading
+  helper** (used by `_multi_file_flow` AND `_run_subtasks`): it lifts the `<nav>` (or a linking
+  `<header>`) out of the first written page and states it **once** as canonical markup to copy
+  verbatim, then quotes the most recent siblings against a **single total budget**
+  (`max_sibling_context_chars`). It replaced `_read_refs(written, max_chars=2500)`, whose cap was
+  **per file** — a six-page build shipped ~12 KB of markup that overflowed the context window and
+  evicted the very pages defining the nav, and each excerpt was cut at a fixed offset that could land
+  before the nav (long `<head>`) or mid-element. That was the "every page has a different navbar" bug.
 - **Genuine multi-step work in a loaded project → `_run_tool_loop`** (native tool calling) — and,
   since 2026-07, **any repair request whose target can't be pinned down**. `_wants_existing_file_change()`
   (a repair verb — fix/update/refactor/rename/… — that isn't opening an interrogative) marks a
@@ -364,6 +371,8 @@ when non-empty; `allowed_commands` remains deliberately informational. `allow_ne
 leaving it unset meant budgeting 8192 prompt tokens into a 4096 window and losing the overflow.
 Verified in the request payload via `_chat_params(...)["options"]["num_ctx"]`. It must stay above
 `max_context_tokens` with headroom for the generated file; lower it on a RAM/VRAM-tight machine.
+`max_sibling_context_chars` (6000) is the TOTAL cap on already-written sibling files threaded into
+the next step of a multi-file build — see `_sibling_context`.
 `max_context_tokens` is the per-prompt token budget enforced by `app/agent/context_budget.py`
 (oldest history dropped first in `_build_messages`); `max_repair_attempts` caps the
 verify-and-repair loop; `backups_dir` / `max_write_backups` configure safe-write snapshots. RAG

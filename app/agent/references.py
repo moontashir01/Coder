@@ -93,6 +93,29 @@ REF_SCANNED_EXTS = {
 }
 
 
+# The site-wide navigation block. <nav> is the semantic element; a <header>
+# containing links is the common fallback the local model emits instead.
+_NAV_RE = re.compile(r"<nav\b[^>]*>.*?</nav\s*>", re.IGNORECASE | re.DOTALL)
+_HEADER_RE = re.compile(r"<header\b[^>]*>.*?</header\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def extract_nav_block(html: str) -> str | None:
+    """The page's navigation markup, or None if it has none.
+
+    Threading this one block into later pages is far cheaper — and a far
+    stronger signal — than pasting whole sibling files and hoping the nav
+    survives truncation.
+    """
+    m = _NAV_RE.search(html or "")
+    if m:
+        return m.group(0)
+    m = _HEADER_RE.search(html or "")
+    # A <header> only counts as navigation when it actually links somewhere.
+    if m and _HREF_RE.search(m.group(0)):
+        return m.group(0)
+    return None
+
+
 def is_creatable(ref: str) -> bool:
     """True when a missing reference is a text file we can generate (vs. a
     binary asset like a .png/.woff we should only report)."""

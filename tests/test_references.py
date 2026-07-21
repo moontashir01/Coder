@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from app.agent.core import AgentCore
 from app.agent.references import (
     extract_local_references,
+    extract_nav_block,
     find_dead_references,
     is_creatable,
 )
@@ -252,3 +253,35 @@ async def test_repair_respects_max_reference_repairs(tmp_path, monkeypatch):
 
     created = [p.name for p in tmp_path.iterdir() if p.suffix == ".js"]
     assert len(created) == 1  # capped at one despite two dead references
+
+
+# ---------------------------------------------------------------------------
+# extract_nav_block
+# ---------------------------------------------------------------------------
+
+
+def test_extract_nav_block_prefers_nav_element():
+    html = (
+        "<html><head><title>x</title></head><body>"
+        '<nav class="main"><a href="index.html">Home</a></nav>'
+        "<header><a href='other.html'>H</a></header>"
+        "</body></html>"
+    )
+    nav = extract_nav_block(html)
+    assert nav.startswith('<nav class="main">')
+    assert nav.endswith("</nav>")
+
+
+def test_extract_nav_block_falls_back_to_linking_header():
+    html = "<body><header><a href='about.html'>About</a></header></body>"
+    assert extract_nav_block(html).startswith("<header>")
+
+
+def test_extract_nav_block_ignores_header_without_links():
+    html = "<body><header><h1>Just a title</h1></header></body>"
+    assert extract_nav_block(html) is None
+
+
+def test_extract_nav_block_none_when_absent():
+    assert extract_nav_block("<body><p>hi</p></body>") is None
+
