@@ -188,6 +188,13 @@ would fight native tool calls. What remains of the hardening:
   | `"skill:<skill>"`; `unregister_by_source()` is how MCP disconnect cleans up. Every tool also
   carries `permissions` tags — builtins use `fs:read` / `fs:write` / `fs:delete` / `shell` /
   `git:read` / `git:write`; MCP tools are tagged `mcp` as a class.
+  **Builtins are never shadowed:** `register()` refuses to let a non-builtin tool take a name a
+  builtin already owns and gives it a namespaced alias instead (`filesystem_write_file`), returning
+  the name it actually used. This is load-bearing — `@modelcontextprotocol/server-filesystem`
+  advertises `read_file`/`write_file`/`edit_file`/`list_directory`/`search_files`, and before the
+  guard those overwrote the builtins, so the next `unregister_by_source("mcp:filesystem")` on
+  disconnect **deleted** them and every file flow died with `Tool not found: 'write_file'`.
+  `MCPManager.connect_server` records the aliases on `conn.renamed_tools` (surfaced by `/mcp list`).
 - `app/agent/executor.py` — async `execute()`: **refuses any tool whose `permissions` intersect
   `settings.denied_permissions`** (default empty = allow all), validates args against the tool's
   JSON Schema, consults the **approval gate** (below), then awaits async handlers (MCP) or runs sync
@@ -203,8 +210,9 @@ would fight native tool calls. What remains of the hardening:
   input, evals) the default is **allow**, except under `--safe` which denies
   `settings.safe_deny_permissions` (`shell`/`fs:delete`) so a non-interactive run can't silently
   run them. `--yolo` sets `settings.auto_approve` → gate skipped entirely. NB: the deterministic
-  `_file_op_flow`/`_surgical_edit` writes call `filesystem.write_file` directly, **not** through the
-  executor, so they are not gated — the gate covers the native tool loop and MCP tools.
+  `_file_op_flow`/`_surgical_edit` writes go through `executor.execute("write_file", …)` like every
+  other tool call, so they are gated too — and they resolve `write_file` **by name in the registry**,
+  which is why the no-shadowing rule below matters.
 - **Safe writes** (`app/tools/filesystem.py`): `write_file` (overwrite), `edit_file`, and
   `delete_file` back up the previous content into `settings.backups_dir` before mutating — a
   failed backup aborts the mutation. `undo_write` (builtin tool, also the `/undo` REPL command)

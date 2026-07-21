@@ -41,9 +41,15 @@ class MCPManager:
 
         self._connections[name] = conn
 
-        # Register tools
+        # Register tools. A tool whose name collides with a builtin is aliased
+        # by the registry rather than shadowing it — record the mapping so the
+        # REPL can show what the server's tools ended up being called.
+        renamed: dict[str, str] = {}
         for tool_def in conn.make_tool_definitions():
-            registry.register(tool_def)
+            final_name = registry.register(tool_def)
+            if final_name != tool_def.name:
+                renamed[tool_def.name] = final_name
+        conn.renamed_tools = renamed
 
         return conn
 
@@ -102,7 +108,10 @@ class MCPManager:
                 "name": name,
                 "connected": conn.connected,
                 "tool_count": len(conn.tools),
-                "tools": [t.name for t in conn.tools],
+                "tools": [
+                    conn.renamed_tools.get(t.name, t.name) for t in conn.tools
+                ],
+                "renamed": dict(conn.renamed_tools),
                 "command": conn.config.get("command", ""),
             })
         return result

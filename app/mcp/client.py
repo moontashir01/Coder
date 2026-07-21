@@ -19,6 +19,9 @@ class MCPServerConnection:
         self.session: ClientSession | None = None
         self.tools: list[MCPTool] = []
         self.connected: bool = False
+        # {advertised name: name it was registered under} for tools the registry
+        # had to alias because a builtin already owned the name.
+        self.renamed_tools: dict[str, str] = {}
 
         self._ready = asyncio.Event()
         self._stop = asyncio.Event()

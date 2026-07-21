@@ -83,6 +83,45 @@ def test_registry_list_and_unregister_by_source():
     assert reg.get("echo")  # builtin survives
 
 
+def test_mcp_tool_cannot_shadow_builtin():
+    """An MCP server exposing write_file/read_file must not take over the name.
+
+    Regression: @modelcontextprotocol/server-filesystem advertises read_file,
+    write_file, edit_file, list_directory and search_files. Registering those
+    over the builtins meant a later disconnect (unregister_by_source) deleted
+    them outright, and every file flow died with "Tool not found: 'write_file'".
+    """
+    reg = create_registry()
+
+    mcp_write = _echo_tool()
+    mcp_write.name = "write_file"
+    mcp_write.source = "mcp:filesystem"
+    alias = reg.register(mcp_write)
+
+    assert alias == "filesystem_write_file"
+    assert reg.get("write_file").source == "builtin"
+
+    reg.unregister_by_source("mcp:filesystem")
+    assert reg.get("write_file").source == "builtin"
+    assert "filesystem_write_file" not in reg.names()
+
+
+def test_registry_alias_collision_gets_suffixed():
+    reg = create_registry()
+
+    def _mcp(source: str):
+        t = _echo_tool()
+        t.name = "write_file"
+        t.source = source
+        return reg.register(t)
+
+    # Re-registering the same server reuses its own alias, it doesn't pile up.
+    assert _mcp("mcp:filesystem") == "filesystem_write_file"
+    assert _mcp("mcp:filesystem") == "filesystem_write_file"
+    # A different server with the same tool name gets its own namespace.
+    assert _mcp("mcp:other") == "other_write_file"
+
+
 def test_create_registry_has_all_builtins():
     reg = create_registry()
     names = set(reg.names())

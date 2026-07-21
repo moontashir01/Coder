@@ -1,3 +1,16 @@
 {
-  "servers": []
+  "servers": [
+    {
+      "name": "fetch",
+      "command": "C:\\Moontashir\\shamsu\\Coder\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "mcp_server_fetch"],
+      "env": {}
+    },
+    {
+      "name": "playwright",
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "@playwright/mcp@latest"],
+      "env": {}
+    }
+  ]
 }

@@ -25,8 +25,37 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {}
 
-    def register(self, tool: ToolDefinition) -> None:
+    def register(self, tool: ToolDefinition) -> str:
+        """Register a tool; returns the name it was registered under.
+
+        A tool from an outside source (MCP/skill) may NOT take over a name that
+        already belongs to a tool from a different source — it gets a namespaced
+        alias instead (``filesystem_write_file``). Two reasons this matters:
+        the deterministic flows look builtins up by exact name
+        (``_file_op_flow`` → ``write_file``), and ``unregister_by_source()`` on
+        MCP disconnect would otherwise *delete* the shadowed builtin outright,
+        leaving the agent with no way to write files at all.
+        """
+        existing = self._tools.get(tool.name)
+        if existing is not None and existing.source != tool.source:
+            if tool.source != "builtin":
+                tool = tool.model_copy(update={"name": self._alias_for(tool)})
+            # A builtin re-registering over an MCP name reclaims it (correct:
+            # builtins are the trusted implementation).
         self._tools[tool.name] = tool
+        return tool.name
+
+    def _alias_for(self, tool: ToolDefinition) -> str:
+        """Namespaced, collision-free name for a tool whose name is taken."""
+        prefix = tool.source.split(":", 1)[-1] or tool.source
+        candidate = f"{prefix}_{tool.name}"
+        n = 2
+        # An alias already held by the same source is this tool's own slot from
+        # a previous registration — overwrite it instead of piling up suffixes.
+        while candidate in self._tools and self._tools[candidate].source != tool.source:
+            candidate = f"{prefix}_{tool.name}_{n}"
+            n += 1
+        return candidate
 
     def get(self, name: str) -> ToolDefinition:
         if name not in self._tools:
