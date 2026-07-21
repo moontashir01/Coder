@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -390,16 +391,25 @@ CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name);
 
 
 class SymbolIndex:
-    """Synchronous sqlite3-backed symbol + dependency-graph index."""
+    """Synchronous sqlite3-backed symbol + dependency-graph index.
+
+    Thread-safe: the singleton is hit from more than one thread (the retriever's
+    indexing path and the ProjectWatcher's debounce Timer thread), so the single
+    connection is opened with ``check_same_thread=False`` and every use of it is
+    serialized by ``self._lock``.
+    """
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         if db_path is None:
             db_path = getattr(settings, "symbols_path", ".symbols.db")
         self._db_path = str(db_path)
-        self._conn = sqlite3.connect(self._db_path)
+        # RLock: index_file() takes the lock and then calls remove_file().
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        with self._lock:
+            self._conn.executescript(_SCHEMA)
+            self._conn.commit()
 
     # -- mutation -------------------------------------------------------
 
@@ -413,17 +423,6 @@ class SymbolIndex:
         """
         fp = str(file_path)
         fs = extract_symbols(file_path)
-        self.remove_file(fp)
-
-        cur = self._conn.cursor()
-        cur.executemany(
-            "INSERT INTO symbols (name, kind, file_path, start_line, end_line, parent) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                (s.name, s.kind, s.file_path, s.start_line, s.end_line, s.parent)
-                for s in fs.symbols
-            ],
-        )
         root = Path(project_root) if project_root is not None else None
         import_rows = []
         for module, lvl in fs._import_records:
@@ -433,82 +432,104 @@ class SymbolIndex:
                 else None
             )
             import_rows.append((fp, module, resolved))
-        cur.executemany(
-            "INSERT INTO imports (file_path, module, resolved_path) VALUES (?, ?, ?)",
-            import_rows,
-        )
-        cur.executemany(
-            "INSERT INTO refs (file_path, name, line) VALUES (?, ?, ?)",
-            [(fp, r.name, r.line) for r in fs.references],
-        )
-        self._conn.commit()
+
+        with self._lock:
+            self.remove_file(fp)
+            cur = self._conn.cursor()
+            cur.executemany(
+                "INSERT INTO symbols (name, kind, file_path, start_line, end_line, parent) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (s.name, s.kind, s.file_path, s.start_line, s.end_line, s.parent)
+                    for s in fs.symbols
+                ],
+            )
+            cur.executemany(
+                "INSERT INTO imports (file_path, module, resolved_path) VALUES (?, ?, ?)",
+                import_rows,
+            )
+            cur.executemany(
+                "INSERT INTO refs (file_path, name, line) VALUES (?, ?, ?)",
+                [(fp, r.name, r.line) for r in fs.references],
+            )
+            self._conn.commit()
         return len(fs.symbols)
 
     def remove_file(self, file_path: str | Path) -> None:
         fp = str(file_path)
-        cur = self._conn.cursor()
-        cur.execute("DELETE FROM symbols WHERE file_path = ?", (fp,))
-        cur.execute("DELETE FROM imports WHERE file_path = ?", (fp,))
-        cur.execute("DELETE FROM refs WHERE file_path = ?", (fp,))
-        self._conn.commit()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM symbols WHERE file_path = ?", (fp,))
+            cur.execute("DELETE FROM imports WHERE file_path = ?", (fp,))
+            cur.execute("DELETE FROM refs WHERE file_path = ?", (fp,))
+            self._conn.commit()
 
     def clear(self) -> None:
-        cur = self._conn.cursor()
-        cur.execute("DELETE FROM symbols")
-        cur.execute("DELETE FROM imports")
-        cur.execute("DELETE FROM refs")
-        self._conn.commit()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM symbols")
+            cur.execute("DELETE FROM imports")
+            cur.execute("DELETE FROM refs")
+            self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # -- queries --------------------------------------------------------
 
     def lookup(self, name: str) -> list[dict]:
         """Exact-name symbol definitions."""
-        rows = self._conn.execute(
-            "SELECT name, kind, file_path, start_line, end_line, parent "
-            "FROM symbols WHERE name = ? ORDER BY file_path, start_line",
-            (name,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT name, kind, file_path, start_line, end_line, parent "
+                "FROM symbols WHERE name = ? ORDER BY file_path, start_line",
+                (name,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def search(self, prefix: str, limit: int = 20) -> list[dict]:
         """Symbols whose name starts with `prefix`."""
-        rows = self._conn.execute(
-            "SELECT name, kind, file_path, start_line, end_line, parent "
-            "FROM symbols WHERE name LIKE ? ORDER BY name LIMIT ?",
-            (prefix + "%", limit),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT name, kind, file_path, start_line, end_line, parent "
+                "FROM symbols WHERE name LIKE ? ORDER BY name LIMIT ?",
+                (prefix + "%", limit),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def references(self, name: str) -> list[dict]:
         """Call/usage sites of a name across the project."""
-        rows = self._conn.execute(
-            "SELECT file_path, name, line FROM refs WHERE name = ? ORDER BY file_path, line",
-            (name,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT file_path, name, line FROM refs WHERE name = ? ORDER BY file_path, line",
+                (name,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def dependencies(self, file_path: str | Path) -> list[str]:
         """Resolved files that `file_path` imports (project-internal only)."""
-        rows = self._conn.execute(
-            "SELECT DISTINCT resolved_path FROM imports "
-            "WHERE file_path = ? AND resolved_path IS NOT NULL",
-            (str(file_path),),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT resolved_path FROM imports "
+                "WHERE file_path = ? AND resolved_path IS NOT NULL",
+                (str(file_path),),
+            ).fetchall()
         return [r["resolved_path"] for r in rows]
 
     def dependents(self, file_path: str | Path) -> list[str]:
         """Files that import `file_path` (reverse edges)."""
-        rows = self._conn.execute(
-            "SELECT DISTINCT file_path FROM imports WHERE resolved_path = ?",
-            (str(file_path),),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT file_path FROM imports WHERE resolved_path = ?",
+                (str(file_path),),
+            ).fetchall()
         return [r["file_path"] for r in rows]
 
     def count(self) -> int:
-        return self._conn.execute("SELECT COUNT(*) AS c FROM symbols").fetchone()["c"]
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS c FROM symbols").fetchone()
+        return row["c"]
 
 
 # Lazy singleton (Step 12 / A1): constructing a SymbolIndex opens (and creates)

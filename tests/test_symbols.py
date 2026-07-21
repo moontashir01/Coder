@@ -166,6 +166,30 @@ def test_remove_file(tmp_path, index):
     assert index.lookup("gone") == []
 
 
+def test_index_file_from_another_thread(tmp_path, index):
+    """The singleton index is hit from the ProjectWatcher's Timer thread, not
+    just the thread that opened the connection — sqlite must accept that.
+    (Regression: 'SQLite objects created in a thread can only be used in that
+    same thread' made every watcher-driven reindex a silent no-op.)"""
+    import threading
+
+    f = _write(tmp_path, "auth.py", "def authenticate_user():\n    pass\n")
+    errors: list[BaseException] = []
+
+    def worker():
+        try:
+            index.index_file(f)
+        except BaseException as e:  # noqa: BLE001 - capture for the assert
+            errors.append(e)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+
+    assert errors == []
+    assert len(index.lookup("authenticate_user")) == 1
+
+
 # ----------------------------------------------------------------------
 # Retriever integration — indexing populates the symbol index too
 # ----------------------------------------------------------------------
