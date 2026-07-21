@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.agent.core import AgentCore
-from app.agent.verify import check_file
+from app.agent.verify import check_file, is_verifiable
 
 
 class ScriptedLLM:
@@ -113,6 +113,120 @@ def test_check_file_js_skips_without_node(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Content guards — "wrong language / prose dumped into the file" (no tooling)
+# ---------------------------------------------------------------------------
+
+
+def test_is_verifiable_covers_code_and_style_types():
+    # These are now checkable even with no node/tsc — via the content guards.
+    for name in ("a.css", "a.scss", "a.less", "a.js", "a.ts", "a.py", "a.html"):
+        assert is_verifiable(name) is True, name
+    # ...but genuinely unknowable types stay unverifiable (never "broken").
+    for name in ("notes.txt", "data.json", "readme.md", "pic.png"):
+        assert is_verifiable(name) is False, name
+
+
+def test_check_css_rejects_html_content(tmp_path):
+    # The exact reproduced bug: an HTML document written into styles.css.
+    p = tmp_path / "styles.css"
+    p.write_text("<!DOCTYPE html>\n<html><body>oops</body></html>", encoding="utf-8")
+    ok, err = check_file(p)
+    assert ok is False
+    assert "CSS" in err
+
+
+def test_check_css_rejects_prose(tmp_path):
+    p = tmp_path / "notes.css"
+    p.write_text("Sure! Here is the CSS you asked for. It styles the page.", encoding="utf-8")
+    ok, err = check_file(p)
+    assert ok is False
+    assert "prose" in err.lower()
+
+
+def test_check_css_accepts_real_css(tmp_path):
+    p = tmp_path / "good.css"
+    p.write_text("body { color: red; }\n.hero { padding: 2rem; }", encoding="utf-8")
+    ok, err = check_file(p)
+    assert ok is True
+    assert err == ""
+
+
+def test_check_css_accepts_at_rule_only(tmp_path):
+    p = tmp_path / "imp.css"
+    p.write_text('@import url("base.css");', encoding="utf-8")
+    assert check_file(p) == (True, "")
+
+
+def test_check_css_accepts_comment_only(tmp_path):
+    p = tmp_path / "empty.css"
+    p.write_text("/* intentionally left blank */\n", encoding="utf-8")
+    assert check_file(p) == (True, "")
+
+
+def test_check_js_rejects_html_even_without_node(tmp_path, monkeypatch):
+    # HTML dumped into script.js is caught by the tooling-free guard, so the
+    # fix works on machines with no node installed too.
+    monkeypatch.setattr("app.agent.verify.shutil.which", lambda name: None)
+    p = tmp_path / "script.js"
+    p.write_text("<!DOCTYPE html>\n<html></html>", encoding="utf-8")
+    ok, err = check_file(p)
+    assert ok is False
+    assert "JavaScript" in err
+
+
+def test_check_ts_rejects_html_even_without_tsc(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.agent.verify.shutil.which", lambda name: None)
+    p = tmp_path / "main.ts"
+    p.write_text("<html><body>x</body></html>", encoding="utf-8")
+    ok, err = check_file(p)
+    assert ok is False
+    assert "TypeScript" in err
+
+
+def test_check_html_rejects_trailing_prose(tmp_path):
+    # weaknesses.md #9: prose leaking AFTER </html> used to pass (tags balance).
+    p = tmp_path / "index.html"
+    p.write_text(
+        "<!DOCTYPE html><html><body><h1>Hi</h1></body></html>\n\n"
+        "Here is your page! Let me know if you want changes.",
+        encoding="utf-8",
+    )
+    ok, err = check_file(p)
+    assert ok is False
+    assert "after </html>" in err
+
+
+def test_check_html_rejects_leading_prose(tmp_path):
+    p = tmp_path / "lead.html"
+    p.write_text(
+        "Sure, here is the page you asked for:\n"
+        "<!DOCTYPE html><html><body>x</body></html>",
+        encoding="utf-8",
+    )
+    ok, err = check_file(p)
+    assert ok is False
+    assert "before the document" in err
+
+
+def test_check_html_rejects_prose_only(tmp_path):
+    p = tmp_path / "prose.html"
+    p.write_text("This is just an explanation with no markup at all.", encoding="utf-8")
+    ok, err = check_file(p)
+    assert ok is False
+    assert "no HTML tags" in err
+
+
+def test_check_html_allows_trailing_whitespace_and_comment(tmp_path):
+    # A clean doc with only whitespace / an HTML comment after </html> is fine.
+    p = tmp_path / "clean.html"
+    p.write_text(
+        "<!DOCTYPE html><html><body>x</body></html>\n<!-- built by coder -->\n",
+        encoding="utf-8",
+    )
+    assert check_file(p) == (True, "")
+
+
+# ---------------------------------------------------------------------------
 # _file_op_flow verify-and-repair integration
 # ---------------------------------------------------------------------------
 
@@ -135,6 +249,29 @@ async def test_file_op_flow_repairs_broken_python(tmp_path, monkeypatch):
     assert "def add(a, b):" in body  # repaired content on disk
     assert a._llm_direct.calls == 2  # generate + one repair
     assert len(trace) == 2  # two write_file entries
+    assert "repair" in answer.lower()
+
+
+async def test_file_op_flow_repairs_css_written_as_html(tmp_path, monkeypatch):
+    """The reported symptom, end to end: the model dumps an HTML document into
+    styles.css; verify-and-repair must catch it and rewrite real CSS."""
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_verify_css")
+    a._llm_direct = ScriptedLLM(
+        [
+            # 1st call: generation → HTML written into a .css file
+            "FILENAME: styles.css\n<!DOCTYPE html>\n<html><body>x</body></html>",
+            # 2nd call: repair → real CSS
+            "FILENAME: styles.css\nbody { color: red; }",
+        ]
+    )
+
+    answer, trace = await a._file_op_flow("make a styles.css for the theme")
+
+    body = (tmp_path / "styles.css").read_text(encoding="utf-8")
+    assert "color: red" in body  # repaired content on disk
+    assert "<html>" not in body  # the HTML is gone
+    assert a._llm_direct.calls == 2  # generate + one repair
     assert "repair" in answer.lower()
 
 
