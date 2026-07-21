@@ -15,6 +15,11 @@ def get_llm(temperature: float = 0.1, json_mode: bool = False) -> ChatOllama:
         "model": settings.llm_model,
         "base_url": settings.ollama_base_url,
         "temperature": temperature,
+        # Ollama defaults num_ctx to 4096 no matter what the model supports, and
+        # silently truncates anything longer instead of erroring. Set it
+        # explicitly so the prompt budget we enforce (max_context_tokens) is a
+        # budget the server actually honors.
+        "num_ctx": settings.llm_num_ctx,
         # ChatOllama has no top-level `timeout`; it must go to the underlying
         # ollama client via client_kwargs, else it is silently dropped.
         "client_kwargs": {"timeout": settings.llm_request_timeout_seconds},
@@ -31,6 +36,7 @@ def get_streaming_llm(temperature: float = 0.1) -> ChatOllama:
         model=settings.llm_model,
         base_url=settings.ollama_base_url,
         temperature=temperature,
+        num_ctx=settings.llm_num_ctx,  # see get_llm — Ollama defaults to 4096
         client_kwargs={"timeout": settings.llm_request_timeout_seconds},
     )
 

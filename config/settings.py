@@ -56,6 +56,14 @@ class Settings(BaseSettings):
     # qwen2.5-coder:7b handles a larger context window than the old 3B default;
     # raised from 4096 accordingly.
     max_context_tokens: int = 8192
+    # Ollama's own context window (num_ctx). It defaults to 4096 server-side and
+    # is NOT derived from max_context_tokens — leaving it unset meant we budgeted
+    # 8192 prompt tokens into a 4096 window and Ollama silently dropped the
+    # overflow, evicting exactly the sibling-file context that keeps a multi-page
+    # build consistent. Must exceed max_context_tokens (the PROMPT budget) with
+    # room left for the generated file. Costs KV-cache memory per request; lower
+    # it if a machine is tight on RAM/VRAM.
+    llm_num_ctx: int = 16384
     max_tool_retries: int = 3
     max_tool_failures: int = 2  # §11: give up a tool after this many failures
     # M4: how many tool-call rounds the native tool loop may take before it

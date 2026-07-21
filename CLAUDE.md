@@ -359,6 +359,11 @@ when non-empty; `allowed_commands` remains deliberately informational. `allow_ne
 `network_commands` gate network-reaching commands. Tool-level gating is `denied_permissions`
 (hard-refuse) and the approval gate (`approval_gated_permissions`, `safe_deny_permissions`,
 `auto_approve`, `safe_mode`). Path jail: `sandbox_root` (None = off) and `allow_outside_root`.
+**`llm_num_ctx` (default 16384) is set explicitly on every `ChatOllama`** — Ollama's own default is
+4096 regardless of what the model supports, and it *silently truncates* rather than erroring, so
+leaving it unset meant budgeting 8192 prompt tokens into a 4096 window and losing the overflow.
+Verified in the request payload via `_chat_params(...)["options"]["num_ctx"]`. It must stay above
+`max_context_tokens` with headroom for the generated file; lower it on a RAM/VRAM-tight machine.
 `max_context_tokens` is the per-prompt token budget enforced by `app/agent/context_budget.py`
 (oldest history dropped first in `_build_messages`); `max_repair_attempts` caps the
 verify-and-repair loop; `backups_dir` / `max_write_backups` configure safe-write snapshots. RAG
