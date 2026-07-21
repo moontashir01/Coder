@@ -10,6 +10,7 @@ from app.agent.core import AgentCore
 from app.agent.references import (
     extract_local_references,
     extract_nav_block,
+    find_broken_page_links,
     find_dead_references,
     is_creatable,
 )
@@ -285,3 +286,75 @@ def test_extract_nav_block_ignores_header_without_links():
 def test_extract_nav_block_none_when_absent():
     assert extract_nav_block("<body><p>hi</p></body>") is None
 
+
+# ---------------------------------------------------------------------------
+# find_broken_page_links — target exists but the href form can't reach it
+# ---------------------------------------------------------------------------
+
+
+def test_find_broken_page_links_fixes_root_absolute_and_extensionless(tmp_path):
+    (tmp_path / "about.html").write_text("<html></html>", encoding="utf-8")
+    (tmp_path / "blog.html").write_text("<html></html>", encoding="utf-8")
+    index = tmp_path / "index.html"
+    index.write_text(
+        "<nav>"
+        '<a href="/about.html">About</a>'
+        '<a href="blog">Blog</a>'
+        '<a href="contact.html">Contact</a>'          # already fine
+        '<a href="https://example.com/x.html">Ext</a>'  # external
+        "</nav>",
+        encoding="utf-8",
+    )
+
+    fixes = find_broken_page_links(index, tmp_path)
+
+    assert fixes == [("/about.html", "about.html"), ("blog", "blog.html")]
+
+
+def test_find_broken_page_links_leaves_real_routes_alone(tmp_path):
+    """No such page on disk → it's a server route, not a broken file link."""
+    index = tmp_path / "index.html"
+    index.write_text('<a href="/dashboard">Dash</a>', encoding="utf-8")
+    assert find_broken_page_links(index, tmp_path) == []
+
+
+def test_find_broken_page_links_preserves_fragment(tmp_path):
+    (tmp_path / "about.html").write_text("<html></html>", encoding="utf-8")
+    index = tmp_path / "index.html"
+    index.write_text('<a href="/about.html#team">Team</a>', encoding="utf-8")
+    assert find_broken_page_links(index, tmp_path) == [
+        ("/about.html#team", "about.html#team")
+    ]
+
+
+async def test_repair_page_links_rewrites_the_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "about.html").write_text("<html></html>", encoding="utf-8")
+    index = tmp_path / "index.html"
+    index.write_text(
+        '<nav><a href="/about.html">About</a></nav><p>about.html</p>',
+        encoding="utf-8",
+    )
+
+    a = AgentCore(session_id="pytest_links")
+    note, trace = await a._repair_page_links(_write_trace(index))
+
+    text = index.read_text(encoding="utf-8")
+    assert '<a href="about.html">About</a>' in text
+    assert "<p>about.html</p>" in text  # untouched outside the href
+    assert "index.html" in note
+
+
+async def test_repair_page_links_noop_when_links_are_fine(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "about.html").write_text("<html></html>", encoding="utf-8")
+    index = tmp_path / "index.html"
+    original = '<nav><a href="about.html">About</a></nav>'
+    index.write_text(original, encoding="utf-8")
+
+    a = AgentCore(session_id="pytest_links_noop")
+    note, trace = await a._repair_page_links(_write_trace(index))
+
+    assert note == ""
+    assert trace == []
+    assert index.read_text(encoding="utf-8") == original

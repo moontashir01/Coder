@@ -116,6 +116,68 @@ def extract_nav_block(html: str) -> str | None:
     return None
 
 
+def find_broken_page_links(
+    file_path: Path | str, project_root: Path | str | None = None
+) -> list[tuple[str, str]]:
+    """`<a href>` targets that point at a real sibling page in a broken FORM.
+
+    Distinct from find_dead_references, which reports links whose file is
+    MISSING. These links have a file — the href just can't reach it from a
+    static page opened over file://:
+
+      * root-absolute — ``href="/about.html"`` (there is no web root)
+      * extensionless — ``href="about"`` (no server to add .html)
+
+    Returns ``(href_as_written, corrected_href)`` pairs, and only when the
+    corrected target actually exists next to the file, so a genuine route in a
+    server-rendered app is never rewritten.
+    """
+    p = Path(file_path)
+    if p.suffix.lower() not in (".html", ".htm"):
+        return []
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+
+    base = p.parent
+    root = Path(project_root).resolve() if project_root is not None else None
+    fixes: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for m in _HREF_RE.finditer(text):
+        if m.group("tag").lower() != "a":
+            continue
+        raw = (m.group("val") or "").strip()
+        if not raw or raw in seen or _EXTERNAL_RE.match(raw):
+            continue
+        target = raw.split("#", 1)[0].split("?", 1)[0].strip()
+        if not target:
+            continue
+
+        candidate = target.lstrip("/\\")  # root-absolute → same-dir
+        if not Path(candidate).suffix:
+            candidate = f"{candidate}.html"  # extensionless → add .html
+        if candidate == target:
+            continue  # already a well-formed relative link
+
+        try:
+            resolved = (base / candidate).resolve()
+        except Exception:
+            continue
+        if root is not None:
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                continue
+        if not resolved.is_file():
+            continue  # no such page → a real route, leave it alone
+
+        seen.add(raw)
+        fixes.append((raw, candidate + raw[len(target):]))  # keep #frag/?query
+    return fixes
+
+
 def is_creatable(ref: str) -> bool:
     """True when a missing reference is a text file we can generate (vs. a
     binary asset like a .png/.woff we should only report)."""

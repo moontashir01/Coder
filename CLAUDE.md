@@ -81,7 +81,12 @@ this turn (HTML/CSS/JS via `app/agent/references.py`) for **local** references �
 `<link href>`, `<img src>`, CSS `@import`/`url()`, JS relative imports — that point at a file which
 doesn't exist, and **creates each missing TEXT file** (`.css`/`.js`/`.ts`/`.html`/…) via
 `_file_op_flow`, feeding the referencing file in as context so ids/classes/selectors line up.
-Missing **binary** assets (`.png`/`.woff`/…) are **reported, never fabricated**. External URLs,
+Missing **binary** assets (`.png`/`.woff`/…) are **reported, never fabricated**. A second pass,
+`_repair_page_links`, then fixes links whose target **exists** but whose *form* can't reach it from a
+static page opened over `file://` — `href="/about.html"` (root-absolute) and `href="about"`
+(extensionless). It is purely deterministic (no LLM): the corrected target must already exist next to
+the page, so a genuine route in a server-rendered app is never rewritten, and only the `href` value on
+`<a>` tags is touched. External URLs,
 `//cdn`, `data:`/`mailto:`/`#anchor`, root-absolute `/paths`, and bare npm import specifiers are all
 ignored (no off-disk false alarms); targets that resolve outside the sandbox root are skipped. It's
 bounded by `settings.max_reference_repairs`, gated by `settings.check_references` (default on),

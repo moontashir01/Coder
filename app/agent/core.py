@@ -14,6 +14,7 @@ from app.agent.recovery import classify_error, recovery_hint
 from app.agent.references import (
     REF_SCANNED_EXTS,
     extract_nav_block,
+    find_broken_page_links,
     find_dead_references,
     is_creatable,
 )
@@ -1806,6 +1807,69 @@ class AgentCore:
             )
         return note, ref_trace
 
+    async def _repair_page_links(self, trace: list[dict]) -> tuple[str, list[dict]]:
+        """Rewrite nav links that point at a real page in an unusable form.
+
+        `find_dead_references` only reports links whose target is MISSING. A
+        link like `href="/about.html"` or `href="about"` has a file — it just
+        can't reach it from a static page opened over file://, which is how
+        these builds are viewed. Both forms are common in generated navs and
+        nothing else catches them.
+
+        Purely deterministic: the corrected target must already exist next to
+        the page, so a genuine route in a server-rendered app is never touched.
+        No LLM call. Best-effort — a failure here never discards written files.
+        """
+        workdir = Path(self._project_path or Path.cwd())
+        root = workdir.resolve()
+        fixed: list[str] = []
+        extra_trace: list[dict] = []
+
+        for rel in self._written_paths(trace, workdir):
+            path = workdir / rel
+            if path.suffix.lower() not in (".html", ".htm"):
+                continue
+            try:
+                fixes = find_broken_page_links(path, root)
+                if not fixes:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+                for raw, corrected in fixes:
+                    # Rewrite only the href value, and only on <a> tags, so an
+                    # identical string elsewhere in the page is left alone.
+                    text = re.sub(
+                        r"(<a\b[^>]*?\bhref\s*=\s*([\"']))"
+                        + re.escape(raw)
+                        + r"(\2)",
+                        lambda m: m.group(1) + corrected + m.group(3),
+                        text,
+                        flags=re.IGNORECASE,
+                    )
+            except Exception as e:
+                logger.warning("page-link repair of %s failed: %s", rel, e)
+                continue
+
+            result = await self.executor.execute(
+                "write_file", {"path": str(path), "content": text}
+            )
+            extra_trace.append(
+                {
+                    "tool": "write_file",
+                    "arguments": {"path": str(path)},
+                    "result": result,
+                }
+            )
+            if result.get("success"):
+                self._reindex_after_write(path)
+                fixed.append(f"{rel} ({len(fixes)})")
+
+        note = ""
+        if fixed:
+            note = "\n\nFixed unreachable nav links in " + ", ".join(
+                f"`{f}`" for f in fixed
+            )
+        return note, extra_trace
+
     def split_tasks(self, user_message: str) -> list[str]:
         """Public preview of how a compound message decomposes (M1/M6).
 
@@ -1889,6 +1953,19 @@ class AgentCore:
                 answer += ref_note
             if ref_trace:
                 trace.extend(ref_trace)
+
+            # Then repair links whose target EXISTS but is unreachable from a
+            # static page ("/about.html", "about"). Runs after the pass above so
+            # pages it just created are considered too.
+            try:
+                link_note, link_trace = await self._repair_page_links(trace)
+            except Exception:
+                logger.warning("page-link repair failed", exc_info=True)
+                link_note, link_trace = "", []
+            if link_note:
+                answer += link_note
+            if link_trace:
+                trace.extend(link_trace)
 
         await self.memory.add_ai(answer)
         return answer, trace
