@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
+import time
+import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -14,6 +16,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style as PTStyle
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.syntax import Syntax
@@ -30,6 +33,27 @@ if TYPE_CHECKING:
 console = Console()
 
 _HISTORY_FILE = Path(".coder_history")
+_ERROR_LOG = Path(".coder_errors.log")
+
+
+def _log_exception(context: str, exc: BaseException) -> Path | None:
+    """Append a full traceback to the error log; return where it landed.
+
+    The REPL only shows `str(exc)` so a turn's failure doesn't wreck the
+    display — but bare messages like "[Errno 2] No such file or directory"
+    are undiagnosable without the frames. Best-effort: logging must never
+    replace the original error.
+    """
+    try:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        body = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        with _ERROR_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {stamp} — {context} =====\n{body}")
+        return _ERROR_LOG
+    except Exception:
+        return None
 
 _BANNER = """[bold cyan]
   ██████╗ ██████╗ ██████╗ ███████╗██████╗
@@ -242,7 +266,13 @@ class CoderREPL:
         except KeyboardInterrupt:
             console.print("\n[yellow](interrupted)[/yellow]")
         except Exception as e:
-            console.print(f"\n[red]Agent error:[/red] {e}")
+            log = _log_exception(f"agent turn: {user_input[:120]}", e)
+            console.print(
+                f"\n[red]Agent error:[/red] "
+                f"[bold]{type(e).__name__}[/bold]: {escape(str(e))}"
+            )
+            if log is not None:
+                console.print(f"[dim]Full traceback appended to {log}[/dim]")
             console.print(
                 "[dim]Type /clear to reset if the conversation is stuck.[/dim]"
             )
