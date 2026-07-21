@@ -7,8 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.agent.core import (AgentCore, FileOp, _extension_guard,
-                            _parse_file_plan, wants_multifile)
+from app.agent.core import (
+    AgentCore,
+    FileOp,
+    _extension_guard,
+    _parse_file_plan,
+    wants_multifile,
+)
 
 
 class ScriptedLLM:
@@ -240,7 +245,7 @@ async def test_chat_routes_to_multifile(tmp_path, monkeypatch):
 
     called = {}
 
-    async def fake_multi(message, refs):
+    async def fake_multi(message, refs, extra_context=""):
         called["message"] = message
         called["refs"] = refs
         return "multi done", [{"tool": "write_file"}]
@@ -260,7 +265,7 @@ async def test_chat_single_file_still_uses_file_op(tmp_path, monkeypatch):
 
     multi_called = {"hit": False}
 
-    async def fake_multi(message, refs):
+    async def fake_multi(message, refs, extra_context=""):
         multi_called["hit"] = True
         return "x", []
 
@@ -334,6 +339,33 @@ async def test_multi_file_flow_manifest_and_sibling_context(tmp_path, monkeypatc
     # Second generation call sees the already-generated sibling's CONTENT
     assert "body{color:blue}" in a._llm_direct.prompts[2]
     assert "a.css" in a._llm_direct.prompts[2]
+
+
+async def test_multi_file_flow_threads_caller_extra_context(tmp_path, monkeypatch):
+    """extra_context from the caller (e.g. the overall plan when running as a
+    sub-task) must reach BOTH the planning call and every per-file generation —
+    it used to be dropped on the multi-file branch of _route_one."""
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_mf_extra_ctx")
+    captured = {}
+
+    async def fake_plan(msg, context, extra_context=""):
+        captured["plan_extra"] = extra_context
+        return [FileOp("a.txt", "create", "write A")]
+
+    async def fake_fop(msg, target=None, extra_context="", on_token=None):
+        captured["fop_extra"] = extra_context
+        return "ok", []
+
+    monkeypatch.setattr(a, "_plan_file_ops", fake_plan)
+    monkeypatch.setattr(a, "_file_op_flow", fake_fop)
+
+    await a._multi_file_flow(
+        "make things", refs=[], extra_context="OVERALL-PLAN-MARKER"
+    )
+
+    assert captured["plan_extra"] == "OVERALL-PLAN-MARKER"
+    assert "OVERALL-PLAN-MARKER" in captured["fop_extra"]
 
 
 async def test_multi_file_flow_edit_sees_generated_siblings(tmp_path, monkeypatch):

@@ -9,10 +9,19 @@ from types import SimpleNamespace
 import pytest
 
 from app.agent import core as core_mod
-from app.agent.core import (AgentCore, _apply_search_replace, _extract_at_refs,
-                            _extract_filename, _infer_filename,
-                            _parse_file_output, _parse_search_replace,
-                            _strip_at_refs, _strip_code_fences, _wants_file_op)
+from app.agent.core import (
+    AgentCore,
+    _apply_search_replace,
+    _extract_at_refs,
+    _extract_filename,
+    _infer_filename,
+    _parse_file_output,
+    _parse_search_replace,
+    _strip_at_refs,
+    _strip_code_fences,
+    _trim_html_prose,
+    _wants_file_op,
+)
 
 
 def _sr_block(search: str, replace: str) -> str:
@@ -73,6 +82,15 @@ def test_extract_filename():
     assert _extract_filename("make a website") is None
 
 
+def test_extract_filename_skips_prose_abbreviations():
+    # "e.g." must not be mistaken for a file (a live run created a junk `e.g`).
+    assert (
+        _extract_filename("Add JS to login.html, e.g. validate the form")
+        == "login.html"
+    )
+    assert _extract_filename("style it nicely, e.g. modern colors") is None
+
+
 def test_infer_filename():
     assert _infer_filename("make me an html page") == "index.html"
     assert _infer_filename("write a python script") == "main.py"
@@ -100,6 +118,34 @@ def test_parse_file_output_fallback():
     name, content = _parse_file_output("<html></html>", fallback="index.html")
     assert name == "index.html"
     assert content == "<html></html>"
+
+
+def test_trim_html_prose_removes_trailing_commentary():
+    src = "<!DOCTYPE html><html><body>x</body></html>\n\nHere is your page!"
+    assert _trim_html_prose(src) == "<!DOCTYPE html><html><body>x</body></html>"
+
+
+def test_trim_html_prose_removes_leading_commentary():
+    src = "Sure, here you go:\n<!DOCTYPE html><html></html>"
+    assert _trim_html_prose(src) == "<!DOCTYPE html><html></html>"
+
+
+def test_trim_html_prose_keeps_clean_document():
+    src = "<!DOCTYPE html><html><body>x</body></html>"
+    assert _trim_html_prose(src) == src
+
+
+def test_trim_html_prose_noop_on_fragment():
+    # No document boundaries → leave it entirely alone (real markup untouched).
+    src = "Hello <span>world</span>"
+    assert _trim_html_prose(src) == src
+
+
+def test_parse_file_output_trims_prose_for_html():
+    raw = "FILENAME: index.html\n<html><body>hi</body></html>\n\nHope this helps!"
+    name, content = _parse_file_output(raw, fallback="x.txt")
+    assert name == "index.html"
+    assert content == "<html><body>hi</body></html>"
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +243,85 @@ async def test_at_ref_targets_file_over_message_guess(tmp_path, monkeypatch):
     assert target.read_text(encoding="utf-8") == "v = 2"
     assert "Updated" in answer
     assert "real.py" in answer
+
+
+# ---------------------------------------------------------------------------
+# Last-write fallback: a follow-up that names no file edits the previous file
+# ---------------------------------------------------------------------------
+
+
+async def test_follow_up_without_filename_edits_last_written_file(
+    tmp_path, monkeypatch
+):
+    """ "make me an html file" then "add a footer to the page" must edit the
+    file written first, not invent a new generic filename."""
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_lastwrite")
+    a._llm_direct = ScriptedLLM(["FILENAME: hello.html\n<html><body>Hi</body></html>"])
+    a._llm_edit = ScriptedLLM(
+        [_sr_block("<body>Hi</body>", "<body>Hi<footer>f</footer></body>")]
+    )
+
+    await a._file_op_flow("make me an html file")
+    answer, trace = await a._file_op_flow("add a footer to the page")
+
+    written = tmp_path / "hello.html"
+    assert written.read_text(encoding="utf-8") == (
+        "<html><body>Hi<footer>f</footer></body></html>"
+    )
+    assert "hello.html" in answer
+    # and no bogus second file appeared
+    assert {p.name for p in tmp_path.iterdir() if p.is_file()} == {"hello.html"}
+
+
+async def test_new_artifact_request_is_not_hijacked_by_last_write(
+    tmp_path, monkeypatch
+):
+    """ "now write a css file" after writing hello.html must create a NEW file,
+    not surgically edit hello.html."""
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_lastwrite_new")
+    a._llm_direct = ScriptedLLM(
+        [
+            "FILENAME: hello.html\n<html>hi</html>",
+            "FILENAME: theme.css\nbody { color: red; }",
+        ]
+    )
+
+    await a._file_op_flow("make me an html file")
+    await a._file_op_flow("now write a css file for the theme")
+
+    assert (tmp_path / "theme.css").is_file()
+    assert (tmp_path / "hello.html").read_text(encoding="utf-8") == "<html>hi</html>"
+
+
+def test_last_write_fallback_guards(tmp_path, monkeypatch):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    a = AgentCore(session_id="pytest_lastwrite_guard")
+
+    # nothing written yet
+    assert a._last_write_fallback("add a footer") is None
+
+    # last write no longer on disk
+    a._last_write_path = str(proj / "gone.html")
+    assert a._last_write_fallback("add a footer") is None
+
+    # exists, but outside the current workdir (e.g. project switched) → no hijack
+    outside = tmp_path / "outside.html"
+    outside.write_text("<html></html>", encoding="utf-8")
+    a._last_write_path = str(outside)
+    assert a._last_write_fallback("add a footer") is None
+
+    # exists in the workdir → workdir-relative target
+    inside = proj / "index.html"
+    inside.write_text("<html></html>", encoding="utf-8")
+    a._last_write_path = str(inside)
+    assert a._last_write_fallback("add a footer") == "index.html"
+    # ...unless the request asks for a NEW artifact
+    assert a._last_write_fallback("now make a css file") is None
+    assert a._last_write_fallback("build a new page for contacts") is None
 
 
 # ---------------------------------------------------------------------------

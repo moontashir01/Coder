@@ -64,12 +64,22 @@ class Settings(BaseSettings):
     max_tool_steps: int = 12
     # M1: split a compound request ("do A, then B, and C") into ordered
     # sub-tasks and route each one, instead of only handling the first. When the
-    # cheap regex splitter sees a single task but the planner classifies it as
-    # multi_step, fall back to the LLM planner to decompose it.
+    # cheap regex splitter sees a single task but the request still reads as
+    # multi-part (natural language, no explicit "then"/"also"), the LLM planner
+    # decomposes it. max_plan_tasks caps how many sub-tasks one turn will run.
     decompose_multitask: bool = True
+    max_plan_tasks: int = 10
     # Verify-and-repair: how many LLM repair passes to run when a just-written
     # file fails its syntax/structure check.
     max_repair_attempts: int = 2
+    # Cross-file reference repair: after a turn that wrote files, find local
+    # references (<script src>, <link href>, CSS @import/url(), JS relative
+    # imports) pointing at files that don't exist and create the missing TEXT
+    # files so the build actually resolves (weaknesses.md #2/#3). Missing binary
+    # assets (images/fonts) are reported, never fabricated. max_reference_repairs
+    # caps how many files one turn will auto-create.
+    check_references: bool = True
+    max_reference_repairs: int = 10
     retrieval_top_k: int = 5
     conversation_buffer_size: int = 20
     # U6: when history overflows max_context_tokens, summarize the dropped

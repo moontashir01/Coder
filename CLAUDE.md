@@ -62,17 +62,46 @@ chat(msg)
 ```
 
 Every successful write in `_file_op_flow` / `_surgical_edit` then runs
-**`_verify_and_repair`**: `app/agent/verify.py:check_file()` syntax-checks the file (`.py`
-in-process `compile()`, `.js` `node --check`, `.ts` `tsc --noEmit`, `.html` tag-balance parser;
-unknown ext / missing checker binary = unverifiable-ok, never "broken"), and on failure feeds the
-error back for a complete-file regeneration, capped at `settings.max_repair_attempts`.
+**`_verify_and_repair`**: `app/agent/verify.py:check_file()` checks the file two ways — a **syntax**
+check (`.py` in-process `compile()`, `.js` `node --check`, `.ts` `tsc --noEmit`, `.html`/`.htm`
+tag-balance parser) **and** a tooling-free **content guard** that catches the *wrong kind* of
+content the local model sometimes emits: an HTML document dumped into a `.js`/`.ts`/`.css` file,
+plain prose left in a code/style file, or prose leaking before `<!doctype>` / after `</html>` in
+HTML (the reproduced "text instead of code in the file" failure). Because the content guard needs no
+external binary, `.js`/`.ts`/`.css`/`.scss`/`.less` are **always** verifiable now — a missing
+node/tsc only skips the *syntax* half, not the language/prose guard. Unknown ext = unverifiable-ok,
+never "broken". On failure it feeds the error back for a complete-file regeneration, capped at
+`settings.max_repair_attempts`. Belt-and-suspenders: `_parse_file_output` also pre-trims stray prose
+outside an HTML document (`_trim_html_prose`) before the first write, so the common trailing-prose
+leak never reaches disk.
+
+**Cross-file reference repair (closes the plan→verify loop, weaknesses.md #2/#3).** After a turn
+that wrote any files, `chat()` runs `_repair_dead_references(trace)`: it scans every file written
+this turn (HTML/CSS/JS via `app/agent/references.py`) for **local** references — `<script src>`,
+`<link href>`, `<img src>`, CSS `@import`/`url()`, JS relative imports — that point at a file which
+doesn't exist, and **creates each missing TEXT file** (`.css`/`.js`/`.ts`/`.html`/…) via
+`_file_op_flow`, feeding the referencing file in as context so ids/classes/selectors line up.
+Missing **binary** assets (`.png`/`.woff`/…) are **reported, never fabricated**. External URLs,
+`//cdn`, `data:`/`mailto:`/`#anchor`, root-absolute `/paths`, and bare npm import specifiers are all
+ignored (no off-disk false alarms); targets that resolve outside the sandbox root are skipped. It's
+bounded by `settings.max_reference_repairs`, gated by `settings.check_references` (default on),
+best-effort, and restores `_last_write_path` so an auto-created dependency never hijacks the
+follow-up edit target ("now add a footer" still edits the page, not the generated `script.js`). So a
+build's `<script src="script.js">` no longer dangles when the model forgot to create `script.js` —
+the pass creates it. NB this runs at the `chat()` seam, so it covers the single-file, multi-file,
+subtask, AND tool-loop paths uniformly; tests that call `_file_op_flow`/`_multi_file_flow` directly
+bypass it (unit-tested separately in `tests/test_references.py`).
 
 **Why three paths:** the 3B model these paths were built for is unreliable at the JSON tool
 protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-coder:7b`). So:
 - **Create/edit a single file → `_file_op_flow`** (the common case). `_wants_file_op()` is a
   verb+target regex ("make/create/edit … html/file/`*.ext`"); note `classify()` tags file
   *creation* as `code_generation`, so the regex — not the classifier — is what catches it. Files land
-  in the loaded project, else **cwd**.
+  in the loaded project, else **cwd**. A follow-up that names **no** file ("now add a footer to the
+  page") targets the **last file the agent wrote** (`_last_write_fallback`; recorded in
+  `_reindex_after_write`, which every successful write path hits) — skipped when the message asks
+  for a new artifact (`_NEW_ARTIFACT_RE`: "a css file", "a new page") or the last write is
+  gone/outside the workdir.
   - **Create / new file:** ONE plain LLM call for `FILENAME: <name>\n<full contents>`, parsed by
     `_parse_file_output` (strips code fences, incl. stray/unmatched ones), written via `write_file`.
   - **Edit existing file → surgical first (`_surgical_edit`).** Asks `_llm_edit` (temperature 0,
@@ -86,7 +115,13 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
 - **`@path` references** (`_extract_at_refs`): in any message, `@src/app.py` pins the edit *target*
   (`_resolve_ref`, prefers an existing file) and, for non-edit questions, injects the file as context
   (`_read_refs`). The `@` is stripped before the model/classifier see the text. Emails are ignored.
-- **Split/reorganize across several files → `_multi_file_flow`** (`wants_multifile()` regex:
+- **Split/reorganize across several files → `_multi_file_flow`** — and in `chat()`, a request the
+  cheap splitter leaves whole that matches `wants_multifile()` routes **straight** here, skipping
+  the classify/decompose LLM calls (LLM pre-decomposition fragments a spec; this flow has its own
+  per-file planner that must see the FULL text). Related: `_split_compound` treats Title-Case
+  `"Label:"` items ("1. Search Bar: …") as spec headings, not new tasks — a numbered feature list
+  stays one build. Caller `extra_context` (e.g. the sub-task manifest) threads into both the
+  planning call and every per-file generation. (`wants_multifile()` regex:
   separate/split/extract… + plural "files" or ≥2 languages). One `_plan_file_ops` LLM call returns
   `{"files": [{filename, action, instruction}]}` (`_parse_file_plan`, tolerant), then each op runs
   through `_file_op_flow`. **Cross-file consistency:** every per-file call gets the full plan

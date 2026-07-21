@@ -11,6 +11,11 @@ from app.agent.context_budget import render_transcript, split_history_at_budget
 from app.agent.executor import Executor
 from app.agent.planner import Planner, _extract_json
 from app.agent.recovery import classify_error, recovery_hint
+from app.agent.references import (
+    REF_SCANNED_EXTS,
+    find_dead_references,
+    is_creatable,
+)
 from app.agent.tool_registry import ToolRegistry, create_registry
 from app.agent.verify import check_file, is_verifiable
 from app.memory.conversation import ConversationMemory
@@ -239,15 +244,24 @@ _TASK_SEPARATOR_RE = re.compile(
 _NUMBERED_ITEM_RE = re.compile(r"(?:^|\s)\d+[.)]\s+")
 _BULLET_ITEM_RE = re.compile(r"(?m)^\s*[-*•]\s+")
 
+# "Search Bar: Input to search for a city." — a Title-Case label ending in a
+# colon is a spec/feature HEADING, not an imperative instruction, even when its
+# first word doubles as an action verb ("Search", "Show", "Run", "Test"). A
+# real imperative rarely puts a colon right after a Title-Case phrase
+# ("Create index.html: …" stays a task — "index.html" is lowercase).
+_HEADING_LABEL_RE = re.compile(r"^[A-Z0-9][\w'&/-]*(?:\s+[A-Z0-9][\w'&/-]*){0,4}\s*:")
+
 
 def _fragments_to_tasks(fragments: list[str]) -> list[str]:
     """Reduce ordered fragments to tasks: a fragment that STARTS with an
     imperative verb opens a new task; any other fragment is glued back onto the
     previous task (it's a continuation, not a new instruction). A leading
-    non-imperative fragment with no task yet is dropped as lead-in prose."""
+    non-imperative fragment with no task yet is dropped as lead-in prose.
+    Title-Case "Label:" headings glue too — a feature list ("1. Search Bar: …",
+    "2. Dark Mode: …") describes ONE build, not many tasks."""
     tasks: list[str] = []
     for frag in fragments:
-        if _ACTION_VERB_RE.match(frag):
+        if _ACTION_VERB_RE.match(frag) and not _HEADING_LABEL_RE.match(frag):
             tasks.append(frag)
         elif tasks:
             tasks[-1] = f"{tasks[-1]}; {frag}"
@@ -281,7 +295,48 @@ def _split_compound(message: str) -> list[str]:
     return tasks if len(tasks) >= 2 else [text]
 
 
+# An imperative verb anywhere in the text (not just at the start of a clause).
+_ANY_ACTION_VERB_RE = re.compile(
+    r"\b(?:" + "|".join(_ACTION_VERBS) + r")\b", re.IGNORECASE
+)
+
+
+def _looks_multipart(message: str) -> bool:
+    """Heuristic gate for "spend an LLM planning call on this?" (M1).
+
+    The cheap `_split_compound` only catches *delimited* multi-task prompts
+    ("do A, then B"). Real requests are usually plain prose across several
+    sentences ("Build a login page. It redirects to the homepage. Add a logout
+    button."). This returns True when a request reads as multi-part — two or
+    more distinct action verbs, or three or more sentences — so chat() knows to
+    ask the LLM planner to decompose it. False negatives just fall back to
+    single-file routing (today's behavior); false positives cost one planning
+    call that returns a single task.
+    """
+    distinct_verbs = {v.lower() for v in _ANY_ACTION_VERB_RE.findall(message)}
+    sentences = [s for s in re.split(r"[.!?]+", message) if s.strip()]
+    return len(distinct_verbs) >= 2 or len(sentences) >= 3
+
+
 _FILENAME_IN_MSG_RE = re.compile(r"\b([\w./-]+\.\w{1,6})\b")
+
+# Prose abbreviations that look like "stem.ext" but are NOT filenames — the
+# planner writes "e.g." / "i.e." in step descriptions and _extract_filename must
+# not turn them into a bogus file (a live run created a junk `e.g` file).
+_FILENAME_ABBREVIATIONS = {
+    "e.g",
+    "i.e",
+    "etc",
+    "vs",
+    "a.m",
+    "p.m",
+    "u.s",
+    "aka",
+    "fyi",
+    "no",
+    "min",
+    "max",
+}
 
 # keyword → default filename when the user names no explicit file
 _INFER_FILENAME_TABLE: list[tuple[str, str]] = [
@@ -313,8 +368,14 @@ structure, CSS styling (in a <style> block or linked file), and meaningful sampl
 
 
 def _extract_filename(message: str) -> str | None:
-    m = _FILENAME_IN_MSG_RE.search(message)
-    return m.group(1) if m else None
+    """First filename-looking token in the message, skipping prose abbreviations
+    ("e.g.", "i.e.") so they don't become bogus files."""
+    for m in _FILENAME_IN_MSG_RE.finditer(message):
+        token = m.group(1)
+        if token.lower().rstrip(".") in _FILENAME_ABBREVIATIONS:
+            continue
+        return token
+    return None
 
 
 # `@path` references, e.g. "change @src/app.py" (Claude-Code style file mention).
@@ -337,6 +398,16 @@ def _infer_filename(message: str) -> str:
         if keyword in low:
             return name
     return "output.txt"
+
+
+# "a css file", "a new page", "another script" — phrasing that asks for a NEW
+# artifact. The last-write fallback must not hijack these into editing the
+# previously written file; they should keep creating fresh files.
+_NEW_ARTIFACT_RE = re.compile(
+    r"\b(?:a|an|new|another|separate|fresh)\s+(?:[\w-]+\s+){0,2}"
+    r"(?:file|page|webpage|website|script|component|module|app|project)\b",
+    re.IGNORECASE,
+)
 
 
 # Per-extension content guard — the 3B model otherwise writes JS into a .css
@@ -407,6 +478,34 @@ def _parse_textual_tool_call(text: str) -> dict | None:
     return {"name": name, "args": args, "id": "", "type": "tool_call"}
 
 
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_HTML_CLOSE_RE = re.compile(r"</html\s*>", re.IGNORECASE)
+
+
+def _trim_html_prose(content: str) -> str:
+    """Drop stray prose the model left OUTSIDE an HTML document — before the
+    doctype/<html> or after </html> (a common 7B leak, weaknesses.md #9).
+
+    Only ever removes text outside the document boundaries, so real markup is
+    untouched; a no-op when those boundaries aren't present (e.g. an HTML
+    fragment/component, or any non-HTML file that never contains </html>).
+    """
+    matches = list(_HTML_CLOSE_RE.finditer(content))
+    if matches:
+        end = matches[-1].end()
+        if _HTML_COMMENT_RE.sub("", content[end:]).strip():
+            content = content[:end]  # cut trailing commentary after </html>
+    low = content.lower()
+    anchor = -1
+    for marker in ("<!doctype", "<html"):
+        i = low.find(marker)
+        if i != -1:
+            anchor = i if anchor == -1 else min(anchor, i)
+    if anchor > 0 and _HTML_COMMENT_RE.sub("", content[:anchor]).strip():
+        content = content[anchor:]  # cut prose before the doctype/<html>
+    return content
+
+
 def _parse_file_output(raw: str, fallback: str) -> tuple[str, str]:
     """Split a `FILENAME: x\\n<content>` response into (name, content)."""
     text = raw.strip()
@@ -416,6 +515,8 @@ def _parse_file_output(raw: str, fallback: str) -> tuple[str, str]:
         name = m.group(1).strip().strip("`\"'")
         text = text[m.end() :].lstrip("\n")
     content = _strip_code_fences(text)
+    if (name or "").lower().endswith((".html", ".htm")):
+        content = _trim_html_prose(content)
     return (name or "output.txt"), content
 
 
@@ -609,6 +710,9 @@ class AgentCore:
         self.mcp_manager = mcp_manager
         self.skill_loader = skill_loader  # SkillLoader | None
         self._watcher = None  # ProjectWatcher for live reindex (Step 4)
+        # Last file this agent successfully wrote — the fallback edit target for
+        # a follow-up that names no file ("now add a footer to the page").
+        self._last_write_path: str | None = None
 
     # ------------------------------------------------------------------
     # Project management
@@ -668,13 +772,20 @@ class AgentCore:
         return previous
 
     def _reindex_after_write(self, path: str | Path) -> None:
-        """Refresh the RAG + symbol index for a just-written file so retrieval
-        isn't stale (roadmap Step 1 / C1).
+        """Bookkeeping after every successful mutating write: remember the path
+        as the follow-up edit target (see _last_write_fallback) and refresh the
+        RAG + symbol index so retrieval isn't stale (roadmap Step 1 / C1).
 
-        No-op when no project is loaded (the retriever has no active collection
-        then). Best-effort: a reindex failure must never fail the underlying
-        write, so it is swallowed here.
+        Reindexing is a no-op when no project is loaded (the retriever has no
+        active collection then). Best-effort: a reindex failure must never fail
+        the underlying write, so it is swallowed here.
         """
+        try:
+            # resolve(): tool-loop paths can be relative; pin them to cwd now so
+            # the fallback still points at the right file after a chdir.
+            self._last_write_path = str(Path(path).resolve())
+        except Exception:
+            self._last_write_path = str(path)
         if not self._project_path:
             return
         try:
@@ -930,6 +1041,29 @@ class AgentCore:
                 continue
         return refs[0]
 
+    def _last_write_fallback(self, user_message: str) -> str | None:
+        """Edit target for a follow-up that names no file ("now add a footer").
+
+        Falls back to the last file this agent successfully wrote — the cheap
+        version of Claude-Code-style "it / that file" memory. Not used when the
+        request asks for a NEW artifact ("write a css file"), or when the last
+        write no longer exists or sits outside the current working directory
+        (e.g. another project was loaded since). Returns a workdir-relative
+        path, matching what _file_op_flow expects.
+        """
+        if not self._last_write_path:
+            return None
+        if _NEW_ARTIFACT_RE.search(user_message):
+            return None
+        workdir = Path(self._project_path or Path.cwd())
+        p = Path(self._last_write_path)
+        try:
+            if not p.is_file():
+                return None
+            return str(p.resolve().relative_to(workdir.resolve()))
+        except (ValueError, OSError):
+            return None  # outside the workdir → don't hijack the target
+
     def _read_refs(self, refs: list[str], max_chars: int = 4000) -> str:
         """Read the @-referenced files into a context block for non-edit answers."""
         if not refs:
@@ -1001,6 +1135,10 @@ class AgentCore:
         """
         workdir = Path(self._project_path or Path.cwd())
         filename = target or _extract_filename(user_message)
+        if filename is None:
+            # Follow-up that names no file ("now add a footer to the page") →
+            # edit the file written last turn instead of guessing a new name.
+            filename = self._last_write_fallback(user_message)
 
         full_existing = ""
         target_path: Path | None = None
@@ -1239,13 +1377,18 @@ class AgentCore:
             trace,
         )
 
-    async def _plan_file_ops(self, user_message: str, context: str) -> list[FileOp]:
+    async def _plan_file_ops(
+        self, user_message: str, context: str, extra_context: str = ""
+    ) -> list[FileOp]:
         """One LLM call → an ordered list of per-file operations.
 
         ``context`` is the text of the existing files relevant to the request
-        (so the planner knows what to split out). Returns [] on any failure;
-        the caller falls back to the single-file flow.
+        (so the planner knows what to split out); ``extra_context`` is caller
+        context (e.g. the overall sub-task plan when running inside
+        _run_subtasks). Returns [] on any failure; the caller falls back to the
+        single-file flow.
         """
+        extra_block = f"{extra_context}\n\n" if extra_context else ""
         messages = [
             SystemMessage(
                 content="You are a precise multi-file refactoring planner. "
@@ -1254,6 +1397,7 @@ class AgentCore:
             HumanMessage(
                 content=(
                     f"Request: {user_message}\n\n"
+                    f"{extra_block}"
                     f"Existing files:\n{context or '(none)'}\n\n"
                     f"Output the JSON plan now:"
                 )
@@ -1266,14 +1410,17 @@ class AgentCore:
         return _parse_file_plan(raw)
 
     async def _multi_file_flow(
-        self, user_message: str, refs: list[str]
+        self, user_message: str, refs: list[str], extra_context: str = ""
     ) -> tuple[str, list[dict]]:
         """Plan a set of per-file operations, then run each through _file_op_flow.
 
         Reads the existing files relevant to the request (the @refs plus any
         file named in the message that exists on disk) so the planner can decide
         what to split out, then executes create/edit for each planned file by
-        delegating to the already-tested single-file flow.
+        delegating to the already-tested single-file flow. ``extra_context``
+        (e.g. the overall plan when running as one sub-task of a compound
+        request) is threaded into both the planning call and every per-file
+        generation, so a decomposed step doesn't lose the surrounding spec.
         """
         workdir = Path(self._project_path or Path.cwd())
 
@@ -1284,7 +1431,7 @@ class AgentCore:
             ctx_names.append(guessed)
         context = self._read_refs([n for n in ctx_names if (workdir / n).is_file()])
 
-        ops = await self._plan_file_ops(user_message, context)
+        ops = await self._plan_file_ops(user_message, context, extra_context)
         if not ops:
             return (
                 "I couldn't plan the multi-file change — try naming the files, "
@@ -1313,7 +1460,7 @@ class AgentCore:
             # Each op reuses the single-file flow: create → FILENAME gen,
             # edit on an existing file → surgical SEARCH/REPLACE then rewrite.
             sub_msg = op.instruction or user_message
-            extra = manifest
+            extra = f"{extra_context}\n\n{manifest}" if extra_context else manifest
             siblings = self._read_refs(written, max_chars=2500)
             if siblings:
                 extra += (
@@ -1342,17 +1489,13 @@ class AgentCore:
         """Route ONE (already-decomposed) request through a single flow.
 
         This is the original chat() branch ladder, factored out (M1) so chat()
-        can call it once per sub-task. ``task_type`` is classified here when not
-        supplied by the caller (chat() passes it to avoid a double classify).
+        can call it once per sub-task. The regex heuristics are checked before
+        classifying, so a file op (the common decomposed step) skips the
+        classify LLM call entirely; ``task_type`` is only computed when needed.
         """
-        if task_type is None:
-            task_type = self.planner.classify(message)
 
-        if wants_multifile(message):
-            # Plan + execute several file operations in one turn.
-            return await self._multi_file_flow(message, refs=at_refs)
-        if _wants_file_op(message) or task_type == "file_edit":
-            # Create/update a single file deterministically; an @ref pins the target.
+        async def _file_op():
+            # Create/update a single file deterministically; an @ref pins target.
             target = self._resolve_ref(at_refs)
             return await self._file_op_flow(
                 message,
@@ -1360,6 +1503,19 @@ class AgentCore:
                 extra_context=extra_context,
                 on_token=on_token,
             )
+
+        if wants_multifile(message):
+            # Plan + execute several file operations in one turn.
+            return await self._multi_file_flow(
+                message, refs=at_refs, extra_context=extra_context
+            )
+        if _wants_file_op(message):
+            return await _file_op()
+
+        if task_type is None:
+            task_type = self.planner.classify(message)
+        if task_type == "file_edit":
+            return await _file_op()
         if task_type == "multi_step":
             # Genuine multi-step work → native tool loop. M2: no longer gated on
             # a loaded project — the tool loop's file tools default to cwd, so
@@ -1375,38 +1531,156 @@ class AgentCore:
         )
         return answer, []
 
+    @staticmethod
+    def _written_paths(trace: list[dict], workdir: Path) -> list[str]:
+        """Relative paths a trace successfully created/edited (for threading)."""
+        out: list[str] = []
+        for t in trace:
+            if t.get("tool") not in ("write_file", "create_file", "edit_file"):
+                continue
+            if not (t.get("result") or {}).get("success"):
+                continue
+            p = (t.get("arguments") or {}).get("path")
+            if not p:
+                continue
+            try:
+                rel = str(Path(p).resolve().relative_to(workdir.resolve()))
+            except Exception:
+                rel = str(p)
+            if rel not in out:
+                out.append(rel)
+        return out
+
     async def _run_subtasks(
         self, subtasks: list[str], at_refs: list[str]
     ) -> tuple[str, list[dict]]:
-        """Execute decomposed sub-tasks in order (M1).
+        """Execute decomposed sub-tasks in order with shared context (M1).
 
-        Each sub-task is routed independently, and a short summary of the work
-        already done is threaded forward as context so later steps stay
-        consistent (matching filenames/imports) — the same trick
-        _multi_file_flow uses for siblings. Streaming is disabled here: like the
-        multi-file path, the combined answer is returned whole.
+        This is the Claude-Code-style engine: every sub-task sees (1) the full
+        plan manifest, so it knows which files/steps are still coming, and (2)
+        the CURRENT contents of every file already created or edited in this
+        turn — re-read from disk each step, so an edit made by one task is
+        visible to the next. That is what keeps links/imports/redirects/ids
+        consistent across files (the same threading _multi_file_flow uses).
+        Streaming is disabled here: the combined answer is returned whole.
         """
+        workdir = Path(self._project_path or Path.cwd())
+        manifest = (
+            "## Overall plan — all parts of ONE request\n"
+            "Complete each part so the results are consistent with each other "
+            "(reuse the same file names; make links, imports, redirects, ids and "
+            "class/function names match across files):\n"
+            + "\n".join(f"{i}. {s}" for i, s in enumerate(subtasks, 1))
+        )
+
         trace: list[dict] = []
         summaries: list[str] = []
-        done: list[str] = []
+        written: list[str] = []
         for i, sub in enumerate(subtasks, 1):
-            extra = ""
-            if done:
-                extra = (
-                    "## Already done earlier in this same request\n"
-                    "Keep names, paths, and imports consistent with these:\n"
-                    + "\n".join(f"- {d}" for d in done)
+            extra = manifest
+            siblings = self._read_refs(written, max_chars=2500) if written else ""
+            if siblings:
+                extra += (
+                    "\n\n## Files already created/edited in this request\n"
+                    "Reference them EXACTLY (paths, links, ids, selectors, "
+                    "function names) — do not invent new names:\n\n" + siblings
                 )
             # Only apply an @ref to the sub-task that actually names its path, so
             # "edit @a.py and create b.py" doesn't target a.py for both steps.
             sub_refs = [r for r in at_refs if r in sub]
             ans, sub_trace = await self._route_one(sub, sub_refs, extra_context=extra)
             trace.extend(sub_trace)
-            summaries.append(f"{i}. {sub}\n   → {ans}")
-            done.append(f"{sub} → {ans[:100]}")
+            summaries.append(f"{i}. {sub}\n   -> {ans}")
+            # Track files this step wrote so the next step sees their contents.
+            for rel in self._written_paths(sub_trace, workdir):
+                if rel not in written:
+                    written.append(rel)
 
         header = f"Completed {len(subtasks)} tasks:\n"
         return header + "\n".join(summaries), trace
+
+    async def _repair_dead_references(
+        self, trace: list[dict]
+    ) -> tuple[str, list[dict]]:
+        """Create files this turn's output references but never wrote.
+
+        Scans every file written this turn (HTML/CSS/JS) for LOCAL references —
+        `<script src>`, `<link href>`, CSS `@import`/`url()`, JS relative
+        imports — that don't exist on disk, then generates each missing TEXT
+        file so the build actually resolves (weaknesses.md #2/#3). Missing binary
+        assets (images/fonts) are reported, not fabricated. Best-effort and
+        bounded by settings.max_reference_repairs; returns (note, extra_trace).
+        """
+        workdir = Path(self._project_path or Path.cwd())
+        written = self._written_paths(trace, workdir)
+        if not written:
+            return "", []
+        root = workdir.resolve()
+
+        # Map each missing target → (reference-as-written, the file that named
+        # it), so duplicate references dedupe and each created file can be made
+        # consistent with whoever needs it.
+        missing: dict[Path, tuple[str, str]] = {}
+        for rel in written:
+            fp = workdir / rel
+            if fp.suffix.lower() not in REF_SCANNED_EXTS:
+                continue
+            for ref, resolved in find_dead_references(fp, root):
+                if resolved not in missing:
+                    missing[resolved] = (ref, rel)
+        if not missing:
+            return "", []
+
+        # Auto-creating dependency files must not hijack the follow-up edit
+        # target ("now add a footer") away from the primary artifact — restore it.
+        prev_last_write = self._last_write_path
+
+        created: list[str] = []
+        reported: list[str] = []
+        ref_trace: list[dict] = []
+        for resolved, (ref, referencer) in missing.items():
+            if len(created) >= settings.max_reference_repairs:
+                break
+            if resolved.exists():  # satisfied by an earlier iteration
+                continue
+            try:
+                rel_target = str(resolved.relative_to(root))
+            except ValueError:
+                continue
+            if not is_creatable(rel_target):
+                reported.append(rel_target)  # binary asset — report, don't fake
+                continue
+            referencer_text = self._read_refs([referencer], max_chars=3000)
+            instruction = (
+                f"Create the file `{rel_target}`. It is referenced by "
+                f"`{referencer}` (via a <script src>, <link href>, import, or "
+                f"url()) but does not exist yet. Implement exactly what "
+                f"`{referencer}` needs from it — matching ids, classes, selectors "
+                f"and function names — so the two work together."
+            )
+            _, sub_trace = await self._file_op_flow(
+                instruction, target=rel_target, extra_context=referencer_text
+            )
+            ref_trace.extend(sub_trace)
+            if any((t.get("result") or {}).get("success") for t in sub_trace):
+                created.append(rel_target)
+
+        self._last_write_path = prev_last_write
+
+        note = ""
+        if created:
+            note += (
+                f"\n\nReference check — created {len(created)} missing referenced "
+                "file(s): " + ", ".join(f"`{c}`" for c in created) + "."
+            )
+        if reported:
+            note += (
+                f"\n\nReference check — {len(reported)} referenced asset(s) are "
+                "missing and were not auto-created (add them manually): "
+                + ", ".join(f"`{r}`" for r in reported)
+                + "."
+            )
+        return note, ref_trace
 
     def split_tasks(self, user_message: str) -> list[str]:
         """Public preview of how a compound message decomposes (M1/M6).
@@ -1438,27 +1712,59 @@ class AgentCore:
         self._update_skills_context(clean_message)
         await self.memory.add_human(user_message)
 
-        # M1: split a compound request into ordered sub-tasks so each is routed
-        # and completed, instead of only handling the first.
+        # M1: decompose a multi-task request into ordered sub-tasks so each is
+        # routed and completed (with shared context), instead of only the first.
+        # Fast path: the cheap splitter catches delimited prompts ("do A, then B").
         subtasks = _split_compound(clean_message)
         if len(subtasks) >= 2:
-            answer, trace = await self._run_subtasks(subtasks, at_refs)
-        else:
-            # One task per the cheap splitter. Classify once; a genuine
-            # multi_step request the splitter couldn't parse is decomposed by
-            # the LLM planner (M1 robust pass). Otherwise route it as one task.
-            task_type = self.planner.classify(clean_message)
-            planned = (
-                self.planner.decompose(clean_message)
-                if settings.decompose_multitask and task_type == "multi_step"
-                else []
+            answer, trace = await self._run_subtasks(
+                subtasks[: settings.max_plan_tasks], at_refs
             )
+        elif wants_multifile(clean_message):
+            # Explicit multi-file build → _multi_file_flow (via _route_one).
+            # It has its own per-file planner that must see the FULL spec; LLM
+            # pre-decomposition would fragment it, and classify() is unused on
+            # that branch — so skip both LLM calls.
+            answer, trace = await self._route_one(
+                clean_message, at_refs, on_token=on_token
+            )
+        else:
+            # One task per the cheap splitter. Classify once; then for a request
+            # that reads as multi-part prose (a build spanning several files/
+            # pages, no explicit "then"/"also"), ask the LLM planner to break it
+            # into ordered steps — this is the natural-language path.
+            task_type = self.planner.classify(clean_message)
+            should_plan = settings.decompose_multitask and (
+                task_type == "multi_step"
+                or (
+                    task_type in ("code_generation", "file_edit")
+                    and _looks_multipart(clean_message)
+                )
+            )
+            planned = self.planner.decompose(clean_message) if should_plan else []
             if len(planned) >= 2:
-                answer, trace = await self._run_subtasks(planned, at_refs)
+                answer, trace = await self._run_subtasks(
+                    planned[: settings.max_plan_tasks], at_refs
+                )
             else:
                 answer, trace = await self._route_one(
                     clean_message, at_refs, task_type=task_type, on_token=on_token
                 )
+
+        # Close the loop: create any files this turn references but never wrote,
+        # so a build actually resolves instead of just parsing (weaknesses.md #2).
+        if settings.check_references and trace:
+            try:
+                ref_note, ref_trace = await self._repair_dead_references(trace)
+            except Exception:
+                # Genuinely best-effort (as the docstring promises): a failure
+                # here must not discard a turn whose files were already written.
+                logger.warning("reference repair failed", exc_info=True)
+                ref_note, ref_trace = "", []
+            if ref_note:
+                answer += ref_note
+            if ref_trace:
+                trace.extend(ref_trace)
 
         await self.memory.add_ai(answer)
         return answer, trace

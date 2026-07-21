@@ -35,6 +35,36 @@ Reply with ONLY valid JSON matching this schema exactly:
 Available tools: read_file, write_file, edit_file, create_file, delete_file,
 list_directory, search_files, run_command, git_status, git_diff, git_commit, git_log"""
 
+# Decomposition prompt (M1 robust pass): turn ONE natural-language request into
+# an ordered list of concrete build steps. Unlike _PLAN_PROMPT this is tuned for
+# multi-file feature builds — it names the file per step and insists later steps
+# stay consistent with earlier ones (shared stylesheet, matching links/ids).
+_DECOMPOSE_PROMPT = """You break ONE coding request into an ordered list of concrete build steps.
+
+Reply with ONLY valid JSON in exactly this shape:
+{"steps": [{"step_description": "..."}]}
+
+Rules:
+- Each step is ONE file to create or edit, or ONE command to run, in the order
+  it should happen. Order steps so shared files (e.g. a stylesheet or a JS
+  helper) and any file another file links to are usable when they are needed.
+- When several files are involved, give each its OWN step and NAME the file in
+  the description, e.g. "Create login.html: ..." / "Create styles.css: ...".
+- Keep the steps consistent with each other: reuse the SAME file names across
+  steps; if pages share styling, put it in one CSS file and have each page link
+  that exact file; if pages navigate to each other or a button redirects,
+  reference the exact target file name.
+- Any stylesheet or script an HTML file references (e.g. script.js, styles.css)
+  MUST have its own "Create <file>" step so the file actually exists — never
+  reference a file you did not also create.
+- Put page behavior (form validation, redirects, button handlers) in ONE shared
+  script file and give it a create step; do not leave logic only described.
+- If editing an existing file would be needed so another file links to it,
+  include that edit as its own step.
+- If the whole request is genuinely a single file or a single action, return
+  exactly ONE step.
+- Output ONLY the JSON. No prose, no markdown fences."""
+
 
 def _extract_json(text: str) -> dict:
     """Extract the first JSON object from text, tolerating markdown fences."""
@@ -78,8 +108,8 @@ class Planner:
         """
         try:
             messages = [
-                SystemMessage(content=_PLAN_PROMPT),
-                HumanMessage(content=f"Task: {user_message}"),
+                SystemMessage(content=_DECOMPOSE_PROMPT),
+                HumanMessage(content=f"Request: {user_message}"),
             ]
             data = _extract_json(self._llm_plan.invoke(messages).content)
             steps = data.get("steps") if isinstance(data, dict) else None

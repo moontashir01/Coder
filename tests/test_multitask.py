@@ -24,6 +24,18 @@ class ScriptedLLM:
         return SimpleNamespace(content=out)
 
 
+class RecordingLLM(ScriptedLLM):
+    """ScriptedLLM that also records the full prompt text of every call."""
+
+    def __init__(self, outputs):
+        super().__init__(outputs)
+        self.prompts: list[str] = []
+
+    def invoke(self, messages):
+        self.prompts.append("\n".join(str(getattr(m, "content", m)) for m in messages))
+        return super().invoke(messages)
+
+
 # ---------------------------------------------------------------------------
 # _split_compound — the cheap decomposition heuristic (M1)
 # ---------------------------------------------------------------------------
@@ -79,6 +91,64 @@ def test_split_compound_drops_noun_leadin():
 
 def test_split_compound_empty():
     assert _split_compound("") == [""]
+
+
+def test_split_compound_heading_labels_do_not_split():
+    """A numbered feature/spec list ("1. Search Bar: …") describes ONE build,
+    not many tasks — even when a label starts with a verb-lookalike ("Search").
+    Regression: a weather-dashboard spec was severed from its build sentence."""
+    msg = (
+        "Build a weather dashboard in three separate files "
+        "(index.html, styles.css, script.js).\n"
+        "1. Search Bar: Input to search for a city.\n"
+        "2. Current Weather: Displays city name and temperature.\n"
+        "3. Dark Mode: A toggle button to switch themes.\n"
+        "Provide complete code for all files."
+    )
+    assert _split_compound(msg) == [msg]
+
+
+def test_split_compound_uppercase_imperatives_still_split():
+    # Title-case IMPERATIVES (no colon) must still open new tasks.
+    tasks = _split_compound(
+        "1. Create alpha.py with a hello function 2. Create beta.py importing alpha"
+    )
+    assert len(tasks) == 2
+
+
+# ---------------------------------------------------------------------------
+# _looks_multipart — the gate for "spend an LLM planning call?" (M1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        # natural language, no explicit "then"/"also" separators
+        "create a website with a login page. it redirects to the homepage. add a logout button.",
+        "build the backend api and write unit tests for it",
+        "generate a react app. add routing. set up a theme.",
+    ],
+)
+def test_looks_multipart_true(msg):
+    from app.agent.core import _looks_multipart
+
+    assert _looks_multipart(msg) is True
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "create an index.html file for a landing page",
+        "write a python function that adds two numbers",
+        "explain what a decorator does",
+        "make a website with a navbar, footer and hero section",
+    ],
+)
+def test_looks_multipart_false(msg):
+    from app.agent.core import _looks_multipart
+
+    assert _looks_multipart(msg) is False
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +232,88 @@ async def test_chat_uses_planner_decompose_for_multistep(tmp_path, monkeypatch):
     assert "Completed 2 tasks" in answer
 
 
+async def test_chat_plans_natural_language_multipart(tmp_path, monkeypatch):
+    # A plain-prose multi-part build (no "then"/"also", not classified
+    # multi_step) is decomposed by the LLM planner and every file gets written.
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_nl_plan")
+    monkeypatch.setattr(a.planner, "classify", lambda m: "code_generation")
+    monkeypatch.setattr(
+        a.planner,
+        "decompose",
+        lambda m: [
+            "Create login.html: a login form",
+            "Create home.html: homepage linking login.html",
+        ],
+    )
+    a._llm_direct = ScriptedLLM(
+        [
+            "FILENAME: login.html\n<html><body>login</body></html>",
+            "FILENAME: home.html\n<html><body>home</body></html>",
+        ]
+    )
+
+    answer, trace = await a.chat(
+        "create a login page. it should show a homepage. add nice styling."
+    )
+
+    assert (tmp_path / "login.html").is_file()
+    assert (tmp_path / "home.html").is_file()
+    assert "Completed 2 tasks" in answer
+
+
+async def test_chat_simple_create_does_not_plan(tmp_path, monkeypatch):
+    # A single-file create must NOT trigger the LLM planner (no decompose call).
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_no_plan")
+    monkeypatch.setattr(a.planner, "classify", lambda m: "code_generation")
+
+    def _boom(msg):  # decompose must not be called for a simple create
+        raise AssertionError("decompose should not run for a single-file create")
+
+    monkeypatch.setattr(a.planner, "decompose", _boom)
+    a._llm_direct = ScriptedLLM(["FILENAME: index.html\n<html></html>"])
+
+    answer, trace = await a.chat("create an index.html file for a landing page")
+
+    assert (tmp_path / "index.html").is_file()
+    assert "Completed" not in answer
+
+
+async def test_chat_multifile_spec_goes_whole_to_multi_file_flow(tmp_path, monkeypatch):
+    """An explicit multi-file build reaches _multi_file_flow as ONE whole
+    message (severing the spec list loses features) and skips the classify and
+    decompose LLM calls — the multi-file flow has its own per-file planner."""
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_mf_whole")
+
+    def _boom(msg):
+        raise AssertionError("classify/decompose must not run for a multi-file spec")
+
+    monkeypatch.setattr(a.planner, "classify", _boom)
+    monkeypatch.setattr(a.planner, "decompose", _boom)
+
+    seen = {}
+
+    async def fake_mf(message, refs, extra_context=""):
+        seen["message"] = message
+        return "handled", []
+
+    monkeypatch.setattr(a, "_multi_file_flow", fake_mf)
+
+    answer, trace = await a.chat(
+        "Build a weather dashboard web app in three separate files "
+        "(index.html, styles.css, script.js).\n"
+        "1. Search Bar: Input to search for a city.\n"
+        "2. Dark Mode: A toggle button to switch themes.\n"
+        "Provide complete code for all files."
+    )
+
+    assert "Search Bar" in seen["message"]
+    assert "Dark Mode" in seen["message"]
+    assert answer == "handled"
+
+
 async def test_chat_single_task_unchanged(tmp_path, monkeypatch):
     # A non-compound request must still route through a single flow (no split).
     monkeypatch.chdir(tmp_path)
@@ -202,7 +354,8 @@ async def test_run_subtasks_filters_refs_per_task(monkeypatch):
     assert "Completed 2 tasks" in answer
 
 
-async def test_run_subtasks_threads_prior_context(monkeypatch):
+async def test_run_subtasks_threads_manifest(monkeypatch):
+    # Every sub-task sees the full plan manifest (so it knows what else is coming).
     a = AgentCore(session_id="pytest_thread")
     seen_extra: list[str] = []
 
@@ -216,9 +369,39 @@ async def test_run_subtasks_threads_prior_context(monkeypatch):
 
     await a._run_subtasks(["create a.py", "create b.py"], at_refs=[])
 
-    assert seen_extra[0] == ""  # the first task has no prior context
-    assert "Already done" in seen_extra[1]  # the second sees a summary
-    assert "create a.py" in seen_extra[1]
+    assert "Overall plan" in seen_extra[0]
+    assert "create a.py" in seen_extra[0] and "create b.py" in seen_extra[0]
+    assert "Overall plan" in seen_extra[1]
+
+
+async def test_run_subtasks_threads_written_file_contents(tmp_path, monkeypatch):
+    # The core Claude-Code-style behavior: a later task's generation prompt must
+    # include the ACTUAL contents of a file an earlier task wrote, so links /
+    # redirects / ids line up across files.
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_subtask_ctx")
+    monkeypatch.setattr(a.planner, "classify", lambda m: "code_generation")
+    a._llm_direct = RecordingLLM(
+        [
+            "FILENAME: login.html\n<html><body>LOGIN-MARKER</body></html>",
+            "FILENAME: home.html\n<html><body>HOME</body></html>",
+        ]
+    )
+
+    answer, trace = await a._run_subtasks(
+        [
+            "create login.html with a form",
+            "create home.html that links back to login.html",
+        ],
+        at_refs=[],
+    )
+
+    assert (tmp_path / "login.html").is_file()
+    assert (tmp_path / "home.html").is_file()
+    # the SECOND generation call saw the first file's real content + name
+    assert "LOGIN-MARKER" in a._llm_direct.prompts[1]
+    assert "login.html" in a._llm_direct.prompts[1]
+    assert "Completed 2 tasks" in answer
 
 
 # ---------------------------------------------------------------------------
