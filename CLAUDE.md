@@ -127,7 +127,19 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
   through `_file_op_flow`. **Cross-file consistency:** every per-file call gets the full plan
   manifest as `extra_context`, plus the content of already-written siblings, so
   `<link href>`/`<script src>`/shared names line up.
-- **Genuine multi-step work in a loaded project → `_run_tool_loop`** (native tool calling).
+- **Genuine multi-step work in a loaded project → `_run_tool_loop`** (native tool calling) — and,
+  since 2026-07, **any repair request whose target can't be pinned down**. `_wants_existing_file_change()`
+  (a repair verb — fix/update/refactor/rename/… — that isn't opening an interrogative) marks a
+  request to change something that *already exists*. Two escalation points use it:
+  `_route_one` sends such a request to the tool loop rather than the tool-free `_direct_answer`, and
+  `_file_op_flow` bails to the tool loop when `target`, `_extract_filename` and
+  `_last_write_fallback` **all** come back None. That last one is the important guard: without it
+  `_infer_filename` fell through to its last resort `"output.txt"`, and the model — given no file to
+  work from — wrote *"please provide the contents of these files"* onto disk. Creation requests are
+  deliberately untouched: "make me a landing page" still infers `index.html`.
+  `_FILE_OP_TARGET_RE` also covers UI nouns (`nav`/`navbar`/`header`/`footer`/`hero`/`button`/`form`/…)
+  so "fix the navigation on all the pages" hits `_file_op_flow` directly; it excludes language-level
+  words (`function`, `class`) so "write a python function that adds two numbers" stays a snippet.
 - **Everything else (write/explain code, Q&A) → `_direct_answer`** (one call, no tools).
   This path streams: `chat()`/`_direct_answer` accept an optional `on_token` callback which,
   when set, switches to `_llm_stream.astream()` and fires per token. The REPL passes one from

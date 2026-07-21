@@ -55,6 +55,10 @@ task needs file or command access; answer directly (in plain text) when it does 
 When asked to create or save a file, you MUST call write_file (or create_file)
 with a relative path like "index.html" — do not just print the code.
 
+NEVER ask the user to paste file contents. If you need to see a file, find it
+with list_directory or search_files and read it with read_file. You are running
+inside their project — locating the files is your job, not theirs.
+
 The user's message may contain SEVERAL distinct requests. First enumerate every
 one of them, then use tools to complete ALL of them before you give a final
 answer. Do not stop after the first — a text response with no tool call is only
@@ -94,8 +98,14 @@ _FILE_OP_VERB_RE = re.compile(
     r"update|change|modify|edit|refactor|rewrite|fix|implement|put)\b",
     re.IGNORECASE,
 )
+# Nouns that name something living in a file on disk. Deliberately excludes
+# language-level words ("function", "class") so "write a python function that
+# adds two numbers" stays a snippet request, not a file write.
 _FILE_OP_TARGET_RE = re.compile(
-    r"\b(file|html|css|page|webpage|website|script|component|module|app)\b"
+    r"\b(files?|html|css|pages?|webpages?|websites?|sites?|scripts?|"
+    r"components?|modules?|app|templates?|markup|stylesheets?|styles|"
+    r"nav|navbar|navigation|menu|header|footer|sidebar|banner|hero|"
+    r"buttons?|forms?|links?|layout|sections?)\b"
     r"|\b[\w./-]+\.\w{1,6}\b",  # an explicit filename like index.html
     re.IGNORECASE,
 )
@@ -104,6 +114,33 @@ _FILE_OP_TARGET_RE = re.compile(
 def _wants_file_op(message: str) -> bool:
     """True when the message asks to create/edit a file on disk (not just show code)."""
     return bool(_FILE_OP_VERB_RE.search(message) and _FILE_OP_TARGET_RE.search(message))
+
+
+# Verbs that presuppose the thing already exists on disk ("fix the navbar"),
+# as opposed to pure authoring verbs ("write a function"). The distinction
+# matters in _route_one: a repair request the verb+target gate missed must not
+# fall through to the tool-free _direct_answer, where the model can neither
+# find nor read the files and ends up asking the user to paste them.
+_REPAIR_VERB_RE = re.compile(
+    r"\b(fix|repair|correct|update|change|modify|edit|refactor|rewrite|"
+    r"replace|rename|remove|delete|revert|restore|clean\s*up|debug)\b",
+    re.IGNORECASE,
+)
+# A message that OPENS with an interrogative is asking about code, not asking
+# for it to be changed ("how do I fix a memory leak?").
+_EXPLAIN_QUESTION_RE = re.compile(
+    r"^\s*(how|what|why|when|which|who|where|explain|describe|tell me|"
+    r"is|are|does|do|can i|should i)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_existing_file_change(message: str) -> bool:
+    """True when the user asks to change something that already exists but named
+    no file the regex gate recognized — hand the model tools so it can go find it."""
+    if _EXPLAIN_QUESTION_RE.match(message):
+        return False
+    return bool(_REPAIR_VERB_RE.search(message))
 
 
 # A separation/restructure verb that implies touching more than one file.
@@ -1140,6 +1177,19 @@ class AgentCore:
             # edit the file written last turn instead of guessing a new name.
             filename = self._last_write_fallback(user_message)
 
+        if filename is None and _wants_existing_file_change(user_message):
+            # We were asked to CHANGE something that already exists but nothing
+            # told us which file. Pressing on means generating "a file" blind:
+            # _infer_filename falls back to "output.txt" and the model, having
+            # been handed no file to work from, writes prose asking the user to
+            # paste the contents — straight onto disk. Escalate to the tool loop
+            # instead, where list_directory/search_files/read_file can find the
+            # real files. (Creation requests still infer a name as before.)
+            messages = await self._build_messages(
+                user_message, extra_context=extra_context
+            )
+            return await self._run_tool_loop(messages)
+
         full_existing = ""
         target_path: Path | None = None
         if filename:
@@ -1520,6 +1570,15 @@ class AgentCore:
             # Genuine multi-step work → native tool loop. M2: no longer gated on
             # a loaded project — the tool loop's file tools default to cwd, so
             # multi-step work runs in a bare folder too.
+            messages = await self._build_messages(message, extra_context=extra_context)
+            return await self._run_tool_loop(messages)
+
+        # "fix the navigation on all the pages" — a change to something that
+        # already exists, but no file name the gates above recognized. Falling
+        # through to _direct_answer here is a dead end: that path carries no
+        # tools, so the model can only ask the user to paste the files. Give it
+        # the tool loop instead and let it locate them itself.
+        if _wants_existing_file_change(message):
             messages = await self._build_messages(message, extra_context=extra_context)
             return await self._run_tool_loop(messages)
 

@@ -433,6 +433,58 @@ async def test_route_one_multistep_runs_tool_loop_without_project(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Repair requests never dead-end on the tool-free _direct_answer
+# ---------------------------------------------------------------------------
+
+
+async def test_route_one_repair_request_escalates_to_tool_loop(monkeypatch):
+    """"fix the navigation" names no file the gates recognize. It must reach the
+    tool loop, not _direct_answer — that path carries no tools, so the model can
+    only reply "please paste the file contents" (the reported failure)."""
+    a = AgentCore(session_id="pytest_repair")
+
+    async def fake_build(message, extra_context="", include_tool_protocol=True):
+        assert include_tool_protocol is True
+        return ["built-messages"]
+
+    async def fake_loop(messages, max_steps=None):
+        return "loop done", [{"tool": "read_file"}]
+
+    async def fail_direct(*args, **kwargs):
+        raise AssertionError("must not fall through to the tool-free path")
+
+    monkeypatch.setattr(a, "_build_messages", fake_build)
+    monkeypatch.setattr(a, "_run_tool_loop", fake_loop)
+    monkeypatch.setattr(a, "_direct_answer", fail_direct)
+
+    answer, trace = await a._route_one(
+        "the checkout is broken, fix it", at_refs=[], task_type="simple_qa"
+    )
+    assert answer == "loop done"
+    assert trace
+
+
+async def test_route_one_plain_question_still_direct_answers(monkeypatch):
+    """The escalation must not swallow ordinary Q&A."""
+    a = AgentCore(session_id="pytest_repair_qa")
+
+    async def fake_direct(message, extra_context="", on_token=None):
+        return "prose"
+
+    async def fail_loop(*args, **kwargs):
+        raise AssertionError("a question must not run the tool loop")
+
+    monkeypatch.setattr(a, "_direct_answer", fake_direct)
+    monkeypatch.setattr(a, "_run_tool_loop", fail_loop)
+
+    answer, trace = await a._route_one(
+        "how do I fix a memory leak in python", at_refs=[], task_type="explanation"
+    )
+    assert answer == "prose"
+    assert trace == []
+
+
+# ---------------------------------------------------------------------------
 # M4 — tool loop honors settings.max_tool_steps and reports partial completion
 # ---------------------------------------------------------------------------
 

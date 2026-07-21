@@ -52,6 +52,11 @@ class ScriptedLLM:
         "edit index.html to change the title",
         "add a navbar to index.html",
         "write a CSS file for the theme",
+        # Named a UI element rather than a file — used to miss the target gate
+        # entirely and dead-end on the tool-free _direct_answer.
+        "fix the navigation on all the pages",
+        "update the footer links",
+        "change the hero section styles",
     ],
 )
 def test_wants_file_op_true(msg):
@@ -165,6 +170,52 @@ async def test_file_op_flow_creates_file(tmp_path, monkeypatch):
     assert written.read_text(encoding="utf-8") == "<html><body>Hi</body></html>"
     assert trace[0]["tool"] == "write_file"
     assert trace[0]["result"]["success"] is True
+    assert "Created" in answer
+
+
+async def test_file_op_flow_untargeted_repair_escalates_to_tool_loop(
+    tmp_path, monkeypatch
+):
+    """A repair request with no identifiable target must not write output.txt.
+
+    Regression: "fix the navigation" named no file, _extract_filename and the
+    last-write fallback both came back None, so _infer_filename's last resort
+    ("output.txt") won and the model — handed no file to work from — wrote
+    "please provide the contents of these files" straight to disk.
+    """
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_untargeted")
+    a._llm_direct = ScriptedLLM(
+        ["I need more information. Please provide the contents of these files."]
+    )
+
+    async def fake_loop(messages, max_steps=None):
+        return "loop done", [{"tool": "read_file"}]
+
+    monkeypatch.setattr(a, "_run_tool_loop", fake_loop)
+
+    answer, trace = await a._file_op_flow("fix the navigation")
+
+    assert answer == "loop done"
+    assert not (tmp_path / "output.txt").exists()
+
+
+async def test_file_op_flow_untargeted_creation_still_infers_name(
+    tmp_path, monkeypatch
+):
+    """The escalation is scoped to repairs — creation still infers a filename."""
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_untargeted_create")
+    a._llm_direct = ScriptedLLM(["FILENAME: index.html\n<html><body>Hi</body></html>"])
+
+    async def fail_loop(*args, **kwargs):
+        raise AssertionError("creation must not escalate")
+
+    monkeypatch.setattr(a, "_run_tool_loop", fail_loop)
+
+    answer, trace = await a._file_op_flow("make me a landing page")
+
+    assert (tmp_path / "index.html").exists()
     assert "Created" in answer
 
 
