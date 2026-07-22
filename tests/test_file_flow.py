@@ -146,6 +146,34 @@ def test_trim_html_prose_noop_on_fragment():
     assert _trim_html_prose(src) == src
 
 
+def test_parse_file_output_keeps_only_the_requested_block():
+    """The model sometimes answers a one-file call with the WHOLE build. Every
+    block after the first used to land inside the first file — a stylesheet with
+    a script and an HTML document appended to it (seen live in the eval suite)."""
+    raw = (
+        "FILENAME: styles.css\n"
+        "h1 { color: blue; }\n\n"
+        "FILENAME: script.js\n"
+        "console.log('hi');\n\n"
+        "FILENAME: index.html\n"
+        "<!DOCTYPE html><html><body>x</body></html>"
+    )
+    name, content = _parse_file_output(raw, fallback="x.txt", target="styles.css")
+    assert name == "styles.css"
+    assert content == "h1 { color: blue; }"
+
+    # …and the call that asked for a later file gets that file, not the first.
+    name, content = _parse_file_output(raw, fallback="x.txt", target="index.html")
+    assert name == "index.html"
+    assert content == "<!DOCTYPE html><html><body>x</body></html>"
+
+
+def test_parse_file_output_falls_back_to_the_first_block():
+    raw = "FILENAME: a.css\nbody{}\n\nFILENAME: b.js\nconsole.log(1);"
+    name, content = _parse_file_output(raw, fallback="x.txt")
+    assert (name, content) == ("a.css", "body{}")
+
+
 def test_parse_file_output_trims_prose_for_html():
     raw = "FILENAME: index.html\n<html><body>hi</body></html>\n\nHope this helps!"
     name, content = _parse_file_output(raw, fallback="x.txt")

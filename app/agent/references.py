@@ -98,6 +98,14 @@ REF_SCANNED_EXTS = {
 _NAV_RE = re.compile(r"<nav\b[^>]*>.*?</nav\s*>", re.IGNORECASE | re.DOTALL)
 _HEADER_RE = re.compile(r"<header\b[^>]*>.*?</header\s*>", re.IGNORECASE | re.DOTALL)
 
+# One whole <a>…</a>, its class attribute, and "strip every tag" — the pieces
+# needed to compare two navs and to move the active marker between pages.
+_A_TAG_RE = re.compile(r"<a\b[^>]*>.*?</a\s*>", re.IGNORECASE | re.DOTALL)
+_CLASS_ATTR_RE = re.compile(
+    r"""\bclass\s*=\s*(["'])(.*?)\1""", re.IGNORECASE | re.DOTALL
+)
+_TAG_STRIP_RE = re.compile(r"<[^>]+>")
+
 
 def extract_nav_block(html: str) -> str | None:
     """The page's navigation markup, or None if it has none.
@@ -114,6 +122,184 @@ def extract_nav_block(html: str) -> str | None:
     if m and _HREF_RE.search(m.group(0)):
         return m.group(0)
     return None
+
+
+def replace_nav_block(html: str, new_nav: str) -> str:
+    """Swap the page's navigation markup for ``new_nav`` (first block only)."""
+    if _NAV_RE.search(html or ""):
+        return _NAV_RE.sub(lambda _: new_nav, html, count=1)
+    m = _HEADER_RE.search(html or "")
+    if m and _HREF_RE.search(m.group(0)):
+        return html[: m.start()] + new_nav + html[m.end() :]
+    return html
+
+
+def _normalize_target(href: str) -> str:
+    """A nav link's comparable target: bare filename, lowercased, .html implied."""
+    raw = (href or "").strip()
+    if not raw:
+        return ""
+    if _EXTERNAL_RE.match(raw):
+        return raw.lower()
+    target = raw.split("#", 1)[0].split("?", 1)[0].strip().lstrip("/\\")
+    if not target:
+        return raw.lower()
+    target = target.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if target and "." not in target:
+        target += ".html"
+    return target
+
+
+def nav_links(nav_html: str) -> list[tuple[str, str]]:
+    """``(href, link text)`` for each ``<a>`` in a navigation block, in order."""
+    out: list[tuple[str, str]] = []
+    for m in _A_TAG_RE.finditer(nav_html or ""):
+        tag = m.group(0)
+        href_m = _HREF_RE.search(tag)
+        href = (href_m.group("val") or "").strip() if href_m else ""
+        label = " ".join(_TAG_STRIP_RE.sub(" ", tag).split())
+        out.append((href, label))
+    return out
+
+
+def nav_signature(nav_html: str) -> tuple[tuple[str, str], ...]:
+    """The comparable identity of a nav: its ``(target, label)`` pairs.
+
+    Normalized so that two pages whose navs differ ONLY in which item carries
+    the active class — or in `./about.html` vs `about.html` — compare equal.
+    Anything else (a renamed label, a reordered or missing item, a different
+    target) makes the signatures differ, which is exactly the "every page has a
+    different navbar" failure.
+    """
+    return tuple(
+        (_normalize_target(href), label.lower()) for href, label in nav_links(nav_html)
+    )
+
+
+def _set_class(open_tag: str, value: str) -> str:
+    """Set/replace the class attribute of an opening tag (dropping it if empty)."""
+    m = _CLASS_ATTR_RE.search(open_tag)
+    if m:
+        quote = m.group(1)
+        return (
+            open_tag[: m.start()] + f"class={quote}{value}{quote}" + open_tag[m.end() :]
+        )
+    if not value:
+        return open_tag
+    body = open_tag[:-1].rstrip()
+    if body.endswith("/"):
+        body = body[:-1].rstrip()
+        return f'{body} class="{value}" />'
+    return f'{body} class="{value}">'
+
+
+def set_active_link(nav_html: str, page: str) -> str:
+    """Re-point the nav's ``active`` class at ``page``.
+
+    Used when one page's nav is replaced by the canonical one: the markup is
+    shared, only which item is highlighted is per-page.
+    """
+    page_base = _normalize_target(page)
+
+    def _fix(m: re.Match) -> str:
+        tag = m.group(0)
+        open_m = re.match(r"<a\b[^>]*>", tag, re.IGNORECASE | re.DOTALL)
+        if not open_m:
+            return tag
+        open_tag = open_m.group(0)
+        classes = []
+        cm = _CLASS_ATTR_RE.search(open_tag)
+        if cm:
+            classes = [c for c in cm.group(2).split() if c.lower() != "active"]
+        href_m = _HREF_RE.search(open_tag)
+        href = (href_m.group("val") or "") if href_m else ""
+        if _normalize_target(href) == page_base and page_base:
+            classes.append("active")
+        return _set_class(open_tag, " ".join(classes)) + tag[len(open_tag) :]
+
+    return _A_TAG_RE.sub(_fix, nav_html or "")
+
+
+def _name_key(name: str) -> str:
+    """Collapse a filename to what a model was *probably* aiming at.
+
+    `scripts.js` / `script.js` / `Script.js` / `main-script.js` are distinct
+    files on disk but the same intent; punctuation and a trailing plural are the
+    two ways the local model spells the same asset differently in two places.
+    """
+    stem = re.sub(r"[^a-z0-9]+", "", Path(name).stem.lower())
+    if len(stem) > 3 and stem.endswith("s"):
+        stem = stem[:-1]
+    return stem
+
+
+def find_similar_file(target: Path | str, project_root: Path | str) -> Path | None:
+    """An existing file that a missing reference almost certainly MEANT.
+
+    `_repair_dead_references` creates whatever a page points at, so a build
+    whose HTML says `scripts.js` while the plan wrote `script.js` ends up with
+    two scripts of overlapping purpose. Before creating, look for the file the
+    reference was a near-miss for: same extension, same collapsed name, in the
+    reference's own directory (then the project root). Deliberately strict — a
+    genuinely different name like `main.css` vs `styles.css` is NOT matched.
+    """
+    target = Path(target)
+    root = Path(project_root)
+    ext = target.suffix.lower()
+    key = _name_key(target.name)
+    if not ext or not key:
+        return None
+    for directory in (target.parent, root):
+        try:
+            if not directory.is_dir():
+                continue
+            candidates = sorted(
+                p
+                for p in directory.iterdir()
+                if p.is_file()
+                and p.suffix.lower() == ext
+                and _name_key(p.name) == key
+                and p.resolve() != target.resolve()
+            )
+        except OSError:
+            continue
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def rewrite_reference(text: str, old_ref: str, new_ref: str) -> tuple[str, int]:
+    """Point every occurrence of ``old_ref`` at ``new_ref``. Returns (text, n).
+
+    Only attribute/import values are touched — a quoted value (optionally
+    carrying a `?query`/`#fragment`, which is preserved) or a bare CSS
+    ``url(...)`` — so the same string elsewhere in the file is left alone.
+    """
+    if not old_ref or old_ref == new_ref:
+        return text, 0
+    count = 0
+
+    def _quoted(m: re.Match) -> str:
+        nonlocal count
+        count += 1
+        suffix = m.group("val")[len(old_ref) :]
+        return f'{m.group("q")}{new_ref}{suffix}{m.group("q")}'
+
+    out = re.sub(
+        r"""(?P<q>["'])(?P<val>""" + re.escape(old_ref) + r"""(?:[?#][^"']*)?)(?P=q)""",
+        _quoted,
+        text,
+    )
+
+    def _url(m: re.Match) -> str:
+        nonlocal count
+        count += 1
+        return f"url({new_ref})"
+
+    out = re.sub(
+        r"\burl\(\s*" + re.escape(old_ref) + r"\s*\)", _url, out, flags=re.IGNORECASE
+    )
+    return out, count
 
 
 def find_broken_page_links(
@@ -174,7 +360,7 @@ def find_broken_page_links(
             continue  # no such page → a real route, leave it alone
 
         seen.add(raw)
-        fixes.append((raw, candidate + raw[len(target):]))  # keep #frag/?query
+        fixes.append((raw, candidate + raw[len(target) :]))  # keep #frag/?query
     return fixes
 
 

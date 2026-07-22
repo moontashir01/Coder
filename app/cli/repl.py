@@ -46,14 +46,13 @@ def _log_exception(context: str, exc: BaseException) -> Path | None:
     """
     try:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        body = "".join(
-            traceback.format_exception(type(exc), exc, exc.__traceback__)
-        )
+        body = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         with _ERROR_LOG.open("a", encoding="utf-8") as fh:
             fh.write(f"\n===== {stamp} — {context} =====\n{body}")
         return _ERROR_LOG
     except Exception:
         return None
+
 
 _BANNER = """[bold cyan]
   ██████╗ ██████╗ ██████╗ ███████╗██████╗
@@ -238,6 +237,12 @@ class CoderREPL:
 
         try:
             streamed: list[str] = []
+            # Progress lines from non-streaming work (the vision model
+            # describing an @-referenced screenshot, which swaps the model
+            # Ollama has loaded and takes seconds). Shown live in the spinner,
+            # then reprinted below it — the Live region is transient, so
+            # anything left only there vanishes when the turn ends.
+            notes: list[str] = []
             with Live(
                 Spinner("dots", text=Text("Thinking...", style="cyan")),
                 console=console,
@@ -250,10 +255,21 @@ class CoderREPL:
                     streamed.append(token)
                     live.update(Text("".join(streamed)))
 
+                def on_status(message: str) -> None:
+                    notes.append(message)
+                    # Text(), not markup: a status line contains "[vision]",
+                    # which console markup would try to read as a style tag.
+                    live.update(Spinner("dots", text=Text(message, style="cyan")))
+
+                self.agent.status_hook = on_status
                 try:
                     answer, trace = await self.agent.chat(user_input, on_token=on_token)
                 finally:
                     self._active_live = None
+                    self.agent.status_hook = None
+
+            for note in notes:
+                console.print(Text(f"  {note}", style="dim cyan"))
 
             # Show tool calls that were made (with diff previews when present)
             for step in trace:

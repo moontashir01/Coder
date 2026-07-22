@@ -27,6 +27,33 @@ class Settings(BaseSettings):
     # keep a generous per-request timeout so longer generations aren't cut off.
     llm_request_timeout_seconds: int = 120
 
+    # Vision pipeline (app/agent/vision.py): an @-referenced IMAGE is handed to
+    # this model, which describes it in structured text; that text then feeds
+    # the normal code-generation flow. The user never talks to it directly and
+    # the coding model never sees an image. Only one 7B model fits in 8 GB of
+    # VRAM, so Ollama swaps models between the vision call and generation —
+    # a few seconds, and the reason vision_num_ctx stays small (the description
+    # is short). vision_enabled=False is the kill switch: image refs are then
+    # skipped exactly like an unreadable file. Override via .env
+    # (VISION_MODEL=llava:7b) without touching code.
+    # NB the Ollama tag has no hyphen in "qwen2.5vl" — `qwen2.5-vl:7b` does not
+    # resolve and every vision call would degrade to text-only.
+    vision_model: str = "qwen2.5vl:7b"
+    vision_enabled: bool = True
+    vision_num_ctx: int = 4096
+    image_extensions: list[str] = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]
+    # Refuse to base64 an image bigger than this (encoding inflates it ~33%);
+    # beyond it something is wrong and the ref is skipped with a warning.
+    max_image_bytes: int = 20_000_000
+    # Downscale an image so its LONGEST edge is at most this many pixels before
+    # sending it to the VL model. A byte cap does NOT bound resolution, and
+    # Qwen2.5-VL tokenizes at ~native resolution while Ollama SILENTLY truncates
+    # the prompt to vision_num_ctx — so a tall/high-res screenshot loses its
+    # lower half with no error and the model describes only what survived. 1536px
+    # keeps the image comfortably under the 4096-token window with room for the
+    # prompt and the description. 0 disables downscaling. See app/agent/vision.py.
+    max_image_dimension: int = 1536
+
     # Bundled-resource paths — anchored to the package's resources dir (see
     # _RESOURCES above) so they resolve identically from any working directory
     # and ship as package data in a wheel/pipx install.
@@ -94,6 +121,13 @@ class Settings(BaseSettings):
     # context window. The shared nav block is lifted out and stated once within
     # this same budget.
     max_sibling_context_chars: int = 6000
+    # Multi-file builds: before planning the file list, spend ONE extra LLM call
+    # distilling the requirements every file shares (the navigation the request
+    # dictated, concrete fonts/colours for the style words it used) so each
+    # per-file call stops re-interpreting them — see app/agent/buildspec.py. The
+    # call only happens when the request plausibly states something shared, and
+    # what it returns is filtered against the user's own words.
+    extract_build_spec: bool = True
     retrieval_top_k: int = 5
     conversation_buffer_size: int = 20
     # U6: when history overflows max_context_tokens, summarize the dropped

@@ -7,6 +7,12 @@ from typing import Any, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+from app.agent.buildspec import (
+    SPEC_INSTRUCTIONS,
+    BuildSpec,
+    build_spec_from_data,
+    mentions_shared_spec,
+)
 from app.agent.context_budget import render_transcript, split_history_at_budget
 from app.agent.executor import Executor
 from app.agent.planner import Planner, _extract_json
@@ -16,14 +22,21 @@ from app.agent.references import (
     extract_nav_block,
     find_broken_page_links,
     find_dead_references,
+    find_similar_file,
     is_creatable,
+    nav_signature,
+    replace_nav_block,
+    rewrite_reference,
+    set_active_link,
 )
 from app.agent.tool_registry import ToolRegistry, create_registry
 from app.agent.verify import check_file, is_verifiable
+from app.agent.vision import _describe_image, is_image
 from app.memory.conversation import ConversationMemory
 from app.memory.project_memory import ProjectMemory, project_memory
 from app.models.llm import get_llm, get_streaming_llm
 from app.rag.retriever import Retriever, get_retriever
+from app.tools.filesystem import _jail_check
 from config.settings import settings
 
 # Imported lazily to avoid circular deps at module init
@@ -116,6 +129,33 @@ _FILE_OP_TARGET_RE = re.compile(
 def _wants_file_op(message: str) -> bool:
     """True when the message asks to create/edit a file on disk (not just show code)."""
     return bool(_FILE_OP_VERB_RE.search(message) and _FILE_OP_TARGET_RE.search(message))
+
+
+# "build this @screenshot.png" — the verbs that mean "produce what this picture
+# shows". Used ONLY when the message carries an image ref, where the target noun
+# _wants_file_op looks for is the image itself (and the ref is stripped out of
+# the text, so there is nothing left to match). Kept separate from
+# _FILE_OP_VERB_RE, which also gates ordinary text requests: widening it here
+# cannot change how a request without an image routes.
+_IMAGE_BUILD_VERB_RE = re.compile(
+    r"\b(create|make|write|save|generate|build|scaffold|add|append|insert|"
+    r"update|change|modify|edit|refactor|rewrite|fix|implement|put|"
+    r"recreate|replicate|reproduce|clone|copy|mimic|imitate|convert|turn|"
+    r"code|design|develop)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_image_build(message: str) -> bool:
+    """True when a message carrying an image ref asks for it to be BUILT.
+
+    A message that opens with an interrogative is asking *about* the picture
+    ("what does this show?", "does this copy their homepage?") — it gets the
+    description as context and a plain answer, not a file on disk.
+    """
+    if _EXPLAIN_QUESTION_RE.match(message):
+        return False
+    return bool(_IMAGE_BUILD_VERB_RE.search(message))
 
 
 # Verbs that presuppose the thing already exists on disk ("fix the navbar"),
@@ -427,8 +467,23 @@ def _extract_at_refs(message: str) -> list[str]:
 
 
 def _strip_at_refs(message: str) -> str:
-    """Drop the leading @ from each reference so the model sees a plain path."""
-    return _AT_REF_RE.sub(lambda m: m.group(1), message)
+    """Drop the leading @ from each reference so the model sees a plain path.
+
+    An IMAGE reference is removed outright rather than un-@'d: it reaches the
+    model as a description instead (see vision.py), and leaving "screenshot.png"
+    in the text would make _extract_filename/_resolve_ref pick the screenshot as
+    the file to write.
+    """
+    return _AT_REF_RE.sub(lambda m: "" if is_image(m.group(1)) else m.group(1), message)
+
+
+def _split_image_refs(refs: list[str]) -> tuple[list[str], list[str]]:
+    """Partition @refs into (text refs, image refs) by extension."""
+    text_refs: list[str] = []
+    image_refs: list[str] = []
+    for ref in refs:
+        (image_refs if is_image(ref) else text_refs).append(ref)
+    return text_refs, image_refs
 
 
 def _infer_filename(message: str) -> str:
@@ -545,14 +600,41 @@ def _trim_html_prose(content: str) -> str:
     return content
 
 
-def _parse_file_output(raw: str, fallback: str) -> tuple[str, str]:
-    """Split a `FILENAME: x\\n<content>` response into (name, content)."""
+_FILENAME_HEADER_RE = re.compile(
+    r"^[ \t]*FILENAME:[ \t]*(\S+)[ \t]*$", re.IGNORECASE | re.MULTILINE
+)
+
+
+def _parse_file_output(
+    raw: str, fallback: str, target: str | None = None
+) -> tuple[str, str]:
+    """Split a `FILENAME: x\\n<content>` response into (name, content).
+
+    Each call generates exactly ONE file, but the model sometimes answers with
+    several `FILENAME:` blocks anyway — the whole build in one response — and
+    every block after the first then lands *inside* the first file (a stylesheet
+    with an HTML document appended to it). So when there are several, keep only
+    the block this call asked for (``target``), else the first one, and drop the
+    rest rather than writing them into the wrong file.
+    """
     text = raw.strip()
     name = fallback
-    m = re.search(r"^\s*FILENAME:\s*(\S+)\s*$", text, re.IGNORECASE | re.MULTILINE)
-    if m:
-        name = m.group(1).strip().strip("`\"'")
-        text = text[m.end() :].lstrip("\n")
+    blocks = list(_FILENAME_HEADER_RE.finditer(text))
+    if blocks:
+        chosen = blocks[0]
+        if target and len(blocks) > 1:
+            want = Path(target).name.lower()
+            for m in blocks:
+                if Path(m.group(1).strip().strip("`\"'")).name.lower() == want:
+                    chosen = m
+                    break
+        end = len(text)
+        for m in blocks:
+            if m.start() > chosen.start():
+                end = m.start()
+                break
+        name = chosen.group(1).strip().strip("`\"'")
+        text = text[chosen.end() : end].lstrip("\n")
     content = _strip_code_fences(text)
     if (name or "").lower().endswith((".html", ".htm")):
         content = _trim_html_prose(content)
@@ -601,6 +683,9 @@ Rules:
   the link/import (e.g. for index.html: remove the inline <style>/<script> and
   add <link rel="stylesheet" href="styles.css"> and <script src="script.js">).
 - Keep each instruction specific and self-contained.
+- Spell shared filenames identically everywhere: pick the stylesheet and script
+  names once and repeat those exact spellings in every instruction that mentions
+  them (never "script.js" in one and "scripts.js" in another).
 - Output ONLY the JSON. No prose, no markdown fences."""
 
 _SR_BLOCK_RE = re.compile(
@@ -752,6 +837,18 @@ class AgentCore:
         # Last file this agent successfully wrote — the fallback edit target for
         # a follow-up that names no file ("now add a footer to the page").
         self._last_write_path: str | None = None
+        # Cross-file requirements distilled from THIS turn's request (nav labels,
+        # concrete design decisions). Set by _multi_file_flow, read by the
+        # post-generation nav check; cleared at the top of every chat().
+        self._build_spec: BuildSpec | None = None
+        # Progress lines for long non-streaming work (currently the vision call,
+        # which swaps the loaded Ollama model and takes seconds). The REPL
+        # installs a hook that writes into its Live region; unset = silent.
+        self.status_hook: Callable[[str], None] | None = None
+        # Image path (+ mtime/size) -> description. One screenshot is referenced
+        # by every sub-task of a compound build, and each vision call costs a
+        # model swap, so describe it once and reuse it until the file changes.
+        self._image_desc_cache: dict[tuple, str] = {}
 
     # ------------------------------------------------------------------
     # Project management
@@ -1068,7 +1165,12 @@ class AgentCore:
             self._skills_context = ""
 
     def _resolve_ref(self, refs: list[str]) -> str | None:
-        """Pick the @-referenced file to act on: first that exists, else the first given."""
+        """Pick the @-referenced file to act on: first that exists, else the first given.
+
+        An image ref is never a target — "@screenshot.png" is what to build
+        FROM, not the file to write — so images are filtered out here.
+        """
+        refs = [r for r in refs if not is_image(r)]
         if not refs:
             return None
         workdir = Path(self._project_path or Path.cwd())
@@ -1103,13 +1205,90 @@ class AgentCore:
         except (ValueError, OSError):
             return None  # outside the workdir → don't hijack the target
 
+    def _status(self, message: str) -> None:
+        """Report progress to whoever is driving (REPL); silent by default."""
+        logger.debug("status: %s", message)
+        if self.status_hook is None:
+            return
+        try:
+            self.status_hook(message)
+        except Exception:
+            logger.debug("status hook raised", exc_info=True)
+
+    def _describe_image_ref(self, ref: str) -> str | None:
+        """Text description of an @-referenced image, or None if unavailable.
+
+        Memoized on (path, mtime, size) so a compound request that threads the
+        same screenshot through several sub-tasks pays for ONE vision call —
+        each one swaps the model Ollama has loaded and costs seconds. The stamp
+        is part of the key, so editing the image re-describes it. Every
+        failure mode inside _describe_image returns None; the caller then
+        behaves as if the image was never referenced.
+        """
+        workdir = Path(self._project_path or Path.cwd())
+        path = workdir / ref
+        # The vision path reads bytes straight off disk, bypassing the executor
+        # — so apply the same path jail the file tools use, or `@../../secret.png`
+        # would be read and base64'd out of the sandbox. Inert when no root is set
+        # (tests/library) or under --allow-outside-root; non-fatal like every
+        # other vision failure — an escaping ref is simply skipped.
+        jail = _jail_check(str(path))
+        if jail is not None:
+            logger.warning("image ref %s escapes the sandbox root — skipping", ref)
+            self._status(
+                f"[vision] Skipped {Path(ref).name} — outside the project root"
+            )
+            return None
+        try:
+            stat = path.stat()
+            key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            logger.debug("image ref %s not found", ref)
+            return None
+        if key in self._image_desc_cache:
+            return self._image_desc_cache[key]
+        description = _describe_image(path, on_status=self._status)
+        if description:
+            self._image_desc_cache[key] = description
+        return description
+
+    def _image_context(self, refs: list[str]) -> str:
+        """Context block describing @-referenced images, for the code flows.
+
+        This is the seam where the vision pipeline ends: from here on the
+        request is an ordinary text prompt with a described screenshot attached,
+        so routing, planning and generation need no image awareness at all.
+        """
+        blocks: list[str] = []
+        for ref in refs:
+            description = self._describe_image_ref(ref)
+            if not description:
+                continue
+            blocks.append(
+                f"## Reference image: {ref}\n"
+                "The user attached this image as the visual reference for the "
+                "request. It was analyzed and described below — build to match "
+                "it.\n\n" + description
+            )
+        return "\n\n".join(blocks)
+
     def _read_refs(self, refs: list[str], max_chars: int = 4000) -> str:
-        """Read the @-referenced files into a context block for non-edit answers."""
+        """Read the @-referenced files into a context block for non-edit answers.
+
+        An image ref has no text to read, so it is described by the vision model
+        instead (vision.py) and the description is injected in its place —
+        callers only ever handle text either way.
+        """
         if not refs:
             return ""
         workdir = Path(self._project_path or Path.cwd())
         blocks: list[str] = []
         for ref in refs:
+            if is_image(ref):
+                description = self._describe_image_ref(ref)
+                if description:
+                    blocks.append(f"### {ref} (image description)\n{description}")
+                continue
             p = workdir / ref
             try:
                 if p.is_file():
@@ -1319,7 +1498,7 @@ class AgentCore:
             return f"LLM error while generating the file: {e}", []
 
         name, content = _parse_file_output(
-            raw, fallback=filename or _infer_filename(user_message)
+            raw, fallback=filename or _infer_filename(user_message), target=filename
         )
         out_path = workdir / name
         result = await self.executor.execute(
@@ -1533,6 +1712,75 @@ class AgentCore:
             return []
         return _parse_file_plan(raw)
 
+    async def _extract_build_spec(self, user_message: str) -> BuildSpec:
+        """Distill the requirements every file of this build shares (Gap 1/2).
+
+        `_plan_file_ops` decomposes a request per file; nothing before it turned
+        the request's *cross-file* demands — "the nav should be Our Story |
+        RSVP | Gallery", "soft pastel with script headings" — into one canonical
+        statement, so each per-file call re-interpreted them and disagreed.
+
+        Runs at most one extra LLM call, and only when the request plausibly
+        specifies something shared; otherwise (and on any failure) it returns an
+        empty spec and the pipeline behaves exactly as it did before. What the
+        model returns is filtered against the user's own words in
+        `build_spec_from_data`, so this can add requirements the user stated but
+        never invent ones they didn't.
+        """
+        if not settings.extract_build_spec or not mentions_shared_spec(user_message):
+            return BuildSpec()
+        messages = [
+            SystemMessage(
+                content="You extract shared build requirements. You output only JSON."
+                + SPEC_INSTRUCTIONS
+            ),
+            HumanMessage(content=f"Request: {user_message}\n\nOutput the JSON now:"),
+        ]
+        data: dict | None = None
+        try:
+            raw = self._llm_direct.invoke(messages).content
+            parsed = _extract_json(str(raw))
+            data = parsed if isinstance(parsed, dict) else None
+        except Exception as e:
+            logger.debug("build-spec extraction failed: %s", e)
+        # Even with no usable JSON the style half still degrades to the
+        # rule-based presets, so "pastel" never reaches the model as bare prose.
+        return build_spec_from_data(data, user_message)
+
+    @staticmethod
+    def _shared_asset_note(ops: list[FileOp]) -> str:
+        """Pin the ONE stylesheet / ONE script the plan chose, by exact name.
+
+        Left implicit, the model writes `script.js` and then links `scripts.js`
+        from the pages — and the reference repair dutifully creates the second
+        file, leaving two scripts of overlapping purpose (Gap 4).
+        """
+        lines: list[str] = []
+        for label, exts in (
+            ("stylesheet", (".css",)),
+            ("script", (".js", ".mjs", ".ts")),
+        ):
+            names = [
+                op.filename for op in ops if Path(op.filename).suffix.lower() in exts
+            ]
+            if not names:
+                continue
+            uniq = list(dict.fromkeys(names))
+            if len(uniq) == 1:
+                lines.append(
+                    f"- The shared {label} is `{uniq[0]}`. Every file that needs it "
+                    "must reference EXACTLY that name — never a variant spelling."
+                )
+            else:
+                lines.append(
+                    f"- The {label}s in this build are "
+                    + ", ".join(f"`{n}`" for n in uniq)
+                    + ". Reference them by exactly these names; create no others."
+                )
+        if not lines:
+            return ""
+        return "### Shared assets — exact filenames\n" + "\n".join(lines)
+
     async def _multi_file_flow(
         self, user_message: str, refs: list[str], extra_context: str = ""
     ) -> tuple[str, list[dict]]:
@@ -1555,7 +1803,14 @@ class AgentCore:
             ctx_names.append(guessed)
         context = self._read_refs([n for n in ctx_names if (workdir / n).is_file()])
 
-        ops = await self._plan_file_ops(user_message, context, extra_context)
+        # Shared requirements first (Gap 1/2): the planner AND every per-file
+        # call must see the same canonical nav/design, or each re-invents them.
+        spec = await self._extract_build_spec(user_message)
+        self._build_spec = spec  # read by the post-generation nav check
+        spec_block = spec.to_context_block()
+        plan_extra = "\n\n".join(c for c in (extra_context, spec_block) if c)
+
+        ops = await self._plan_file_ops(user_message, context, plan_extra)
         if not ops:
             return (
                 "I couldn't plan the multi-file change — try naming the files, "
@@ -1576,6 +1831,9 @@ class AgentCore:
                 for op in ops
             )
         )
+        asset_note = self._shared_asset_note(ops)
+        if asset_note:
+            manifest += "\n\n" + asset_note
 
         trace: list[dict] = []
         summaries: list[str] = []
@@ -1584,7 +1842,7 @@ class AgentCore:
             # Each op reuses the single-file flow: create → FILENAME gen,
             # edit on an existing file → surgical SEARCH/REPLACE then rewrite.
             sub_msg = op.instruction or user_message
-            extra = f"{extra_context}\n\n{manifest}" if extra_context else manifest
+            extra = "\n\n".join(c for c in (extra_context, spec_block, manifest) if c)
             siblings = self._sibling_context(written)
             if siblings:
                 extra += "\n\n" + siblings
@@ -1613,10 +1871,18 @@ class AgentCore:
         classifying, so a file op (the common decomposed step) skips the
         classify LLM call entirely; ``task_type`` is only computed when needed.
         """
+        # An @image ref is neither a target nor readable text — it's a
+        # screenshot to build from. Describe it once here and hand the result
+        # down as ordinary context, so every flow below routes exactly as it
+        # would for a plain text prompt. Text refs behave as they always have.
+        text_refs, image_refs = _split_image_refs(at_refs)
+        image_ctx = self._image_context(image_refs)
+        if image_ctx:
+            extra_context = "\n\n".join(c for c in (extra_context, image_ctx) if c)
 
         async def _file_op():
             # Create/update a single file deterministically; an @ref pins target.
-            target = self._resolve_ref(at_refs)
+            target = self._resolve_ref(text_refs)
             return await self._file_op_flow(
                 message,
                 target=target,
@@ -1627,8 +1893,16 @@ class AgentCore:
         if wants_multifile(message):
             # Plan + execute several file operations in one turn.
             return await self._multi_file_flow(
-                message, refs=at_refs, extra_context=extra_context
+                message, refs=text_refs, extra_context=extra_context
             )
+        if image_refs and _wants_image_build(message):
+            # "build this @screenshot.png". _wants_file_op needs a verb AND a
+            # target noun, but here the noun IS the image — and the image ref is
+            # stripped out of the text, so nothing is left for it to match.
+            # Without this the request dead-ends on _direct_answer, which prints
+            # the page into the terminal and writes no file. A question about
+            # the picture ("what does @shot.png show") still answers normally.
+            return await _file_op()
         if _wants_file_op(message):
             return await _file_op()
 
@@ -1653,7 +1927,9 @@ class AgentCore:
             return await self._run_tool_loop(messages)
 
         # Plain answer; inject any @-referenced files (plus caller context).
-        refs_ctx = self._read_refs(at_refs)
+        # Images already went into extra_context above — pass text refs only so
+        # the same screenshot isn't described twice.
+        refs_ctx = self._read_refs(text_refs)
         combined = "\n\n".join(c for c in (extra_context, refs_ctx) if c)
         answer = await self._direct_answer(
             message, extra_context=combined, on_token=on_token
@@ -1702,6 +1978,13 @@ class AgentCore:
             + "\n".join(f"{i}. {s}" for i, s in enumerate(subtasks, 1))
         )
 
+        # A text ref pins an edit target, so it belongs only to the step that
+        # names it. An image ref pins nothing — it is the visual reference for
+        # the WHOLE request (and its filename is stripped out of the text
+        # entirely), so every step gets it. The description itself is computed
+        # once and memoized, not re-run per step.
+        text_refs, image_refs = _split_image_refs(at_refs)
+
         trace: list[dict] = []
         summaries: list[str] = []
         written: list[str] = []
@@ -1712,7 +1995,7 @@ class AgentCore:
                 extra += "\n\n" + siblings
             # Only apply an @ref to the sub-task that actually names its path, so
             # "edit @a.py and create b.py" doesn't target a.py for both steps.
-            sub_refs = [r for r in at_refs if r in sub]
+            sub_refs = [r for r in text_refs if r in sub] + image_refs
             ans, sub_trace = await self._route_one(sub, sub_refs, extra_context=extra)
             trace.extend(sub_trace)
             summaries.append(f"{i}. {sub}\n   -> {ans}")
@@ -1723,6 +2006,59 @@ class AgentCore:
 
         header = f"Completed {len(subtasks)} tasks:\n"
         return header + "\n".join(summaries), trace
+
+    async def _redirect_near_miss_references(
+        self,
+        missing: dict[Path, tuple[str, str]],
+        referencers: dict[Path, list[str]],
+        root: Path,
+    ) -> tuple[list[str], list[dict]]:
+        """Repoint references that misspell a file that already exists (Gap 4).
+
+        Mutates ``missing``, dropping every target handled here so the caller's
+        create loop doesn't also generate it. Deterministic — `find_similar_file`
+        only matches punctuation/plural variants of the same stem and extension,
+        so a genuinely new dependency is still created, not silently aliased.
+        """
+        redirected: list[str] = []
+        extra_trace: list[dict] = []
+        for resolved in list(missing):
+            ref, _ = missing[resolved]
+            existing = find_similar_file(resolved, root)
+            if existing is None:
+                continue
+            try:
+                new_ref = str(existing.resolve().relative_to(root)).replace("\\", "/")
+            except ValueError:
+                continue
+            patched_any = False
+            for rel in referencers.get(resolved, []):
+                path = root / rel
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    new_text, n = rewrite_reference(text, ref, new_ref)
+                except Exception as e:
+                    logger.warning("near-miss rewrite of %s failed: %s", rel, e)
+                    continue
+                if not n:
+                    continue
+                result = await self.executor.execute(
+                    "write_file", {"path": str(path), "content": new_text}
+                )
+                extra_trace.append(
+                    {
+                        "tool": "write_file",
+                        "arguments": {"path": str(path)},
+                        "result": result,
+                    }
+                )
+                if result.get("success"):
+                    self._reindex_after_write(path)
+                    patched_any = True
+            if patched_any:
+                redirected.append(f"{ref} -> {new_ref}")
+                missing.pop(resolved, None)
+        return redirected, extra_trace
 
     async def _repair_dead_references(
         self, trace: list[dict]
@@ -1746,6 +2082,7 @@ class AgentCore:
         # it), so duplicate references dedupe and each created file can be made
         # consistent with whoever needs it.
         missing: dict[Path, tuple[str, str]] = {}
+        referencers: dict[Path, list[str]] = {}
         for rel in written:
             fp = workdir / rel
             if fp.suffix.lower() not in REF_SCANNED_EXTS:
@@ -1753,12 +2090,22 @@ class AgentCore:
             for ref, resolved in find_dead_references(fp, root):
                 if resolved not in missing:
                     missing[resolved] = (ref, rel)
+                if rel not in referencers.setdefault(resolved, []):
+                    referencers[resolved].append(rel)
         if not missing:
             return "", []
 
-        # Auto-creating dependency files must not hijack the follow-up edit
-        # target ("now add a footer") away from the primary artifact — restore it.
+        # Repairing dependencies must not hijack the follow-up edit target
+        # ("now add a footer") away from the primary artifact — restore it after.
         prev_last_write = self._last_write_path
+
+        # A reference that is a near-miss for a file we DID write ("scripts.js"
+        # next to the plan's "script.js") is a typo, not a missing dependency —
+        # creating it would leave two assets of overlapping purpose. Repoint the
+        # reference at the real file instead (deterministic, no LLM).
+        redirected, redirect_trace = await self._redirect_near_miss_references(
+            missing, referencers, root
+        )
 
         created: list[str] = []
         reported: list[str] = []
@@ -1793,6 +2140,15 @@ class AgentCore:
         self._last_write_path = prev_last_write
 
         note = ""
+        if redirected:
+            note += (
+                "\n\nReference check — repointed "
+                f"{len(redirected)} near-miss reference(s) at the file that "
+                "already exists (instead of creating a duplicate): "
+                + ", ".join(f"`{r}`" for r in redirected)
+                + "."
+            )
+            ref_trace = redirect_trace + ref_trace
         if created:
             note += (
                 f"\n\nReference check — created {len(created)} missing referenced "
@@ -1838,9 +2194,7 @@ class AgentCore:
                     # Rewrite only the href value, and only on <a> tags, so an
                     # identical string elsewhere in the page is left alone.
                     text = re.sub(
-                        r"(<a\b[^>]*?\bhref\s*=\s*([\"']))"
-                        + re.escape(raw)
-                        + r"(\2)",
+                        r"(<a\b[^>]*?\bhref\s*=\s*([\"']))" + re.escape(raw) + r"(\2)",
                         lambda m: m.group(1) + corrected + m.group(3),
                         text,
                         flags=re.IGNORECASE,
@@ -1867,6 +2221,96 @@ class AgentCore:
         if fixed:
             note = "\n\nFixed unreachable nav links in " + ", ".join(
                 f"`{f}`" for f in fixed
+            )
+        return note, extra_trace
+
+    async def _repair_nav_consistency(
+        self, trace: list[dict]
+    ) -> tuple[str, list[dict]]:
+        """Make every page written this turn carry the SAME navigation (Gap 3).
+
+        `_sibling_context` threads the first page's nav into later pages, but
+        that is a prompt-level hint the model is free to ignore — and it does:
+        page 3 renames "Event Details" to "Details", page 4 drops an item. Both
+        `_repair_page_links` (href *form*) and `_repair_dead_references`
+        (missing targets) look at links one page at a time and can't see the
+        disagreement.
+
+        Deterministic, no LLM: compare the pages' nav signatures, pick the
+        canonical one, and patch the outliers — carrying the active marker over
+        to each page's own link. A page with no nav at all is left alone (we
+        don't inject markup where the design may not want any).
+        """
+        workdir = Path(self._project_path or Path.cwd())
+        pages: list[tuple[str, str, str]] = []  # (rel, text, nav)
+        for rel in self._written_paths(trace, workdir):
+            path = workdir / rel
+            if path.suffix.lower() not in (".html", ".htm"):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            nav = extract_nav_block(text)
+            if nav:
+                pages.append((rel, text, nav))
+        if len(pages) < 2:
+            return "", []
+
+        signatures = [nav_signature(nav) for _, _, nav in pages]
+        if len({s for s in signatures if s}) < 2:
+            return "", []  # already consistent (or no links to compare)
+
+        # Canonical = the nav that best matches the labels the user asked for,
+        # then the one the most pages already agree on, then the first written.
+        spec_labels = {
+            label.strip().lower()
+            for label in (self._build_spec.nav_labels() if self._build_spec else ())
+        }
+
+        def _rank(index: int) -> tuple[int, int, int]:
+            sig = signatures[index]
+            matched = sum(1 for _, label in sig if label.strip() in spec_labels)
+            return (matched, signatures.count(sig), -index)
+
+        best = max(range(len(pages)), key=_rank)
+        canonical_sig = signatures[best]
+        canonical_nav = pages[best][2]
+        canonical_rel = pages[best][0]
+
+        fixed: list[str] = []
+        extra_trace: list[dict] = []
+        for i, (rel, text, _nav) in enumerate(pages):
+            if signatures[i] == canonical_sig:
+                continue
+            path = workdir / rel
+            try:
+                new_text = replace_nav_block(text, set_active_link(canonical_nav, rel))
+            except Exception as e:
+                logger.warning("nav repair of %s failed: %s", rel, e)
+                continue
+            if new_text == text:
+                continue
+            result = await self.executor.execute(
+                "write_file", {"path": str(path), "content": new_text}
+            )
+            extra_trace.append(
+                {
+                    "tool": "write_file",
+                    "arguments": {"path": str(path)},
+                    "result": result,
+                }
+            )
+            if result.get("success"):
+                self._reindex_after_write(path)
+                fixed.append(rel)
+
+        note = ""
+        if fixed:
+            note = (
+                "\n\nNavigation check — "
+                + ", ".join(f"`{f}`" for f in fixed)
+                + f" had a different navbar; replaced with the one from `{canonical_rel}`."
             )
         return note, extra_trace
 
@@ -1897,6 +2341,7 @@ class AgentCore:
         at_refs = _extract_at_refs(user_message)
         clean_message = _strip_at_refs(user_message)
 
+        self._build_spec = None  # this turn's shared spec, set by _multi_file_flow
         self._update_skills_context(clean_message)
         await self.memory.add_human(user_message)
 
@@ -1953,6 +2398,19 @@ class AgentCore:
                 answer += ref_note
             if ref_trace:
                 trace.extend(ref_trace)
+
+            # Then make the pages agree on ONE navbar. Runs after the pass above
+            # so a page it just created is included, and before the link repair
+            # so a nav copied onto another page still gets its hrefs checked.
+            try:
+                nav_note, nav_trace = await self._repair_nav_consistency(trace)
+            except Exception:
+                logger.warning("nav consistency repair failed", exc_info=True)
+                nav_note, nav_trace = "", []
+            if nav_note:
+                answer += nav_note
+            if nav_trace:
+                trace.extend(nav_trace)
 
             # Then repair links whose target EXISTS but is unreachable from a
             # static page ("/about.html", "about"). Runs after the pass above so

@@ -72,6 +72,8 @@ to skip). Useful things to try:
 
 - Ask a question: `explain what @src/app.py does`
 - Create a file: `make an index.html landing page`
+- Build from a screenshot: `build a website like this @mockup.png` (needs
+  `ollama pull qwen2.5vl:7b`; without it Coder just uses your text)
 - Re-index or switch projects: `/index`, `/load ../other-project`
 - List commands: `/help`
 
@@ -133,6 +135,7 @@ Then make sure Ollama is serving with the models:
 ollama serve
 ollama pull qwen2.5-coder:7b
 ollama pull nomic-embed-text
+ollama pull qwen2.5vl:7b        # optional — only for @screenshot.png references
 ```
 
 ### Or install with pipx

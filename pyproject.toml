@@ -23,6 +23,11 @@ dependencies = [
     "langchain-ollama>=1.1",
     "mcp>=1.28",
     "pathspec>=0.12",
+    # Vision pipeline: downscale an oversized screenshot before it reaches the
+    # VL model (app/agent/vision.py) — Qwen2.5-VL tokenizes at native resolution
+    # and Ollama silently truncates to num_ctx. Best-effort: a resize failure
+    # falls back to the original bytes, so this is a soft dependency in practice.
+    "Pillow>=11.0",
     "prompt-toolkit>=3.0",
     "pydantic>=2.13",
     "pydantic-settings>=2.14",

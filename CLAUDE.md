@@ -11,11 +11,12 @@ vectors, SQLite for memory, LangChain for the Ollama wrappers.
 
 ## Prerequisites
 
-Ollama running with both models pulled:
+Ollama running with the models pulled:
 ```
 ollama serve
 ollama pull qwen2.5-coder:7b
 ollama pull nomic-embed-text
+ollama pull qwen2.5vl:7b        # optional — only for @screenshot.png refs
 ```
 All Python work uses the venv (`.venv\Scripts\activate` on Windows, `source .venv/bin/activate` on Unix).
 
@@ -81,7 +82,24 @@ this turn (HTML/CSS/JS via `app/agent/references.py`) for **local** references �
 `<link href>`, `<img src>`, CSS `@import`/`url()`, JS relative imports — that point at a file which
 doesn't exist, and **creates each missing TEXT file** (`.css`/`.js`/`.ts`/`.html`/…) via
 `_file_op_flow`, feeding the referencing file in as context so ids/classes/selectors line up.
-Missing **binary** assets (`.png`/`.woff`/…) are **reported, never fabricated**. A second pass,
+Missing **binary** assets (`.png`/`.woff`/…) are **reported, never fabricated**. Before creating
+anything it runs `_redirect_near_miss_references`: a reference that merely *misspells* a file that
+already exists — `scripts.js` beside the plan's `script.js` — is a typo, not a dependency, so the
+reference is rewritten to point at the real file (`rewrite_reference`, quoted values and CSS
+`url()` only) instead of creating a duplicate asset. `find_similar_file` is deliberately strict
+(same extension, same stem once punctuation and a trailing plural are collapsed), so `main.css` is
+still a genuinely new file and is still generated.
+
+Then `_repair_nav_consistency` makes every page written this turn carry the **same** navigation.
+`_sibling_context` states the canonical nav in the prompt, but that's a hint the 7B model is free to
+ignore — and does (page 3 renames an item, page 4 drops one), while the two link passes each look at
+one page at a time and can't see the disagreement. This one is deterministic, no LLM: compare the
+pages' `nav_signature`s (normalized so that *only* a different active item or `./about.html` vs
+`about.html` compares equal), pick the canonical nav — best match for the build spec's labels, then
+the one most pages already agree on, then the first written — and patch the outliers with
+`replace_nav_block` + `set_active_link`, which carries the active marker over to each page's own
+link. A page with **no** nav is left alone (never inject markup where the design may not want any).
+A third pass,
 `_repair_page_links`, then fixes links whose target **exists** but whose *form* can't reach it from a
 static page opened over `file://` — `href="/about.html"` (root-absolute) and `href="about"`
 (extensionless). It is purely deterministic (no LLM): the corrected target must already exist next to
@@ -109,6 +127,12 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
   gone/outside the workdir.
   - **Create / new file:** ONE plain LLM call for `FILENAME: <name>\n<full contents>`, parsed by
     `_parse_file_output` (strips code fences, incl. stray/unmatched ones), written via `write_file`.
+    Each call generates ONE file, but the model sometimes answers with the whole build —
+    several `FILENAME:` blocks in one response — so `_parse_file_output` takes a `target` and keeps
+    **only** the block for the file this call asked for (else the first), discarding the rest.
+    Without that, every later block landed *inside* the first file: a `styles.css` with a script and
+    an HTML document appended to it. This was live-caught by the eval suite (`multifile_three` lost
+    its `index.html` that way).
   - **Edit existing file → surgical first (`_surgical_edit`).** Asks `_llm_edit` (temperature 0,
     few-shot, editor-only system prompt — NOT the persona, whose "confirm what you did" rule causes
     prose) for `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` blocks. `_apply_search_replace` applies
@@ -120,6 +144,7 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
 - **`@path` references** (`_extract_at_refs`): in any message, `@src/app.py` pins the edit *target*
   (`_resolve_ref`, prefers an existing file) and, for non-edit questions, injects the file as context
   (`_read_refs`). The `@` is stripped before the model/classifier see the text. Emails are ignored.
+  An `@`-referenced **image** takes the vision path instead — see below.
 - **Split/reorganize across several files → `_multi_file_flow`** — and in `chat()`, a request the
   cheap splitter leaves whole that matches `wants_multifile()` routes **straight** here, skipping
   the classify/decompose LLM calls (LLM pre-decomposition fragments a spec; this flow has its own
@@ -131,7 +156,29 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
   `{"files": [{filename, action, instruction}]}` (`_parse_file_plan`, tolerant), then each op runs
   through `_file_op_flow`. **Cross-file consistency:** every per-file call gets the full plan
   manifest as `extra_context`, plus `_sibling_context(written)`, so
-  `<link href>`/`<script src>`/shared names line up. **`_sibling_context` is the shared threading
+  `<link href>`/`<script src>`/shared names line up. The manifest also carries
+  `_shared_asset_note(ops)` — the ONE stylesheet / ONE script the plan chose, named exactly, so the
+  pages don't link a variant spelling (`scripts.js`) that the reference repair then creates as a
+  second, overlapping asset.
+  - **Shared build spec (`app/agent/buildspec.py`) — runs BEFORE the plan.** `_plan_file_ops`
+    decomposes per file; nothing turned the request's *cross-file* demands into one canonical
+    statement, so each per-file call re-interpreted them and disagreed ("Our Story" became "About"
+    on page 3; "soft pastel" became Arial and `#ff6b6b`). `_extract_build_spec` spends **one** extra
+    LLM call — gated by `mentions_shared_spec()`, so an ordinary split request costs nothing and
+    behaves exactly as before — and `build_spec_from_data` turns the answer into a compact block
+    injected into the planner AND every per-file generation (it complements `_sibling_context`,
+    which still threads the actual markup). Two halves, opposite rules:
+    - *What the user asked for* (nav labels, cross-page behaviours) is **filtered against their own
+      message** — a label they never typed is dropped, a behaviour about a page nobody mentioned is
+      dropped. It can only restate the request, never invent one.
+    - *Style* is deliberately **concretized**: style words → real Google Fonts + real hex codes, by
+      the LLM when it cooperates and by `_STYLE_PRESETS` when it doesn't. Two deterministic quality
+      gates reject the model's own output when it contradicts the request: `palette_matches_style`
+      (measured in **chroma**, not HSL saturation — every light tint scores ~1.0 saturation, which
+      would reject the very pastels it should accept) and a concrete-CSS check on the decorative
+      line, both live-caught returning gold/crimson for "soft pastel" and "…creates a warm and
+      inviting atmosphere" as design guidance.
+    Nothing style-ish or nav-ish in the prompt → empty spec → the block is omitted entirely. **`_sibling_context` is the shared threading
   helper** (used by `_multi_file_flow` AND `_run_subtasks`): it lifts the `<nav>` (or a linking
   `<header>`) out of the first written page and states it **once** as canonical markup to copy
   verbatim, then quotes the most recent siblings against a **single total budget**
@@ -182,6 +229,67 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
 comes from `_tool_guidance()` and the schemas from `bind_tools`. If you put tool-protocol text in
 system.md it leaks into `_direct_answer`/`_file_op_flow` and the model emits fake tool-call JSON
 instead of the file/answer.
+
+### Vision pipeline — screenshot-to-code (`app/agent/vision.py`)
+
+`coder> Build a website like this @screenshot.png`. There is no new command, flag, or model
+switch: the UX is the existing `@path` syntax, and an `@`-ref whose **extension** is in
+`settings.image_extensions` is routed to the vision model instead of being read as text.
+
+The vision model (`settings.vision_model`, default `qwen2.5vl:7b` — **note the Ollama tag has no
+hyphen**; `qwen2.5-vl:7b` does not resolve) is a **translator, never a participant**.
+`_describe_image` base64s the file, sends it as one `HumanMessage` with `text` + `image_url`
+content blocks (langchain_ollama converts a `data:` URI into Ollama's `images` field — verified
+live on 1.1.0), and returns the structured description. From there everything downstream sees
+**plain text**: `chat()`'s routing, `Planner.classify`, `_multi_file_flow`, `_file_op_flow`,
+`_build_messages` are all unchanged and have no idea an image was involved. That encapsulation is
+the design — keep image handling inside the ref-reading layer.
+
+The extraction prompt is `app/resources/prompts/vision_describe.md` (loaded via
+`settings.prompts_dir` like `system.md`, **not** hardcoded); it asks for LAYOUT / NAVIGATION /
+COLOR PALETTE / TYPOGRAPHY / COMPONENTS / CONTENT / STYLE with concrete hex values, which is what
+makes the description actionable for the coding model. `system.md` says nothing about vision.
+
+Three seams in `core.py`, all small:
+- **`_read_refs`** routes an image ref to `_describe_image_ref` and injects the description where
+  the file text would have gone. **`_route_one`** splits `at_refs` (`_split_image_refs`), describes
+  the images once, and threads the block into `extra_context` for *every* branch — so a screenshot
+  reaches the file/multi-file flows too, not just the direct answer.
+- **An image ref is itself the file-op signal** (`_wants_image_build`). `_wants_file_op` needs a
+  verb AND a target noun — but with a screenshot the noun *is* the image, and the ref is stripped
+  out of the text, so "build this @shot.png" matched nothing and dead-ended on `_direct_answer`:
+  the page was printed into the terminal and no file was written. An image ref plus a build verb
+  now routes straight to `_file_op`. `_IMAGE_BUILD_VERB_RE` is deliberately its own regex (it adds
+  recreate/replicate/clone/copy/mimic/convert/turn/code/design — how people actually talk about a
+  mockup) and is consulted ONLY when an image ref is present, so it cannot change how a text-only
+  request routes. `_EXPLAIN_QUESTION_RE` keeps "what does @shot.png show?" an answer, not a write.
+- **An image is never an edit target.** `_resolve_ref` filters images out, and `_strip_at_refs`
+  *removes* an image ref from the message entirely (text refs still just lose their `@`) — leaving
+  "screenshot.png" in the text made `_extract_filename` target the PNG and the build got written
+  onto the screenshot.
+- **`_run_subtasks`** gives a text ref only to the step that names it (target pinning), but gives
+  the image to **all** of them: a screenshot is the visual reference for the whole request.
+  `_describe_image_ref` memoizes on (path, mtime, size), so N sub-tasks still cost ONE vision call.
+
+**Model swapping is Ollama's job.** Only one 7B fits in 8 GB of VRAM, so the vision call loads
+`qwen2.5vl:7b` and the generation call swaps it back for `qwen2.5-coder:7b` — a few seconds each
+way. Do NOT add preloading/keep-alive or try to hold both. The vision `ChatOllama` is built
+on-demand in `_describe_image` and is **separate** from the agent's own instances (own model name,
+own `vision_num_ctx=4096` — the output is short). The user sees the swap via
+`AgentCore.status_hook`: the REPL installs one per turn that writes `[vision] Analyzing shot.png …`
+into the Live spinner and reprints the lines under it (the Live region is transient, so a status
+line left only there vanishes). Status lines are rendered as `Text`, never markup — `[vision]`
+would otherwise parse as a Rich style tag.
+
+**Every failure is non-fatal, by design.** Missing model (the message names `ollama pull …`),
+unreadable/empty/oversized file (`settings.max_image_bytes`, 20 MB), connection error, or an empty
+/ sub-40-char answer all return `None`, and the turn proceeds exactly as if the image had never
+been referenced — text-only. `settings.vision_enabled = False` is the kill switch and skips the ref
+before any model is constructed. **The image read path is jailed:** `_describe_image_ref` runs the
+same `app/tools/filesystem._jail_check` the file tools use before reading the bytes, so an
+`@../../secret.png` that escapes `sandbox_root` is skipped (non-fatal) rather than base64'd off-disk
+— the vision pipeline reads bytes directly and would otherwise bypass the executor's jail. `VISION_MODEL=llava:7b` in `.env` swaps the model with no code
+change. `tests/test_vision.py` covers all of it offline (fake `ChatOllama`, bytes in `tmp_path`).
 
 ### Tool-call loop (native function calling)
 
@@ -377,12 +485,20 @@ leaving it unset meant budgeting 8192 prompt tokens into a 4096 window and losin
 Verified in the request payload via `_chat_params(...)["options"]["num_ctx"]`. It must stay above
 `max_context_tokens` with headroom for the generated file; lower it on a RAM/VRAM-tight machine.
 `max_sibling_context_chars` (6000) is the TOTAL cap on already-written sibling files threaded into
-the next step of a multi-file build — see `_sibling_context`.
+the next step of a multi-file build — see `_sibling_context`. `extract_build_spec` (default on)
+allows the one extra pre-planning LLM call that distils the shared nav/design spec
+(`app/agent/buildspec.py`); turning it off reverts multi-file builds to the pre-spec behavior.
 `max_context_tokens` is the per-prompt token budget enforced by `app/agent/context_budget.py`
 (oldest history dropped first in `_build_messages`); `max_repair_attempts` caps the
 verify-and-repair loop; `backups_dir` / `max_write_backups` configure safe-write snapshots. RAG
 knobs: `embed_cache_dir` / `max_embed_cache_entries` (persistent embedding cache),
 `max_index_file_bytes` (indexer size cap), `max_read_file_bytes` (`read_file` truncation cap).
+Vision knobs: `vision_model` / `vision_enabled` (kill switch) / `vision_num_ctx` /
+`image_extensions` (what counts as an image `@`-ref) / `max_image_bytes` /
+`max_image_dimension` (long-edge px cap; the image is downscaled to this before
+the vision call — a byte cap does NOT bound resolution, and Ollama silently
+truncates to `vision_num_ctx`, so a high-res screenshot would otherwise be
+half-described; 0 disables. Best-effort via Pillow — see `vision._prepare_image`).
 
 **Observability (Step 9 / C2):** best-effort paths that used to `except Exception: pass` now log via
 a module-level `logging.getLogger(__name__)` (`retriever`, `core`, `vector_store`, `project_memory`)
@@ -397,7 +513,12 @@ The measuring stick for model/prompt changes. `evals/tasks.py` holds ~12 golden 
 cwd and scores the suite; the harness logic is unit-tested offline (`tests/test_evals.py`) with a
 scripted LLM. The **live** run is `python -m evals.run` (needs Ollama; NOT part of `pytest`) —
 `--keep DIR`, `--min SCORE`, `--only ids`. Run it before/after a model or prompt change: the first
-baseline (qwen2.5-coder:7b) was 10/12 and immediately caught a real multi-file routing bug.
+baseline (qwen2.5-coder:7b) was 10/12 and immediately caught a real multi-file routing bug; the
+suite is now 14 tasks and last measured **14/14**. Two lessons from using it: the planner runs at
+temperature 0.2, so **a single run proves nothing** — re-run a suspect task ~5x against a stashed
+baseline before calling a change a regression *or* a fix (a 3/3 baseline vs 1/3 was what exposed the
+`FILENAME:` spill); and `--keep DIR` is the fastest diagnosis, because the wrong content sitting
+inside the wrong file names the bug immediately.
 
 ## Gotchas
 

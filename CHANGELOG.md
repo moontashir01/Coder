@@ -7,6 +7,17 @@ All notable changes to Coder are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Screenshot-to-code** — `@`-reference an image (`build a website like this
+  @mockup.png`) and a local vision model (`qwen2.5vl:7b`) describes it into
+  structured text that feeds the normal code generation. No new command or
+  model switch, and no image ever reaches the coding model. Needs
+  `ollama pull qwen2.5vl:7b`; if the model is missing or the call fails, the
+  request falls back to text-only instead of failing. `VISION_ENABLED=false`
+  turns it off, `VISION_MODEL=` swaps the model. Oversized screenshots are
+  downscaled (long edge capped at `MAX_IMAGE_DIMENSION`, 1536px) before they
+  reach the model, so a high-res image isn't silently truncated to the vision
+  context window and half-described; the resize is best-effort (falls back to
+  the original bytes) and needs Pillow.
 - **Streaming file generation** — creating/rewriting a single file now streams
   the model's tokens live (previously only plain answers streamed).
 - **`/model` command** — show or switch the Ollama model at runtime (rebuilds
