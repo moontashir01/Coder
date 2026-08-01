@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+# SQLite database — recreated by db.init_db() and seed.py.
+*.db
+
+# Virtualenvs
+.venv/
+venv/
+
+# Local secrets
+.env
+
+# User uploads are data, not source. Keep the directory, drop its contents.
+static/uploads/*
+!static/uploads/.gitkeep

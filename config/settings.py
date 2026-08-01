@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     skills_dir: Path = _RESOURCES / "skills"
     prompts_dir: Path = _RESOURCES / "prompts"
     mcp_config: Path = _RESOURCES / "mcp_servers.json"
+    # Runnable project skeletons copied verbatim before any generation
+    # (app/agent/scaffold.py, docs/fullstack-web-plan.md Phase 1). Same rule as
+    # the paths above: resolved from the package, NEVER from cwd, so a
+    # pipx/wheel install ships them. pyproject's package-data glob
+    # (resources/**/*) already picks this tree up — no packaging change needed.
+    scaffolds_dir: Path = _RESOURCES / "scaffolds"
 
     # Per-project paths — relative on purpose (resolved against cwd) so state
     # is created in whatever project folder `coder` is launched from.
@@ -107,6 +113,15 @@ class Settings(BaseSettings):
     # Verify-and-repair: how many LLM repair passes to run when a just-written
     # file fails its syntax/structure check.
     max_repair_attempts: int = 2
+    # Intent check (app/agent/intent.py): after a file passes its SYNTAX check,
+    # spend one more LLM call asking "does this file do what the user asked
+    # for?" — the only point in the write path that sees the request and the
+    # result together. Complaints are filtered deterministically before any
+    # rewrite, and a rewrite that breaks the syntax check is reverted, so the
+    # worst case is a wasted call. Costs one call per file written (two if it
+    # repairs); set false to restore the syntax-only behaviour.
+    check_intent: bool = True
+    max_intent_repairs: int = 1
     # Cross-file reference repair: after a turn that wrote files, find local
     # references (<script src>, <link href>, CSS @import/url(), JS relative
     # imports) pointing at files that don't exist and create the missing TEXT
@@ -128,6 +143,54 @@ class Settings(BaseSettings):
     # call only happens when the request plausibly states something shared, and
     # what it returns is filtered against the user's own words.
     extract_build_spec: bool = True
+    # Requirements Blueprint (app/agent/blueprint.py, docs/requirements-blueprint.md):
+    # for a greenfield BUILD request ("build me a login page"), spend ONE extra
+    # LLM call up front to infer the WHOLE build — the implied features (tiered
+    # requested/core/optional), the full file list incl. a backend, and an API
+    # contract that makes the files line up — then hand that to _multi_file_flow.
+    # ON by default since the full-stack-web work (docs/fullstack-web-plan.md
+    # Phase 0): its eval suite holds 4/4 on qwen2.5-coder:7b, and every later
+    # phase (scaffold, ProjectSpec, amendments) reads the blueprint. It still
+    # deliberately *infers* work the user didn't spell out — the opposite of the
+    # rest of the pipeline — so set it False to get the literal-request behaviour
+    # back. Only fires when should_blueprint() matches (build verb + app/artifact
+    # noun, not a question/edit/split).
+    # NB tests default it OFF again (conftest.py::_no_blueprint): a bare
+    # "create an index.html" fixture matches should_blueprint(), and the stage
+    # would reach a real Ollama. Tests that want it opt back in explicitly.
+    expand_requirements: bool = True
+    # Build the 'optional' tier too (OAuth, 2FA, email delivery, …). Default off:
+    # optional features are reported, not silently built.
+    blueprint_optional_tier: bool = False
+    # Hard cap on how many files one blueprint build will create — bounds the
+    # 7B model's fan-out (cost/latency + coherence, weaknesses.md #6/#8).
+    # Raised 12 -> 24 in Phase 1: the scaffold now owns ~13 boilerplate files, so
+    # the GENERATED set is smaller, but a full e-commerce plan still clears 12
+    # easily and was being silently truncated — `_run_blueprint` and
+    # `_verify_blueprint_coverage` applied the SAME slice, so the coverage check
+    # could not see the files the cap had already dropped. The slice now reports
+    # what it drops (`may not meet:`), per the "never claim a pass you didn't
+    # get" rule: a cap that reports is a budget, a cap that hides is a bug.
+    blueprint_max_files: int = 24
+    # After a blueprint build, verify the WHOLE request shipped (weaknesses.md #3):
+    # every planned file exists (create the missing ones) and every declared
+    # endpoint is defined in a backend file (reported if not). Inert unless a
+    # blueprint actually ran this turn, so it costs nothing on ordinary turns.
+    check_blueprint_coverage: bool = True
+    # Phase 3: after a blueprint build, actually START the generated backend and
+    # probe it — the only check that proves the server RUNS, not just parses
+    # (weaknesses.md #2's last-open item). Runs with a hard timeout and kills the
+    # process tree afterwards. On a startup crash it can feed the traceback back
+    # for up to max_smoke_repairs regeneration passes.
+    # ON by default since docs/fullstack-web-plan.md Phase 0: "it starts" is the
+    # cheapest honest signal that a generated backend works, and the later phases
+    # build a functional probe on top of it. It still EXECUTES model-generated
+    # code — set False to disable. Inert unless a blueprint ran this turn.
+    # NB tests default it OFF again (conftest.py::_no_blueprint) so no test ever
+    # spawns a subprocess server.
+    blueprint_smoke_test: bool = True
+    smoke_test_timeout: float = 8.0
+    max_smoke_repairs: int = 1
     retrieval_top_k: int = 5
     conversation_buffer_size: int = 20
     # U6: when history overflows max_context_tokens, summarize the dropped

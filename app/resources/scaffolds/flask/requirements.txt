@@ -1,0 +1,5 @@
+Flask>=3.0
+# Production WSGI server, used by the Procfile on the deploy host.
+# Skipped on Windows, where gunicorn cannot run (it imports fcntl) — locally you
+# always start the app with `python app.py`.
+gunicorn>=21.2; sys_platform != "win32"

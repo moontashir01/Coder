@@ -16,3 +16,9 @@ projects/
 dist/
 build/
 .pytest_cache/
+
+# Eval harness scratch output
+out/
+out2/
+out3/
+out_eval.log

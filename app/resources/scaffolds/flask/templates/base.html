@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}{{PROJECT_NAME}}{% endblock %}</title>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='css/style.css') }}"
+    />
+  </head>
+  <body>
+    <header class="site-header">
+      <!-- Plain URLs, not url_for(), on purpose. url_for('index') raises a
+           BuildError if that view is ever renamed or removed — and because it
+           lives in base.html, that error would break EVERY page, not just the
+           home page. A literal path degrades to one 404 instead. -->
+      <a class="brand" href="/">{{PROJECT_NAME}}</a>
+
+      <!-- THE ONLY navigation in this project. Every page extends this file,
+           so adding a link here adds it to every page at once. Never copy this
+           nav into a child template. -->
+      <nav class="site-nav">
+        {% block nav %}
+        <a href="/">Home</a>
+        {% endblock %}
+      </nav>
+    </header>
+
+    <main class="site-main">
+      {% block content %}{% endblock %}
+    </main>
+
+    <footer class="site-footer">
+      <p>{{PROJECT_NAME}}</p>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+  </body>
+</html>

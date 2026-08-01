@@ -29,7 +29,8 @@ python main.py --session work           # named conversation session (persists i
 pip install -e .                        # installable CLI: `coder` == `python main.py`
 coder --version                         # works without Ollama (eager typer callback)
 
-pytest tests/ -v                        # all tests (~28s, fully offline — no Ollama needed)
+pytest tests/ -v                        # all tests (~9 min, fully offline — no Ollama needed)
+                                        #   NB stop `ollama serve` first — see the timing gotcha
 pytest tests/test_tools.py -v           # one file
 pytest tests/test_agent.py -v -k executor   # one test by name
 
@@ -63,7 +64,11 @@ chat(msg)
 ```
 
 Every successful write in `_file_op_flow` / `_surgical_edit` then runs
-**`_verify_and_repair`**: `app/agent/verify.py:check_file()` checks the file two ways — a **syntax**
+**`_verify_and_repair`**, which is two stages: `_syntax_repair` (does it parse / is it the right
+kind of content) and then `_intent_repair` (is it what the user asked for). Both notes are joined
+into the answer line: `verified OK; intent OK`.
+
+**Stage 1 — `_syntax_repair`.** `app/agent/verify.py:check_file()` checks the file two ways — a **syntax**
 check (`.py` in-process `compile()`, `.js` `node --check`, `.ts` `tsc --noEmit`, `.html`/`.htm`
 tag-balance parser) **and** a tooling-free **content guard** that catches the *wrong kind* of
 content the local model sometimes emits: an HTML document dumped into a `.js`/`.ts`/`.css` file,
@@ -75,6 +80,43 @@ never "broken". On failure it feeds the error back for a complete-file regenerat
 `settings.max_repair_attempts`. Belt-and-suspenders: `_parse_file_output` also pre-trims stray prose
 outside an HTML document (`_trim_html_prose`) before the first write, so the common trailing-prose
 leak never reaches disk.
+
+**Stage 2 — `_intent_repair` (`app/agent/intent.py`).** Everything above judges **form**. Nothing
+judged **content**: a syntactically perfect contact form passed a request for a login form as
+`verified OK`, and a `median()` that returns the *mean* compiled cleanly and shipped (both
+reproduced live). The old repair prompt could not have caught either — it received the check error
+and the file, and **never the user's message**. This stage is the only point in the write path that
+sees the request and the result together. It runs after syntax (a file that doesn't parse is broken
+whatever it says, and judging one wastes a call on a file about to be rewritten), spends ONE
+temperature-0 call on `_llm_edit` asking for `PASS` or a `MISSING:` list, and regenerates the file
+with the unmet points named. Because the judge is the same 7B model that wrote the file, four rules
+stop it churning good files:
+- **Unparseable verdict = PASS.** `parse_verdict` resolves every ambiguity toward leaving the file
+  alone; so does an LLM error. Silence is the safe answer.
+- **Complaints are filtered deterministically** before any rewrite (`filter_complaints`, no second
+  call): hedged suggestions ("could also add a footer"), complaints about *other* files
+  (`_repair_dead_references` owns those — a rewrite of this file cannot fix them), and complaints
+  whose every content word is already in the file (the characteristic small-model false alarm: it
+  skims, then reports what it just read as absent). That last gate can swallow a real complaint
+  whose vocabulary happens to appear; the trade is deliberate.
+- **A rewrite that breaks `check_file` is reverted.** Intent repair can leave a file unimproved but
+  never leaves one broken — otherwise "add the missing feature" truncating the document would be a
+  net loss. The repair prompt also forbids removing or renaming existing content.
+- **It never claims a pass it didn't get:** unfixed requirements are reported as
+  `may not meet: …` rather than hidden.
+Gated by `settings.check_intent` (default on) + `max_intent_repairs` (1), and skipped for requests
+too short to judge against ("fix it" names no requirement, so a judge given one invents them).
+**Cost: one extra LLM call per file written** (two if it repairs) — that is the price of the check,
+and `check_intent=False` restores the old syntax-only behaviour exactly. Live-validated: caught and
+fixed a missing password field and the mean-instead-of-median function; 15/15 clean on
+already-satisfied files (no false alarms).
+
+> **`conftest.py` defaults `check_intent` OFF in tests** and `tests/test_intent.py` opts back in.
+> The stage sits inside `_verify_and_repair`, so it fires on every file-writing test and calls
+> `_llm_edit` — which most file-flow tests don't script. Left on, they reach a real `ChatOllama`
+> and the suite silently stops being offline (measured 374s → 611s, still all "passing"). If you add
+> a test that writes a file, you do not need to think about this; if you *want* the stage, set the
+> setting in the test.
 
 **Cross-file reference repair (closes the plan→verify loop, weaknesses.md #2/#3).** After a turn
 that wrote any files, `chat()` runs `_repair_dead_references(trace)`: it scans every file written
@@ -454,12 +496,247 @@ registered. `CoderREPL.run()` auto-loads servers from `settings.mcp_config`
 
 ### Bundled resources & packaging (Step 13 / D1)
 
-Prompts, skills, and the default MCP config live **inside the `app` package** at
-`app/resources/{prompts,skills,mcp_servers.json}`, declared as `package-data` in `pyproject.toml`.
+Prompts, skills, project scaffolds, and the default MCP config live **inside the `app` package** at
+`app/resources/{prompts,skills,scaffolds,mcp_servers.json}`, declared as `package-data` in `pyproject.toml`.
 So a non-editable **`pipx`/wheel install ships them** — `settings._RESOURCES` (= `<base>/app/resources`,
 where `<base>` is the config-dir parent, i.e. the repo root in editable installs and site-packages in
 a wheel) resolves them identically in both. `CODER_HOME` still overrides the base. Never load these
-from cwd or the repo layout — always via `settings.prompts_dir` / `skills_dir` / `mcp_config`.
+from cwd or the repo layout — always via `settings.prompts_dir` / `skills_dir` / `scaffolds_dir` /
+`mcp_config`. The `package-data` entry is a recursive glob (`resources/**/*`), so a new resource
+*directory* needs no `pyproject.toml` change — but that glob does **not** reliably include
+dotfiles, which is why `scaffolds/flask/` stores `.gitignore`/`.gitkeep` as `gitignore`/`gitkeep`
+and `scaffold.py` restores the dot on the way out.
+
+### Deterministic project scaffold (`app/agent/scaffold.py`)
+
+The highest-leverage rule in `docs/fullstack-web-plan.md`: **deterministic beats generated.** Before
+a blueprint build generates anything, `_run_blueprint` copies a real, runnable Flask skeleton
+(`app.py` / `db.py` / `models.py` / `seed.py` / `templates/base.html` + `index.html` / `static/` /
+`requirements.txt` / `Procfile` / `.gitignore`) into the project — no LLM call, so no failure mode.
+The app therefore **starts and serves `/` with a 200 before the model has written a line**. This
+exists because the Phase 0 baseline measured the 7B model getting hand-written Flask *boilerplate*
+wrong ~1 build in 4 (`routes.py` using `@app.route`/`sqlite3`/`DATABASE` without importing any of
+them — `docs/phase0-baseline.md`).
+
+Three properties are load-bearing:
+- **It never overwrites.** Re-running is a no-op, so an amendment turn cannot revert turn 1's work.
+- **Only `_FROZEN` files are dropped from the build plan** (`requirements.txt`, `Procfile`,
+  `.gitignore`, `.gitkeep`). Everything else the scaffold wrote stays planned and gets **edited** on
+  top of the working skeleton — `_file_op_flow` routes an existing file to `_surgical_edit`, so the
+  model adds this project's routes to a running `app.py`. Freezing them all would ship the
+  placeholder home page as the finished site.
+- **Placeholder substitution is exact-literal**, not a template engine: `{{PROJECT_NAME}}` /
+  `{{SECRET_KEY}}` share Jinja's delimiters, and `{{ url_for(...) }}` must survive into the
+  generated project untouched.
+
+Gated by `is_web_app(blueprint)` (a runnable backend **and** an endpoint or a page) plus
+`stack.backend == "flask"`, and best-effort — a scaffold failure costs nothing but today's behaviour.
+
+**Generation then breaks the skeleton, so `_restore_scaffold_invariants` puts it back** (end of
+`_run_blueprint`, deterministic, no LLM). A 7B model's SEARCH/REPLACE replaces the block it was
+asked to add to: measured on *every* live build, the edit to `app.py` deleted the scaffold's `/`
+route, leaving the finished site 404ing on its own home page. `restore_index_route` re-adds it —
+declining rather than guessing when the file isn't a recognisable Flask app, when `/` is still
+routed, or when `render_template` isn't imported (a synthesized route that raises `NameError` would
+be worse than the 404 it replaces). `convert_to_child_template` rewrites a page that shipped as a
+full `<html>` document into `{% extends "base.html" %}` + `{% block content %}`, dropping the
+`<header>`/`<nav>`/`<footer>` base.html already renders — leaving them renders *two* navbars, which
+is worse than the drift the layout exists to prevent. Related: `base.html` links home with a literal
+`/` rather than `url_for('index')` **on purpose** — a BuildError there fires on every page, so one
+deleted route would 500 the entire site instead of 404ing one page.
+
+### ProjectSpec — memory between turns (`app/agent/projectspec.py`)
+
+Phase 2 of `docs/fullstack-web-plan.md`, and the fix for its biggest gap: `chat()` resets
+`self._blueprint = None` every turn, so the endpoints/schema/features existed for exactly one turn.
+Turn 2 ("add an admin page") never saw turn 1's contract. `ProjectSpec` persists it to
+**`<project>/.coder/project.json`** — inside the project so it is inspectable, diffable in git, and
+travels with the folder. `chat()` reloads it into `self._spec` at the top of every turn (it is NOT
+reset like the blueprint); `_run_blueprint` saves it after a build; `/spec` prints it.
+
+**`entities` is the load-bearing part.** `ApiContract.data_schema` is free text
+(`"users(email TEXT PRIMARY KEY, …)"`), and free text cannot be diffed, so it cannot produce a
+migration. `parse_schema_line` turns it into structured fields, each stamped with the revision it
+arrived in — so `ddl()` emits `CREATE TABLE` for revision-1 fields and `migrations(since=n)` emits
+`ensure_column` calls for everything later. That split is what lets turn 3 add a column without
+dropping turn 1's data.
+
+Rules the rest of the code depends on:
+- **A corrupt `project.json` returns None, never raises**, and saving is best-effort — a spec that
+  won't save must never cost a turn whose files were written.
+- **`save()` writes directly** (tmp + `os.replace`), NOT via `executor.execute("write_file", …)`:
+  the spec is agent state, and routing it through the tool would hit the approval gate every turn
+  and push a backup into `.coder_backups/`, evicting the user's real undo history.
+- **`.coder/` is a dot-directory**, so the RAG indexer and `project_memory._scan_project` already
+  skip it. Deliberate — the spec must not be embedded and retrieved back as if it were source.
+- **The spec records what was BUILT, not merely what was planned.** `from_blueprint` takes `root`
+  and reads it: page routes come from the real `@app.route` → `render_template` pairs in `app.py`,
+  pages the blueprint never listed (the scaffold's own `index.html`) are picked up from real routes,
+  `base.html` is excluded via `is_layout_template` (it is the shell, not a page), and a declared
+  endpoint is dropped unless the backend really defines it. That last one matters: the context block
+  says *"routes that already exist — do not redefine"*, so listing an unbuilt route instructs the
+  model **not** to build it. Measured live — the blueprint declared `POST /api/login`, the coverage
+  check reported it unwired on the same turn, and the spec claimed it existed.
+- `to_context_block()` is budgeted to `CONTEXT_BUDGET_CHARS` (1200) and drops sections bottom-up, so
+  the schema — the part a migration depends on — is the last thing to go.
+
+### Demo surface: `/run`, `/spec`, `/plan` (`app/agent/apprunner.py`)
+
+Phase 6. `AppRunner` holds **one** long-lived generated-app process, owned by the session rather
+than a turn — the smoke test kills its subject within seconds by design, which is the wrong shape
+when someone wants a URL that keeps working while the next turn amends the project. `/run` starts
+it and prints `http://127.0.0.1:5000`; `/run restart` picks up a change; `/run stop` ends it.
+Never a pool: two copies fight over the port and over `app.db`. It reuses `smoke._kill_tree` and
+registers an `atexit` hook, so a crashed REPL cannot orphan something holding :5000 — and an app
+that starts but never answers is reported as such rather than given a URL that returns nothing.
+
+`/plan` gained an amendment preview (`AgentCore.preview_amendment`): with a spec loaded, a change
+request shows the delta, the new files, and a table of **existing** files that will be updated with
+the reason for each, before anything happens. Costs the same single delta call the real amendment
+would; falls back to the ordinary planner otherwise.
+
+`README.md` is rendered from the spec (`ProjectSpec.to_readme`) on every save, builds and
+amendments alike — real pages, routes and columns, plus `added in revision N` on later fields. The
+scaffold's generic README describes the *template*; by turn 3 a README documenting turn 1 is worse
+than none.
+
+### The functional probe — "it works", not "it started" (`app/agent/smoke.py`)
+
+Phase 5, closing Gap 3. `run_smoke_test(..., spec=…)` no longer just pings the server: it
+exercises it against its own contract. Every phase before this could report a passing smoke test
+on a broken app because **any HTTP status counted as alive** — Phase 1 announced
+`GET /posts/new -> 200` while every POST returned 500; Phase 4 counted `GET /api/login -> 404`
+as up. Three checks, and the third is the point:
+
+1. every page in the spec renders (2xx **and** a non-empty body);
+2. every write endpoint accepts a real submission — a genuine 1×1 PNG built from stdlib
+   `zlib`+`struct` (no Pillow) posted as real multipart, so the upload branch is actually taken;
+3. **the posted value comes back** — only this can fail on a build whose INSERT silently does
+   nothing. `tests/test_functional_probe.py::_SILENT_APP` is exactly that app: starts, answers,
+   returns 302, and adding a product does nothing.
+
+Details that are load-bearing:
+- **`spec=None` reproduces the old liveness behaviour exactly**, so existing callers are unaffected.
+- **Step 3 checks EVERY page, not just those whose `reads` names the entity.** `reads` is inferred
+  from blueprint prose and is routinely empty on the very listing page that matters — probing only
+  tagged pages produced a false failure for a row that had persisted. A false failure here is worse
+  than no check: `_smoke_repair_instruction` would send the model to rewrite working code.
+- **`server_error()` lifts the exception out of a 5xx**, so the repair prompt says
+  `POST /x -> 500 NameError: name 'Product' is not defined` instead of "POST failed". Generic error
+  pages return `""` rather than repeating the status.
+- `_request` retries once: the dev server occasionally resets a connection mid-probe, and
+  "no response" would discard a real named exception.
+- The repair loop now fires on functional failures too, not only startup crashes — startup still
+  takes priority, since a server that never came up makes the other checks meaningless.
+
+### The data layer is generated, not prompted (`app/agent/crud.py`)
+
+Phase 4a/4d. `db.py`'s `CREATE TABLE`s, `models.py` and `seed.py` are written **before any
+generation** from the blueprint's declared schema, and dropped from the plan. They contain no
+decisions — the table *is* the fields, the query *is* the table, the demo row *is* the field types
+— and leaving them to a 7B model produced, on live builds, an `init_db()` with no `CREATE TABLE`
+at all and an `app.py` calling `models.get_all_posts` against a `models.py` defining only
+`add_post`. Phase 2's structured entities are what make this possible.
+
+Two properties then hold **by construction**, not by inspection: SQL injection is impossible
+(values bound as `?`; identifiers come from `projectspec._ident`, which admits only
+`[A-Za-z_][A-Za-z0-9_]*`), and the column lists cannot drift from the tables (both printed from the
+same `Entity`). `tests/test_crud.py` executes the generated SQL against real in-memory sqlite3.
+
+Three rules that are easy to get wrong, each learned from a live regression:
+- **`api_context()` is not optional.** Taking `models.py` away from the model is only safe if the
+  model is told what replaced it — otherwise it invents an API and the app dies at import
+  (`from models import get_user_by_email, get_all_products, User, Product`). It is threaded into
+  `_run_blueprint`'s `extra_context` beside the scaffold and contract blocks.
+- **Idempotency checks must read string literals, never raw text.** `_creates_table` scanning raw
+  text made the scaffold's *commented* `CREATE TABLE ... products` example count as a real table,
+  so the real one was skipped. Same trap as the `ensure_column` example in Phase 3. Use
+  `pyimports.searchable_sql`, which is shared by `missing_tables`, `entities_from_sql` and
+  `_creates_table` for exactly this reason — and require an actual SQL statement keyword, or prose
+  like "printed **from the** same definition" reports a table called `the`.
+- **`seed.py` is RUN, once, after the build** (`core._seed_demo_data`). 4d's promise is that no page
+  starts empty, and a seed script guarded by `if __name__ == "__main__"` that nobody executes does
+  not keep it. This is a deliberate exception to "never execute generated code": `seed.py` and the
+  schema are written by `crud.py`, not by the model. Short timeout, failure reported not raised.
+
+Uploads (4b): `crud.upload_helper_source()` emits a `save_upload()` with an extension **allowlist**,
+`secure_filename`, a jail to `UPLOAD_DIR`, and collision-safe naming; `verify.fix_form_enctype`
+supplies the `enctype` a file input cannot work without. Auth (4c) was trimmed per the plan, keeping
+only `plaintext_password_writes` — a check on the CODE, deliberately never a prompt instruction,
+which caught a live `password_hash = request.form["password"]`.
+
+### The amendment flow — turn N changing turn 1's project (`app/agent/impact.py`)
+
+Phase 3. `should_amend(msg, spec_exists)` is the mirror of `should_blueprint()`: it fires on exactly
+the incremental verbs that gate rejects (add/update/change/remove/also/now) and **only when a
+ProjectSpec exists**, so without memory routing is completely unchanged. `chat()` consults it ahead
+of the blueprint gate; a greenfield "build me a blog" has no incremental verb and still blueprints.
+
+`_amend_project` is five steps: **delta** (one temp-0 call against `prompts/amend.md`, given the
+spec's context block) → **impact** (`impacted_files`, no LLM) → **apply** → **persist**
+(`merge_delta`, revision bump, history) → **verify**.
+
+- **The model is asked only what CHANGED, never which files to edit.** "What else does this break?"
+  is the question a 7B model answers worst — it lists `app.py` and stops. `impact.py` derives it
+  from the spec: a new field on `product` means `db.py`, `models.py`, `seed.py`, every template
+  whose `reads` include the entity, every form template that writes it, and `app.py`.
+- **One reason = one edit.** Reasons for the same file are NOT merged. Measured live: `app.py` got
+  three reasons at once and the model did only the first, so `POST /admin/products` was silently
+  never written. `_file_op_flow` re-reads the file per call, so sequential surgical edits compose;
+  a file's edits are kept adjacent so each runs against what the previous one wrote.
+- **`db.py` is never handed to the model.** Its migration comes from `spec.migrations(since=…)` via
+  `apply_migration_block`, which inserts before `conn.commit()` and declines rather than guessing on
+  an unrecognisable file. A migration is exactly derivable from `added_in`; letting a 7B model write
+  `ALTER TABLE` against live data is risk with no upside.
+- **Regression detection (`vanished_routes` / `restore_page_routes`).** The amendment's own edit to
+  `app.py` deleted turn 1's `/products` route on a live run — the file compiled, the new route
+  worked, the turn reported success. Only the spec could see it, because it records which routes
+  existed *and at which revision*. A deleted GET page route is restored exactly (its body is just
+  `render_template`); a deleted POST handler is reported, never invented — that body is domain logic.
+  Routes added *this* turn are excluded: unwritten ≠ regressed, and that's the coverage check's job.
+- **`self._blueprint = _blueprint_from_spec(spec)` at the end is load-bearing.** `chat()` gates BOTH
+  the coverage check and the smoke test on that attribute and clears it every turn, so an amendment
+  that skipped this would be the only kind of turn never verified and never run — invisibly, since
+  it still reports success. `tests/test_amend.py` pins it.
+
+**Upload forms (`verify.fix_form_enctype`).** A `<form>` with `<input type="file">` and no
+`enctype="multipart/form-data"` posts only the filename, so `request.files[...]` raises and the
+upload silently never happens — invisible to every other check, because the HTML is valid and the
+page renders. Deterministic and purely additive; runs in `_verify_and_repair` alongside the other
+stage-0 fixes.
+
+**Runtime defects `compile()` cannot see (`app/agent/pyimports.py`).** `check_file` compiles a
+`.py`, so it catches `SyntaxError` and is blind to `NameError`/`AttributeError` — which only fire
+when the line runs. That blind spot is how a generated app ships `verified OK` and then 500s, and it
+was measured on every live build. Four deterministic checks, one repair and three report-only:
+- **`add_missing_imports` (repairs).** Names loaded but never bound anywhere in the module get their
+  import added — **allowlist only**, so an unknown name is reported, never guessed, and `import
+  models` is added only when `models.py` exists. Binding is collected *flat* across the module
+  (deliberately over-approximating scope) so the error direction is always "do nothing", and the
+  result is re-parsed before being returned so the pass can't hand back a file it broke. Runs per
+  file, last in `_verify_and_repair`, because an intent rewrite can reintroduce the names.
+- **`unresolved_local_calls`, `missing_tables`, `duplicate_definitions` (report only).** A call into
+  a sibling module that the sibling never defines; SQL against a table nothing creates; a top-level
+  def written twice (the later silently wins). These run **once at the end of the turn**
+  (`_check_cross_module_calls`), never per file — `app.py` is written before `models.py` is
+  regenerated, so a per-file check reported `models.add_post` missing while the next file in the
+  same build defined it. Fixing them means inventing a query or a schema, which is generation, not
+  repair; the structured entity list that would make it deterministic is Phase 2's `ProjectSpec`.
+- `missing_tables` scans **string literals only** (via `ast`), not raw source: `from flask import
+  Flask` otherwise matches its `FROM <table>` pattern. A pleasant side effect is that the scaffold's
+  *commented* `CREATE TABLE` example correctly doesn't count as creating a table.
+
+**Generated sites are kept offline too.** Coder is offline; the sites it generated were not.
+`buildspec.py` used to instruct the model to load Google Fonts with a `<link>` in every page, and
+`references.py` deliberately ignores external URLs, so nothing stripped it — offline that means a
+dead DNS lookup per page and then the wrong font, or for a CDN stylesheet a completely unstyled
+page. Two guards: `BuildSpec.to_context_block(allow_network=...)` emits **system font stacks**
+(keeping each preset's display/body pairing) instead of a Google Fonts link when the network is off,
+and `_verify_and_repair` runs `verify.strip_external_assets` as a deterministic stage 0, removing
+`<link href="http…">` / `<script src="http…">` / CSS `@import` of a URL and reporting it in the
+answer. `<a href="https://…">` is never touched — a hyperlink is not a render dependency.
+`to_context_block` **defaults to the offline branch** so a caller that forgets the argument cannot
+ship a dead CDN dependency.
 
 ### Skills (`app/resources/skills/`)
 
@@ -488,6 +765,12 @@ Verified in the request payload via `_chat_params(...)["options"]["num_ctx"]`. I
 the next step of a multi-file build — see `_sibling_context`. `extract_build_spec` (default on)
 allows the one extra pre-planning LLM call that distils the shared nav/design spec
 (`app/agent/buildspec.py`); turning it off reverts multi-file builds to the pre-spec behavior.
+Full-stack web knobs (`docs/fullstack-web-plan.md`): `expand_requirements` and
+`blueprint_smoke_test` both ship **on** (Phase 0); `scaffolds_dir` locates the runnable project
+skeletons; `blueprint_max_files` (24) caps one build's fan-out and now **reports** what it drops as
+`may not meet:` rather than truncating silently — `_run_blueprint` and `_verify_blueprint_coverage`
+apply the same slice, so a hidden truncation was invisible to the check that exists to catch missing
+files. `allow_network` additionally decides whether generated pages may reference CDN fonts/scripts.
 `max_context_tokens` is the per-prompt token budget enforced by `app/agent/context_budget.py`
 (oldest history dropped first in `_build_messages`); `max_repair_attempts` caps the
 verify-and-repair loop; `backups_dir` / `max_write_backups` configure safe-write snapshots. RAG
@@ -504,6 +787,31 @@ half-described; 0 disables. Best-effort via Pillow — see `vision._prepare_imag
 a module-level `logging.getLogger(__name__)` (`retriever`, `core`, `vector_store`, `project_memory`)
 at `debug`/`warning` — behavior is unchanged (still best-effort) but failures are visible. There's
 no global logging config; if one is added later, route these through it.
+
+### Multi-turn webapp evals (Phase 7)
+
+`python -m evals.run --webapp` runs the demo turn for turn. `EvalTask` gained
+`prompts: list[str]` alongside `prompt`, and `run_task` runs a whole **conversation** against ONE
+workdir with ONE `AgentCore`, checking only after the last turn. The shared agent is not an
+optimisation — a fresh one per turn would reload the spec from disk and mask exactly the in-memory
+staleness the suite exists to catch. A turn that raises stops the conversation; `prompt` still works
+so every single-turn task is untouched.
+
+The checks assert the app WORKS, not that plausibly-named files appeared:
+- **`db_has_column` asks the database, not the source.** A `CREATE TABLE` in a file nobody executes
+  proves nothing — Phase 1 and Phase 4 both shipped builds that would pass a source-level check and
+  fail this one.
+- **`post_persists`** POSTs and then requires the value to come back. A handler that answers 302 and
+  never writes passes everything else and fails this.
+- **`earlier_pages_still_work` is the headline number.** Not "did turn 3 work" but *"did turn 3
+  break turn 1"* — the regression Phase 3 caught live, where an amendment deleted turn 1's
+  `/products` route while reporting success.
+
+`--webapp` turns `blueprint_smoke_test` off: the checks start the app themselves and the two would
+fight for port 5000. Expect a lower score than `--blueprint` — it asks harder questions, and the
+earlier suites were reporting passes while builds were visibly broken (Phase 0's 4/4 coexisted with
+one of four apps not starting). A suite that scores 100% on a broken app is worse than one that
+scores 50% honestly.
 
 ### Eval harness (`evals/`)
 
@@ -540,6 +848,13 @@ inside the wrong file names the bug immediately.
   this by importing the modules in a subprocess and asserting no state files appear. Do not
   reintroduce eager `X = VectorStore()`-style module singletons. (`.coder.db` is still created lazily
   by the async SQLAlchemy layer on first DB use, not at import.)
+- **Suite wall-clock depends on whether Ollama holds a model, not on the tests.** Measured on the
+  same 47 tests, same code: **171s with `qwen2.5-coder:7b` resident vs 46s with `ollama serve`
+  stopped** — 3.7x. The tests never call it (see the offline rule below); the resident model just
+  starves the machine of memory while ~70 tests each construct an `AgentCore` (~2.3s) plus ChromaDB
+  and the embedder. So **time the suite with Ollama stopped**, or a warm model will look exactly
+  like a performance regression in whatever you just changed. The ~9 min figure above is the
+  Ollama-stopped number for 661 tests.
 - **Blocked-command matching** (`_is_blocked`): bare executable names (`format`, `mkfs`) match only
   the *invoked* command (first token), while multi-token/path patterns (`rm -rf /`, `dd if=/dev/zero`)
   substring-match anywhere. Don't revert to plain substring matching — it falsely blocks args like

@@ -61,6 +61,23 @@ _EXTERNAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A value carrying a TEMPLATE EXPRESSION is not a path — it is computed at
+# render time, and the literal text never names a file. Server-rendered
+# templates arrived with the Flask scaffold (Phase 1), and without this guard
+# `href="{{ url_for('static', filename='css/style.css') }}"` was read as a
+# relative path: the reference check reported a missing asset that exists, and
+# `_repair_page_links` would "fix" an extensionless link by rewriting it to
+# `{{ url_for('posts') }}.html` — corrupting a working template.
+# Covers Jinja/Django (`{{ }}`, `{% %}`), Handlebars/Mustache, ERB/EJS (`<% %>`),
+# PHP (`<?= ?>`) and JS template literals (`${ }`).
+_TEMPLATE_EXPR_RE = re.compile(r"\{\{|\{%|<%|<\?|\$\{")
+
+
+def is_template_expression(value: str) -> bool:
+    """True when a reference value is computed by a template engine."""
+    return bool(_TEMPLATE_EXPR_RE.search(value or ""))
+
+
 # Text files we can meaningfully generate to satisfy a dead reference.
 _CREATABLE_EXTS = {
     ".css",
@@ -139,7 +156,9 @@ def _normalize_target(href: str) -> str:
     raw = (href or "").strip()
     if not raw:
         return ""
-    if _EXTERNAL_RE.match(raw):
+    if _EXTERNAL_RE.match(raw) or is_template_expression(raw):
+        # Not a file: compare it as an opaque string so two pages using the
+        # same `{{ url_for(...) }}` still count as having the same nav.
         return raw.lower()
     target = raw.split("#", 1)[0].split("?", 1)[0].strip().lstrip("/\\")
     if not target:
@@ -335,7 +354,12 @@ def find_broken_page_links(
         if m.group("tag").lower() != "a":
             continue
         raw = (m.group("val") or "").strip()
-        if not raw or raw in seen or _EXTERNAL_RE.match(raw):
+        if (
+            not raw
+            or raw in seen
+            or _EXTERNAL_RE.match(raw)
+            or is_template_expression(raw)
+        ):
             continue
         target = raw.split("#", 1)[0].split("?", 1)[0].strip()
         if not target:
@@ -377,7 +401,7 @@ def _clean_ref(val: str) -> str | None:
     """Normalize a raw attribute/import value to a local relative path, or None
     if it isn't a local reference (external, anchor, root-absolute, empty)."""
     v = (val or "").strip()
-    if not v or _EXTERNAL_RE.match(v):
+    if not v or _EXTERNAL_RE.match(v) or is_template_expression(v):
         return None
     if v.startswith("/") or v.startswith("\\"):
         return None  # root-absolute: web root is unknown, don't guess

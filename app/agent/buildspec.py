@@ -47,13 +47,30 @@ _SPEC_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Font stacks that need NO network. Coder itself is offline, but the sites it
+# generates were not: every styled build shipped a hard dependency on
+# fonts.googleapis.com, and with no connection the browser blocks on a dead DNS
+# lookup per page and then falls back to a default — so the typography the build
+# spec chose is the one thing that never appears on screen. These are the
+# fallback, and they keep each preset's PAIRING INTENT (a display face for
+# headings, a readable one for body) rather than flattening everything to Arial.
+_SYS_SANS = 'ui-sans-serif, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif'
+_SYS_SERIF = 'ui-serif, Georgia, Cambria, "Times New Roman", Times, serif'
+_SYS_ROUNDED = 'ui-rounded, "SF Pro Rounded", "Segoe UI", system-ui, sans-serif'
+_SYS_SCRIPT = '"Segoe Script", "Snell Roundhand", "Brush Script MT", cursive'
+
+# Used when the request has style words but matches no preset.
+_DEFAULT_STACKS = (_SYS_SANS, _SYS_SANS)
+
 # Style words we can translate without the LLM's help. Order matters: the first
 # preset whose pattern matches supplies any field the LLM left empty.
+# "stacks" is the offline mirror of "fonts": (heading, body).
 _STYLE_PRESETS: list[tuple[re.Pattern[str], dict]] = [
     (
         re.compile(r"\b(pastel|soft|gentle|delicate|dreamy)\b", re.I),
         {
             "fonts": ("Playfair Display", "Lato"),
+            "stacks": (_SYS_SERIF, _SYS_SANS),
             "palette": ("#f6e7ef", "#e8dff5", "#fceade", "#b28fa8", "#4a3f45"),
             "decorative": (
                 "soft rounded corners (12px), generous whitespace, subtle "
@@ -66,6 +83,7 @@ _STYLE_PRESETS: list[tuple[re.Pattern[str], dict]] = [
         re.compile(r"\b(script|cursive|calligraph\w*|handwritten|wedding)\b", re.I),
         {
             "fonts": ("Great Vibes", "Lato"),
+            "stacks": (_SYS_SCRIPT, _SYS_SANS),
             "palette": ("#fdf6f0", "#f3e0d5", "#e8c4b8", "#a9746e", "#3f3538"),
             "decorative": (
                 "script font for h1/h2 at a large size, letter-spaced small-caps "
@@ -77,6 +95,7 @@ _STYLE_PRESETS: list[tuple[re.Pattern[str], dict]] = [
         re.compile(r"\b(floral|botanical|garden|nature|leafy)\b", re.I),
         {
             "fonts": ("Cormorant Garamond", "Lato"),
+            "stacks": (_SYS_SERIF, _SYS_SANS),
             "palette": ("#f7faf5", "#e3efdc", "#c7ddbc", "#7a9a72", "#33402f"),
             "decorative": (
                 "CSS-only floral accents — pseudo-element flourishes (::before/"
@@ -89,6 +108,7 @@ _STYLE_PRESETS: list[tuple[re.Pattern[str], dict]] = [
         re.compile(r"\b(dark\s?mode|dark\s+theme|midnight|nocturnal)\b", re.I),
         {
             "fonts": ("Inter", "Inter"),
+            "stacks": (_SYS_SANS, _SYS_SANS),
             "palette": ("#0f1115", "#1a1d24", "#272b34", "#8ab4f8", "#e8eaed"),
             "decorative": (
                 "dark surfaces with a single bright accent, 1px subtle borders "
@@ -100,6 +120,7 @@ _STYLE_PRESETS: list[tuple[re.Pattern[str], dict]] = [
         re.compile(r"\b(retro|vintage|nostalgic|70s|80s)\b", re.I),
         {
             "fonts": ("Righteous", "Karla"),
+            "stacks": (_SYS_ROUNDED, _SYS_SANS),
             "palette": ("#fdf0d5", "#f4a259", "#bc4b51", "#5b8e7d", "#2e2b28"),
             "decorative": "thick borders, blocky shadows, warm saturated fills",
         },
@@ -108,6 +129,7 @@ _STYLE_PRESETS: list[tuple[re.Pattern[str], dict]] = [
         re.compile(r"\b(playful|fun|vibrant|bold|colou?rful|energetic)\b", re.I),
         {
             "fonts": ("Poppins", "Nunito"),
+            "stacks": (_SYS_ROUNDED, _SYS_SANS),
             "palette": ("#fff8f0", "#ffd166", "#ef476f", "#06d6a0", "#22223b"),
             "decorative": "large rounded shapes, bright accents, chunky buttons",
         },
@@ -116,6 +138,7 @@ _STYLE_PRESETS: list[tuple[re.Pattern[str], dict]] = [
         re.compile(r"\b(elegant|luxur\w*|sophisticated|refined|classy)\b", re.I),
         {
             "fonts": ("Playfair Display", "Source Sans 3"),
+            "stacks": (_SYS_SERIF, _SYS_SANS),
             "palette": ("#faf7f2", "#efe6d9", "#c8b08b", "#7a6a52", "#2b2620"),
             "decorative": (
                 "wide letter-spacing on headings, thin hairline rules, muted "
@@ -127,6 +150,7 @@ _STYLE_PRESETS: list[tuple[re.Pattern[str], dict]] = [
         re.compile(r"\b(minimal\w*|clean|simple|understated)\b", re.I),
         {
             "fonts": ("Inter", "Inter"),
+            "stacks": (_SYS_SANS, _SYS_SANS),
             "palette": ("#ffffff", "#f4f4f5", "#e4e4e7", "#18181b", "#71717a"),
             "decorative": "flat surfaces, no shadows, one accent colour, strong grid",
         },
@@ -135,6 +159,7 @@ _STYLE_PRESETS: list[tuple[re.Pattern[str], dict]] = [
         re.compile(r"\b(modern|sleek|contemporary|startup|tech)\b", re.I),
         {
             "fonts": ("Inter", "Inter"),
+            "stacks": (_SYS_SANS, _SYS_SANS),
             "palette": ("#ffffff", "#f8fafc", "#e2e8f0", "#2563eb", "#0f172a"),
             "decorative": "8px radii, soft shadows, blue accent, system-ui spacing scale",
         },
@@ -205,6 +230,10 @@ class BuildSpec:
     nav: tuple[tuple[str, str], ...] = ()  # (label, target filename)
     style_keywords: tuple[str, ...] = ()
     fonts: tuple[str, ...] = ()
+    # Offline mirror of `fonts`: (heading stack, body stack) using only families
+    # already on the machine. Emitted instead of a Google Fonts <link> when
+    # there is no network — see `to_context_block`.
+    font_stacks: tuple[str, ...] = ()
     palette: tuple[str, ...] = ()
     decorative: str = ""
     behaviors: tuple[str, ...] = ()
@@ -225,11 +254,25 @@ class BuildSpec:
     def nav_files(self) -> tuple[str, ...]:
         return tuple(target for _, target in self.nav)
 
-    def to_context_block(self) -> str:
+    def stacks(self) -> tuple[str, str]:
+        """(heading, body) system font stacks — always a usable pair."""
+        if len(self.font_stacks) >= 2:
+            return self.font_stacks[0], self.font_stacks[1]
+        if len(self.font_stacks) == 1:
+            return self.font_stacks[0], self.font_stacks[0]
+        return _DEFAULT_STACKS
+
+    def to_context_block(self, allow_network: bool = False) -> str:
         """The block injected into the planner and every per-file generation.
 
         Compact by construction — it rides in the same prompt as the plan
         manifest and the sibling context, inside `llm_num_ctx`.
+
+        ``allow_network`` mirrors `settings.allow_network` and decides how the
+        typography is expressed: real Google Fonts with a `<link>` when the
+        generated site can reach the internet, system font stacks when it
+        cannot. It defaults to **False** — the offline-safe branch — so a caller
+        that forgets to pass it cannot accidentally ship a dead CDN dependency.
         """
         if self.is_empty():
             return ""
@@ -254,11 +297,23 @@ class BuildSpec:
         if self.fonts:
             heading = self.fonts[0]
             body = self.fonts[1] if len(self.fonts) > 1 else self.fonts[0]
-            design.append(
-                f"Fonts: '{heading}' for headings, '{body}' for body text. Load them "
-                "from Google Fonts with a <link> in every page's <head> and set them "
-                "in font-family (with a generic fallback)."
-            )
+            if allow_network:
+                design.append(
+                    f"Fonts: '{heading}' for headings, '{body}' for body text. Load "
+                    "them from Google Fonts with a <link> in every page's <head> and "
+                    "set them in font-family (with a generic fallback)."
+                )
+            else:
+                h_stack, b_stack = self.stacks()
+                design.append(
+                    "Fonts: this machine has NO network, so do NOT link Google "
+                    "Fonts or any CDN — the request would hang and then fall back "
+                    "to a default anyway, losing the styling entirely. Use these "
+                    "system stacks, declared ONCE as CSS variables and referenced "
+                    "as var(--font-heading) / var(--font-body) everywhere:\n"
+                    f"  --font-heading: {h_stack};\n"
+                    f"  --font-body: {b_stack};"
+                )
         if self.palette:
             design.append(
                 "Colour palette — use these EXACT hex values, do not substitute "
@@ -457,6 +512,7 @@ def build_spec_from_data(data: dict | None, message: str) -> BuildSpec:
     # them, so "style_keywords" can never smuggle in a style nobody asked for.
     keywords = find_style_keywords(message)
     fonts: tuple[str, ...] = ()
+    font_stacks: tuple[str, ...] = ()
     palette: tuple[str, ...] = ()
     decorative = ""
     if keywords:
@@ -472,11 +528,18 @@ def build_spec_from_data(data: dict | None, message: str) -> BuildSpec:
             fonts = fonts or tuple(preset["fonts"])
             palette = palette or tuple(preset["palette"])
             decorative = decorative or preset["decorative"]
+        # The offline pair always comes from the preset, never from the model:
+        # a Google Font name the LLM picked says nothing about which families
+        # this machine actually has installed.
+        font_stacks = tuple(preset.get("stacks", _DEFAULT_STACKS)) if preset else ()
+        if fonts and not font_stacks:
+            font_stacks = _DEFAULT_STACKS
 
     return BuildSpec(
         nav=nav,
         style_keywords=keywords,
         fonts=fonts,
+        font_stacks=font_stacks,
         palette=palette,
         decorative=decorative,
         behaviors=behaviors,

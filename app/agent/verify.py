@@ -60,6 +60,116 @@ _HTML_DOC_START_RE = re.compile(
 
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+# --- external assets (offline builds) --------------------------------------
+# Coder is offline, but the sites it GENERATES were not: a Google Fonts <link>
+# or a Tailwind/Bootstrap CDN <script> makes the page depend on a network that
+# isn't there. Offline the browser blocks on a dead DNS lookup and then renders
+# with default fonts — or, for a CDN stylesheet, completely unstyled. Both are
+# invisible to every other check: the file parses, the reference passes (
+# `references.py` deliberately ignores external URLs), and it ships.
+#
+# Matches absolute (`https://…`) and protocol-relative (`//cdn…`) URLs only, so
+# a local `href="css/style.css"` is untouched. `<a href>` is NOT matched — a
+# hyperlink to a real website is legitimate and must stay.
+_EXTERNAL_URL = r"""["'](?:https?:)?//[^"']+["']"""
+_EXTERNAL_LINK_RE = re.compile(
+    r"<link\b[^>]*?\bhref\s*=\s*" + _EXTERNAL_URL + r"[^>]*>",
+    re.IGNORECASE,
+)
+_EXTERNAL_SCRIPT_RE = re.compile(
+    r"<script\b[^>]*?\bsrc\s*=\s*" + _EXTERNAL_URL + r"[^>]*>\s*(?:</script\s*>)?",
+    re.IGNORECASE,
+)
+_EXTERNAL_CSS_IMPORT_RE = re.compile(
+    r"@import\s+(?:url\(\s*)?['\"]?(?:https?:)?//[^'\")\s;]+['\"]?\s*\)?\s*;?",
+    re.IGNORECASE,
+)
+
+
+# A <form> containing a file input MUST carry enctype="multipart/form-data".
+# Without it the browser posts only the filename, so `request.files[...]` raises
+# and the upload silently never happens — the plan calls this "the single most
+# likely way the live demo embarrasses you" (Phase 4b). Deterministic to detect
+# and to fix, so neither is left to the model.
+_FORM_RE = re.compile(r"<form\b[^>]*>.*?</form\s*>", re.IGNORECASE | re.DOTALL)
+_FORM_OPEN_RE = re.compile(r"<form\b[^>]*>", re.IGNORECASE)
+_FILE_INPUT_RE = re.compile(r"<input\b[^>]*\btype\s*=\s*[\"']file[\"']", re.IGNORECASE)
+_ENCTYPE_RE = re.compile(r"\benctype\s*=", re.IGNORECASE)
+_METHOD_POST_RE = re.compile(r"\bmethod\s*=\s*[\"']post[\"']", re.IGNORECASE)
+
+
+def forms_missing_enctype(text: str) -> list[str]:
+    """Opening <form> tags that take a file upload but never declare enctype."""
+    out: list[str] = []
+    for form in _FORM_RE.finditer(text or ""):
+        block = form.group(0)
+        if not _FILE_INPUT_RE.search(block):
+            continue
+        open_tag = _FORM_OPEN_RE.match(block)
+        if open_tag and not _ENCTYPE_RE.search(open_tag.group(0)):
+            out.append(open_tag.group(0))
+    return out
+
+
+def fix_form_enctype(text: str) -> tuple[str, int]:
+    """Add the missing `enctype` (and `method="post"`) to file-upload forms.
+
+    Returns ``(new_text, how_many_fixed)``. Purely additive — no existing
+    attribute is touched — so it cannot change a form that was already correct.
+    """
+    broken = forms_missing_enctype(text)
+    if not broken:
+        return text, 0
+    out = text
+    for open_tag in broken:
+        addition = ' enctype="multipart/form-data"'
+        if not _METHOD_POST_RE.search(open_tag):
+            addition = ' method="post"' + addition
+        fixed = open_tag[:-1].rstrip() + addition + ">"
+        out = out.replace(open_tag, fixed, 1)
+    return out, len(broken)
+
+
+def find_external_assets(text: str, suffix: str) -> list[str]:
+    """Render-blocking off-machine assets in a generated file.
+
+    Returns the matched tags/at-rules (trimmed), or [] when clean.
+    """
+    out: list[str] = []
+    if suffix in (".html", ".htm"):
+        for pattern in (_EXTERNAL_LINK_RE, _EXTERNAL_SCRIPT_RE):
+            out.extend(m.group(0).strip() for m in pattern.finditer(text or ""))
+    elif suffix in (".css", ".scss", ".less"):
+        out.extend(
+            m.group(0).strip() for m in _EXTERNAL_CSS_IMPORT_RE.finditer(text or "")
+        )
+    return out
+
+
+def strip_external_assets(text: str, suffix: str) -> tuple[str, list[str]]:
+    """Remove those assets. Returns (new_text, what_was_removed).
+
+    Deterministic — no LLM, same shape as the other content guards. Removing a
+    dead <link>/<script> cannot break a page: the resource was never going to
+    load. The styling intent survives because the build spec states the font as
+    a system stack (see buildspec.to_context_block) rather than a CDN family.
+    """
+    removed = find_external_assets(text, suffix)
+    if not removed:
+        return text, []
+    out = text
+    if suffix in (".html", ".htm"):
+        out = _EXTERNAL_LINK_RE.sub("", out)
+        out = _EXTERNAL_SCRIPT_RE.sub("", out)
+    elif suffix in (".css", ".scss", ".less"):
+        out = _EXTERNAL_CSS_IMPORT_RE.sub("", out)
+    # Collapse the blank lines the removal leaves behind.
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out, removed
+
+
 # An at-rule is CSS structure even without a `{ ... }` block (e.g. @import).
 _CSS_ATRULE_RE = re.compile(
     r"@(?:import|charset|media|font-face|keyframes|supports|namespace|page|"
@@ -244,7 +354,9 @@ def _html_surrounding_prose(text: str) -> str:
     if anchor > 0:
         head = _HTML_COMMENT_RE.sub("", text[:anchor]).strip()
         if head:
-            return f"unexpected text before the document (looks like prose): {head[:80]!r}"
+            return (
+                f"unexpected text before the document (looks like prose): {head[:80]!r}"
+            )
     return ""
 
 

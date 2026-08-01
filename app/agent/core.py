@@ -1,12 +1,24 @@
+import asyncio
 import json
 import logging
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+from app.agent.blueprint import (
+    ApiContract,
+    Blueprint,
+    Endpoint,
+    PlannedFile,
+    blueprint_from_data,
+    should_amend,
+    should_blueprint,
+)
 from app.agent.buildspec import (
     SPEC_INSTRUCTIONS,
     BuildSpec,
@@ -14,8 +26,44 @@ from app.agent.buildspec import (
     mentions_shared_spec,
 )
 from app.agent.context_budget import render_transcript, split_history_at_budget
+from app.agent.crud import (
+    api_context,
+    apply_table_block,
+    models_source,
+    plaintext_password_writes,
+    seed_source,
+)
 from app.agent.executor import Executor
+from app.agent.impact import (
+    DB_FILE,
+    apply_migration_block,
+    describe,
+    impacted_files,
+    migration_block,
+    restore_page_routes,
+    vanished_routes,
+)
+from app.agent.intent import (
+    INTENT_JUDGE_SYSTEM,
+    build_judge_prompt,
+    build_repair_prompt,
+    filter_complaints,
+    parse_verdict,
+    should_check_intent,
+)
 from app.agent.planner import Planner, _extract_json
+from app.agent.projectspec import (
+    ProjectSpec,
+    SpecDelta,
+    delta_from_data,
+    parse_schema_line,
+)
+from app.agent.pyimports import (
+    add_missing_imports,
+    duplicate_definitions,
+    missing_tables,
+    unresolved_local_calls,
+)
 from app.agent.recovery import classify_error, recovery_hint
 from app.agent.references import (
     REF_SCANNED_EXTS,
@@ -29,8 +77,25 @@ from app.agent.references import (
     rewrite_reference,
     set_active_link,
 )
+from app.agent.runtime_probe import detect_stack
+from app.agent.scaffold import (
+    convert_to_child_template,
+    is_frozen,
+    is_web_app,
+    project_name,
+    restore_index_route,
+    scaffold_context,
+    scaffold_flask,
+    templates_without_inheritance,
+)
+from app.agent.smoke import run_smoke_test
 from app.agent.tool_registry import ToolRegistry, create_registry
-from app.agent.verify import check_file, is_verifiable
+from app.agent.verify import (
+    check_file,
+    fix_form_enctype,
+    is_verifiable,
+    strip_external_assets,
+)
 from app.agent.vision import _describe_image, is_image
 from app.memory.conversation import ConversationMemory
 from app.memory.project_memory import ProjectMemory, project_memory
@@ -85,6 +150,88 @@ def _load_system_prompt() -> str:
         return _SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
     except Exception:
         return "You are Coder, an expert offline AI coding assistant."
+
+
+_AMEND_PROMPT_PATH = settings.prompts_dir / "amend.md"
+
+
+def _existing_project_files(root: Path, limit: int = 400) -> set[str]:
+    """Repo-relative paths of the project's own files (posix, dot-dirs skipped).
+
+    Feeds `impact.impacted_files`, which must only ever propose editing a file
+    that is really there — anything else is a *new* file and belongs to the
+    create path.
+    """
+    out: set[str] = set()
+    try:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(root)
+            if any(part.startswith(".") or part == "__pycache__" for part in rel.parts):
+                continue
+            out.add(rel.as_posix())
+            if len(out) >= limit:
+                break
+    except Exception:
+        logger.debug("could not list project files under %s", root)
+    return out
+
+
+def _blueprint_from_spec(spec: ProjectSpec) -> Blueprint:
+    """A Blueprint view of the amended spec, so the post-turn checks fire.
+
+    `chat()`'s coverage check and smoke test are both gated on
+    `self._blueprint is not None`, and `chat()` clears it every turn. An
+    amendment that didn't set it would be the one kind of turn that is never
+    verified and never run — and the bug would be invisible, because the turn
+    still reports success. Rebuilding the type every downstream consumer already
+    understands is cheaper than widening both gates.
+    """
+    files = tuple(
+        PlannedFile(filename=name, action="edit", role=role)
+        for name, role in sorted(spec.files.items())
+    )
+    return Blueprint(
+        summary=spec.summary,
+        files=files,
+        contract=ApiContract(
+            endpoints=tuple(
+                Endpoint(e.method, e.path, e.request, e.response)
+                for e in spec.endpoints
+            ),
+            data_schema=tuple(e.summary() for e in spec.entities),
+        ),
+        stack=detect_stack(allow_network=settings.allow_network),
+    )
+
+
+def _load_amend_prompt() -> str:
+    """The amendment delta-extraction prompt (bundled resource, D1)."""
+    try:
+        return _AMEND_PROMPT_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return (
+            "You describe ONLY what changes about an existing project, as JSON "
+            'with keys "summary", "entities", "endpoints", "pages", '
+            '"new_files". Do not list existing files to edit. Output ONLY JSON.'
+        )
+
+
+_BLUEPRINT_PROMPT_PATH = settings.prompts_dir / "blueprint.md"
+
+
+def _load_blueprint_prompt() -> str:
+    """The Requirements Blueprint extraction prompt (bundled resource, D1)."""
+    try:
+        return _BLUEPRINT_PROMPT_PATH.read_text(encoding="utf-8")
+    except Exception:
+        # Minimal fallback so a missing resource degrades to "no expansion"
+        # rather than crashing the turn.
+        return (
+            "You expand a build request into a JSON blueprint with keys "
+            '"summary", "features", "files", "contract". Output ONLY JSON.'
+        )
 
 
 def _truncate_context(text: str, max_chars: int = 3000) -> str:
@@ -828,8 +975,16 @@ class AgentCore:
         self._llm_edit = get_llm(
             temperature=0.0, json_mode=False
         )  # format-strict edits
+        # Requirements Blueprint expansion: temperature 0 + JSON mode. Determinism
+        # matters here (preview == execution — docs/requirements-blueprint.md §6),
+        # and format="json" makes the large nested schema parse reliably instead
+        # of flip-flopping between an actionable and a thin blueprint run to run.
+        self._llm_blueprint = get_llm(temperature=0.0, json_mode=True)
         self._llm_stream = get_streaming_llm(temperature=0.1)
         self._project_path: str | None = None
+        # The project's persistent contract (app/agent/projectspec.py), reloaded
+        # at the top of every chat() turn. None means "no memory yet".
+        self._spec: ProjectSpec | None = None
         self._skills_context: str = ""
         self.mcp_manager = mcp_manager
         self.skill_loader = skill_loader  # SkillLoader | None
@@ -841,6 +996,10 @@ class AgentCore:
         # concrete design decisions). Set by _multi_file_flow, read by the
         # post-generation nav check; cleared at the top of every chat().
         self._build_spec: BuildSpec | None = None
+        # The Requirements Blueprint that drove THIS turn, if any. Set by
+        # _run_blueprint, read by the post-build coverage check; None on every
+        # ordinary turn (so the coverage check is inert). Cleared in chat().
+        self._blueprint: Blueprint | None = None
         # Progress lines for long non-streaming work (currently the vision call,
         # which swaps the loaded Ollama model and takes seconds). The REPL
         # installs a hook that writes into its Live region; unset = silent.
@@ -859,6 +1018,15 @@ class AgentCore:
         """Path of the loaded project, or None (public accessor for the REPL /
         commands so they don't reach into `_project_path` — Step 12 / A4)."""
         return self._project_path
+
+    def get_spec(self) -> ProjectSpec | None:
+        """The project's persisted contract, freshly read from disk.
+
+        Public accessor for the same reason as `project_path` — the CLI must not
+        reach into `_spec`, and `/spec` should show what is on disk right now
+        rather than whatever the last turn happened to leave in memory.
+        """
+        return ProjectSpec.load(Path(self._project_path or Path.cwd()))
 
     async def load_project(self, project_path: str) -> dict[str, Any]:
         self._project_path = project_path
@@ -903,6 +1071,7 @@ class AgentCore:
         self._llm = get_llm(temperature=0.1, json_mode=False)
         self._llm_direct = get_llm(temperature=0.2, json_mode=False)
         self._llm_edit = get_llm(temperature=0.0, json_mode=False)
+        self._llm_blueprint = get_llm(temperature=0.0, json_mode=True)
         self._llm_stream = get_streaming_llm(temperature=0.1)
         self.planner = Planner()
         return previous
@@ -1515,7 +1684,9 @@ class AgentCore:
         if result.get("success"):
             verb = "Updated" if full_existing else "Created"
             answer = f"{verb} `{name}` ({len(content)} bytes) in {workdir}"
-            note, extra = await self._verify_and_repair(out_path, name)
+            note, extra = await self._verify_and_repair(
+                out_path, name, user_message, extra_context
+            )
             trace.extend(extra)
             if note:
                 answer += f" — {note}"
@@ -1602,7 +1773,9 @@ class AgentCore:
             answer = f"Edited `{filename}`: {applied} change(s) applied"
             if failed:
                 answer += f" ({failed} block(s) didn't match the file)"
-            note, extra = await self._verify_and_repair(target_path, filename)
+            note, extra = await self._verify_and_repair(
+                target_path, filename, user_message, extra_context
+            )
             trace.extend(extra)
             if note:
                 answer += f" — {note}"
@@ -1613,6 +1786,240 @@ class AgentCore:
         return answer, trace
 
     async def _verify_and_repair(
+        self,
+        target_path: Path,
+        filename: str,
+        user_message: str = "",
+        extra_context: str = "",
+    ) -> tuple[str, list[dict]]:
+        """Check a just-written file two ways, and repair what fails.
+
+        Stage 1 (`_syntax_repair`) is the original roadmap Tier 1 #1 loop: does
+        it parse, and is it the right kind of content. Stage 2 (`_intent_repair`)
+        asks the question no stage before it could — *is this what the user
+        asked for?* — because until now the whole write path judged form and
+        never content: a syntactically perfect contact form passed a request for
+        a login form as "verified OK".
+
+        Ordering matters. Syntax runs first because a file that doesn't parse is
+        broken whatever it says, and judging one wastes a call on a file that is
+        about to be rewritten anyway. Intent runs only once the file is
+        structurally sound.
+
+        Returns (status_note, extra_trace); the note is "" when neither stage
+        had anything to say.
+        """
+        # Stage 0, deterministic and free: with no network, a CDN <script> or a
+        # Google Fonts <link> is dead weight that costs a DNS timeout per page
+        # and then renders wrong (or, for a CDN stylesheet, completely
+        # unstyled). Runs first so the syntax check sees the final content.
+        offline_note = await self._strip_offline_dead_assets(target_path, filename)
+        enctype_note = await self._fix_upload_form(target_path, filename)
+
+        note, trace = await self._syntax_repair(target_path, filename)
+        if note.startswith("verification failed"):
+            # Still broken after every repair attempt — the request-level
+            # question is meaningless against a file that doesn't parse.
+            return (f"{note}; {offline_note}" if offline_note else note), trace
+
+        intent_note, intent_trace = await self._intent_repair(
+            target_path, filename, user_message, extra_context
+        )
+        trace.extend(intent_trace)
+
+        # Stage 3, deterministic: add imports the file uses but never binds.
+        # Runs LAST so it sees the final content — an intent rewrite can
+        # reintroduce the very names it fixes.
+        import_note = await self._repair_missing_imports(target_path, filename)
+
+        for extra_note in (intent_note, offline_note, import_note, enctype_note):
+            if extra_note:
+                note = f"{note}; {extra_note}" if note else extra_note
+        return note, trace
+
+    async def _fix_upload_form(self, target_path: Path, filename: str) -> str:
+        """Give a file-upload form the `enctype` it cannot work without.
+
+        A `<form>` with `<input type="file">` and no
+        `enctype="multipart/form-data"` posts only the filename, so the handler's
+        `request.files[...]` raises and the upload silently never happens. It is
+        invisible to every other check — the HTML is valid, the page renders, the
+        button looks fine. Measured on the live two-turn demo, on the admin form
+        the amendment had just created. Deterministic and purely additive.
+        """
+        if target_path.suffix.lower() not in (".html", ".htm"):
+            return ""
+        try:
+            text = target_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+        fixed, count = fix_form_enctype(text)
+        if not count:
+            return ""
+        result = await self.executor.execute(
+            "write_file", {"path": str(target_path), "content": fixed}
+        )
+        if not result.get("success"):
+            logger.debug("enctype fix: write failed for %s", filename)
+            return ""
+        return f"added multipart enctype to {count} upload form(s)"
+
+    async def _repair_missing_imports(self, target_path: Path, filename: str) -> str:
+        """Add imports a generated Flask module uses but never binds.
+
+        `check_file` compiles the file, so it catches SyntaxError and is blind to
+        NameError — which only fires when the line runs. That blind spot is the
+        single most common way a generated app ships "verified OK" and then 500s:
+        four for four across live builds (docs/phase0-baseline.md,
+        docs/phase1-notes.md). Deterministic, allowlist-only, best-effort.
+        """
+        if target_path.suffix.lower() != ".py":
+            return ""
+        try:
+            source = target_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            logger.debug("import repair: could not read %s", filename)
+            return ""
+
+        workdir = target_path.parent
+        sibling_sources: dict[str, str] = {}
+        for name in ("db", "models", "seed"):
+            sibling = workdir / f"{name}.py"
+            if sibling.is_file() and sibling != target_path:
+                try:
+                    sibling_sources[name] = sibling.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except Exception:
+                    logger.debug("import repair: could not read %s.py", name)
+        local = frozenset(sibling_sources)
+        fixed, added, unresolved = add_missing_imports(source, local)
+
+        notes: list[str] = []
+        if added and fixed != source:
+            result = await self.executor.execute(
+                "write_file", {"path": str(target_path), "content": fixed}
+            )
+            if result.get("success"):
+                notes.append(f"added {len(added)} missing import(s)")
+                source = fixed
+            else:
+                logger.debug("import repair: write failed for %s", filename)
+        if unresolved:
+            # Named, never guessed at — an unknown name could mean anything.
+            notes.append(
+                "may not meet: uses undefined name(s) at runtime — "
+                + ", ".join(unresolved[:6])
+            )
+        # Phase 4c: a raw request password on its way into storage. A check on
+        # the CODE, deliberately not a line in a prompt — a prompt instruction is
+        # advice, and this is the one thing that must not be left to advice.
+        # Silent when the module hashes anywhere, so read-then-hash is fine.
+        try:
+            leaks = plaintext_password_writes(source)
+        except Exception:
+            logger.debug("password check failed for %s", filename, exc_info=True)
+            leaks = []
+        if leaks:
+            notes.append(
+                "may not meet: stores a password without hashing it — "
+                + "; ".join(leaks[:3])
+                + " (use werkzeug.security.generate_password_hash)"
+            )
+        # NB the cross-module "calls a function the sibling never defines" check
+        # deliberately does NOT run here. Per-file is too early: app.py is
+        # written before models.py is regenerated, so this pass would read the
+        # scaffold stub and report `models.add_post` as missing when the very
+        # next file in the build defines it. It runs once at the end of the turn
+        # instead — see `_check_cross_module_calls`.
+        return "; ".join(notes)
+
+    def _check_cross_module_calls(self, workdir: Path) -> list[str]:
+        """Calls between the project's own modules that nothing defines.
+
+        Runs at the END of a build, when every file is final. `app.py` calling
+        `models.get_all_posts(...)` while `models.py` defines only `add_post`
+        compiles cleanly, imports cleanly, and 500s with `AttributeError` the
+        moment the route is opened — invisible to every other check.
+
+        Reported, never fabricated: writing the missing function means inventing
+        a query, which is generation rather than repair.
+        """
+        sources: dict[str, str] = {}
+        try:
+            for path in sorted(workdir.glob("*.py")):
+                try:
+                    sources[path.stem] = path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except Exception:
+                    logger.debug("cross-module check: could not read %s", path.name)
+        except Exception:
+            logger.debug("cross-module check: could not list %s", workdir)
+            return []
+
+        dangling: list[str] = []
+        for stem, text in sources.items():
+            others = {k: v for k, v in sources.items() if k != stem}
+            try:
+                if others:
+                    for ref in unresolved_local_calls(text, others):
+                        dangling.append(f"{stem}.py calls {ref}")
+                # A duplicated top-level def means the LATER one silently wins —
+                # measured live, a surgical edit re-inserted db.py's whole tail
+                # and the second, table-less init_db() is the one that ran.
+                for name in duplicate_definitions(text):
+                    dangling.append(f"{stem}.py defines {name}() twice")
+            except Exception:
+                logger.debug("cross-module check failed for %s.py", stem, exc_info=True)
+
+        try:
+            for table in missing_tables(sources):
+                dangling.append(f"no CREATE TABLE for `{table}`")
+        except Exception:
+            logger.debug("missing-table check failed", exc_info=True)
+        return dangling
+
+    async def _strip_offline_dead_assets(self, target_path: Path, filename: str) -> str:
+        """Remove off-machine assets a generated page can never load (Phase 1).
+
+        Coder is offline; the sites it generates were not. `buildspec.py` used
+        to instruct the model, in as many words, to load Google Fonts with a
+        `<link>` in every page — and nothing stripped it, because
+        `references.py` deliberately ignores external URLs. Offline that is the
+        most visible failure available: the typography the build spec chose is
+        the one thing that never appears, and a CDN stylesheet leaves the page
+        completely unstyled.
+
+        Deterministic, no LLM. Inert when `settings.allow_network` is on (the
+        CDN would actually work) and on file types that can't carry one.
+        Best-effort: a failure here never fails the write.
+        """
+        if settings.allow_network:
+            return ""
+        suffix = target_path.suffix.lower()
+        if suffix not in (".html", ".htm", ".css", ".scss", ".less"):
+            return ""
+        try:
+            text = target_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            logger.debug("offline asset check: could not read %s", filename)
+            return ""
+        new_text, removed = strip_external_assets(text, suffix)
+        if not removed:
+            return ""
+        result = await self.executor.execute(
+            "write_file", {"path": str(target_path), "content": new_text}
+        )
+        if not result.get("success"):
+            logger.debug("offline asset strip: write failed for %s", filename)
+            return ""
+        return (
+            f"removed {len(removed)} external asset reference(s) that cannot "
+            "load offline"
+        )
+
+    async def _syntax_repair(
         self, target_path: Path, filename: str
     ) -> tuple[str, list[dict]]:
         """Syntax-check a just-written file; feed failures back for repair.
@@ -1679,6 +2086,145 @@ class AgentCore:
             f"attempt(s): {error[:200]}",
             trace,
         )
+
+    async def _judge_intent(
+        self,
+        target_path: Path,
+        filename: str,
+        user_message: str,
+        content: str,
+        extra_context: str,
+    ) -> list[str]:
+        """One LLM call: which of the request's requirements does this file miss?
+
+        Returns [] for "satisfied" — and also for every failure mode (LLM error,
+        unreadable verdict, complaints that don't survive `filter_complaints`).
+        Silence is the safe answer: the cost of missing a real defect is a file
+        the user reviews themselves, while the cost of a false one is a rewrite
+        of a file that was already right.
+        """
+        messages = [
+            SystemMessage(content=INTENT_JUDGE_SYSTEM),
+            HumanMessage(
+                content=build_judge_prompt(
+                    user_message, filename, content, extra_context
+                )
+            ),
+        ]
+        try:
+            # Temperature 0 — a checker must not be creative about requirements.
+            raw = self._llm_edit.invoke(messages).content
+        except Exception as e:
+            logger.debug("intent check LLM error for %s: %s", filename, e)
+            return []
+        return filter_complaints(parse_verdict(str(raw)), content, filename)
+
+    async def _intent_repair(
+        self,
+        target_path: Path,
+        filename: str,
+        user_message: str,
+        extra_context: str = "",
+    ) -> tuple[str, list[dict]]:
+        """Judge the file against the request, and regenerate it if it falls short.
+
+        The safety property that makes this stage safe to run by default: a
+        rewrite is written, re-checked with `check_file`, and **reverted** if it
+        no longer parses. Intent repair can leave a file unimproved, but it can
+        never leave one broken — which is what would otherwise happen every time
+        the model "fixed" a missing feature by truncating the document.
+
+        Best-effort throughout: any failure returns the file as it stands.
+        """
+        if not settings.check_intent or not should_check_intent(user_message, filename):
+            return "", []
+        try:
+            content = target_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            logger.debug("intent check could not read %s: %s", filename, e)
+            return "", []
+        if not content.strip():
+            return "", []
+
+        self._status(f"[verify] checking {filename} against the request …")
+        missing = await self._judge_intent(
+            target_path, filename, user_message, content, extra_context
+        )
+        if not missing:
+            return "intent OK", []
+
+        trace: list[dict] = []
+        for attempt in range(1, settings.max_intent_repairs + 1):
+            self._status(f"[verify] {filename}: {missing[0]} — regenerating …")
+            messages = [
+                SystemMessage(
+                    content=_load_system_prompt()
+                    + _FILE_GEN_INSTRUCTIONS
+                    + (
+                        f"\n\nIMPORTANT: {_extension_guard(filename)}"
+                        if _extension_guard(filename)
+                        else ""
+                    )
+                ),
+                HumanMessage(
+                    content=build_repair_prompt(
+                        user_message, filename, content, missing, extra_context
+                    )
+                ),
+            ]
+            try:
+                raw = self._llm_direct.invoke(messages).content
+            except Exception as e:
+                logger.debug("intent repair LLM error for %s: %s", filename, e)
+                break
+            _, fixed = _parse_file_output(str(raw), fallback=filename)
+            if not fixed.strip() or fixed.strip() == content.strip():
+                break  # nothing new to write
+
+            result = await self.executor.execute(
+                "write_file", {"path": str(target_path), "content": fixed}
+            )
+            trace.append(
+                {
+                    "tool": "write_file",
+                    "arguments": {"path": str(target_path)},
+                    "result": result,
+                }
+            )
+            if not result.get("success"):
+                break
+
+            # A semantic rewrite must never break a file that already parsed.
+            ok, err = (True, "")
+            if is_verifiable(target_path):
+                ok, err = check_file(target_path)
+            if not ok:
+                revert = await self.executor.execute(
+                    "write_file", {"path": str(target_path), "content": content}
+                )
+                trace.append(
+                    {
+                        "tool": "write_file",
+                        "arguments": {"path": str(target_path)},
+                        "result": revert,
+                    }
+                )
+                return (
+                    f"intent repair reverted — the rewrite broke the file "
+                    f"({err[:100]})",
+                    trace,
+                )
+
+            content = fixed
+            missing = await self._judge_intent(
+                target_path, filename, user_message, content, extra_context
+            )
+            if not missing:
+                return f"intent-repaired after {attempt} attempt(s)", trace
+
+        # Out of attempts (or the repair call failed): report honestly rather
+        # than claiming a pass. The file on disk is the best version we have.
+        return "may not meet: " + "; ".join(missing[:3]), trace
 
     async def _plan_file_ops(
         self, user_message: str, context: str, extra_context: str = ""
@@ -1782,7 +2328,11 @@ class AgentCore:
         return "### Shared assets — exact filenames\n" + "\n".join(lines)
 
     async def _multi_file_flow(
-        self, user_message: str, refs: list[str], extra_context: str = ""
+        self,
+        user_message: str,
+        refs: list[str],
+        extra_context: str = "",
+        preplanned_ops: list[FileOp] | None = None,
     ) -> tuple[str, list[dict]]:
         """Plan a set of per-file operations, then run each through _file_op_flow.
 
@@ -1793,6 +2343,13 @@ class AgentCore:
         (e.g. the overall plan when running as one sub-task of a compound
         request) is threaded into both the planning call and every per-file
         generation, so a decomposed step doesn't lose the surrounding spec.
+
+        ``preplanned_ops``: when the caller already has the file list (the
+        Requirements Blueprint stage — see `_run_blueprint`), pass it here to
+        SKIP the `_plan_file_ops` LLM call and use those ops directly. Everything
+        downstream (shared build spec, sibling threading, per-file flow, verify)
+        runs identically — the blueprint is a smarter plan producer, not a new
+        consumer.
         """
         workdir = Path(self._project_path or Path.cwd())
 
@@ -1807,10 +2364,16 @@ class AgentCore:
         # call must see the same canonical nav/design, or each re-invents them.
         spec = await self._extract_build_spec(user_message)
         self._build_spec = spec  # read by the post-generation nav check
-        spec_block = spec.to_context_block()
+        # allow_network decides whether the typography ships as a Google Fonts
+        # <link> or as system stacks — offline, a CDN font is a dead dependency
+        # that costs a DNS timeout per page and then falls back anyway.
+        spec_block = spec.to_context_block(allow_network=settings.allow_network)
         plan_extra = "\n\n".join(c for c in (extra_context, spec_block) if c)
 
-        ops = await self._plan_file_ops(user_message, context, plan_extra)
+        if preplanned_ops is not None:
+            ops = preplanned_ops
+        else:
+            ops = await self._plan_file_ops(user_message, context, plan_extra)
         if not ops:
             return (
                 "I couldn't plan the multi-file change — try naming the files, "
@@ -1855,6 +2418,857 @@ class AgentCore:
 
         answer = f"Handled {len(ops)} file(s):\n" + "\n".join(summaries)
         return answer, trace
+
+    async def _expand_requirements(self, user_message: str) -> Blueprint | None:
+        """Infer the WHOLE build from a short request (Requirements Blueprint).
+
+        ONE LLM call, reached only when `should_blueprint()` matched and
+        `settings.expand_requirements` is on (both checked in `chat()`). Returns
+        None on any failure so the turn falls back to ordinary routing. The
+        style/nav spec is deliberately NOT computed here — `_multi_file_flow`'s
+        own `_extract_build_spec` still owns it; this stage owns the features,
+        the file list, and the API contract. See docs/requirements-blueprint.md.
+        """
+        stack = detect_stack(allow_network=settings.allow_network)
+        messages = [
+            SystemMessage(content=_load_blueprint_prompt()),
+            HumanMessage(
+                content=(
+                    "Stack available on this machine: "
+                    f"{stack.note or '(frontend only — no backend runtime detected)'}\n\n"
+                    f"Request: {user_message}\n\nOutput the JSON now:"
+                )
+            ),
+        ]
+        try:
+            raw = self._llm_blueprint.invoke(messages).content
+            parsed = _extract_json(str(raw))
+            data = parsed if isinstance(parsed, dict) else None
+        except Exception as e:
+            logger.debug("blueprint expansion failed: %s", e)
+            return None
+        if data is None:
+            return None
+        return blueprint_from_data(data, user_message, stack)
+
+    async def _extract_delta(
+        self, user_message: str, spec: ProjectSpec
+    ) -> SpecDelta | None:
+        """What this request CHANGES about the project — one temp-0 LLM call.
+
+        The prompt is the spec's own context block plus the user's message, so
+        the model is told what exists rather than left to re-infer it from chat
+        prose. It is asked only for the delta; which existing files that delta
+        breaks is computed deterministically afterwards by `impact.py`, because
+        "what else does this affect?" is the question a 7B model answers worst.
+
+        Returns None on any failure, so the turn falls back to ordinary routing.
+        """
+        messages = [
+            SystemMessage(content=_load_amend_prompt()),
+            HumanMessage(
+                content=(
+                    f"{spec.to_context_block()}\n\n"
+                    f"Requested change: {user_message}\n\nOutput the JSON now:"
+                )
+            ),
+        ]
+        try:
+            raw = self._llm_blueprint.invoke(messages).content
+            parsed = _extract_json(str(raw))
+        except Exception as e:
+            logger.debug("delta extraction failed: %s", e)
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        return delta_from_data(parsed, spec)
+
+    async def _amend_project(
+        self, user_message: str, spec: ProjectSpec, at_refs: list[str]
+    ) -> tuple[str | None, list[dict]]:
+        """Change a project we already remember, updating what the change breaks.
+
+        The phase the demo lives or dies on (docs/fullstack-web-plan.md Phase 3).
+        Five steps:
+
+        1. **Delta** — one temp-0 call returns only what changes.
+        2. **Impact** — `impact.py` derives, by rule and with no LLM, which
+           EXISTING files that delta breaks and why.
+        3. **Apply** — `db.py`'s migration is written deterministically from the
+           spec (never generated); new files go through `_multi_file_flow`;
+           impacted files are edited one at a time, each told precisely what to
+           change and why rather than handed the whole request again.
+        4. **Persist** — merge the delta, bump the revision, save.
+        5. **Verify** — build a Blueprint from the amended spec and assign
+           `self._blueprint`, so the post-turn coverage check and smoke test
+           actually run. They are gated on that attribute, so an amendment that
+           skipped this would be the *only* kind of turn that is never verified
+           or run — invisibly, because the turn would still report success.
+
+        Returns ``(None, [])`` when there is nothing structural to do, so the
+        caller falls through to today's routing.
+        """
+        workdir = Path(self._project_path or Path.cwd())
+
+        delta = await self._extract_delta(user_message, spec)
+        if delta is None or delta.is_empty():
+            return None, []
+
+        existing = _existing_project_files(workdir)
+        edits = impacted_files(spec, delta, existing)
+        # db.py is impacted, but its migration is written from the spec rather
+        # than generated — a 7B model writing ALTER TABLE against live data is
+        # risk with no upside.
+        edits = [e for e in edits if e.filename != DB_FILE]
+
+        notes: list[str] = []
+        trace: list[dict] = []
+
+        # -- 3a. deterministic schema change ------------------------------
+        migration_note = self._apply_migrations(workdir, spec, delta)
+        if migration_note:
+            notes.append(migration_note)
+
+        # -- 3b. new files -------------------------------------------------
+        spec_block = spec.to_context_block()
+        new_ops = [
+            FileOp(filename=name, action="create", instruction=instruction)
+            for name, instruction in delta.new_files
+            if name.replace("\\", "/") not in existing
+        ]
+        if new_ops:
+            text_refs, image_refs = _split_image_refs(at_refs)
+            extra = "\n\n".join(
+                c
+                for c in (
+                    spec_block,
+                    scaffold_context(sorted(existing)),
+                    self._image_context(image_refs),
+                )
+                if c
+            )
+            answer, sub_trace = await self._multi_file_flow(
+                user_message,
+                refs=text_refs,
+                extra_context=extra,
+                preplanned_ops=new_ops,
+            )
+            trace.extend(sub_trace)
+            notes.append(answer)
+
+        # -- 3c. existing files that the change breaks ---------------------
+        updated: list[str] = []
+        for edit in edits:
+            target = workdir / edit.filename
+            if not target.is_file():
+                continue
+            instruction = (
+                f"{user_message}\n\nFor THIS file specifically: {edit.reason}. "
+                "Change only what that requires — leave everything else exactly "
+                "as it is."
+            )
+            prev = self._last_write_path
+            try:
+                _, sub_trace = await self._file_op_flow(
+                    instruction,
+                    target=edit.filename,
+                    extra_context=spec_block,
+                )
+                trace.extend(sub_trace)
+                updated.append(edit.filename)
+            except Exception:
+                logger.warning(
+                    "amend: failed to update %s", edit.filename, exc_info=True
+                )
+            finally:
+                self._last_write_path = prev
+        if updated:
+            notes.append(describe([e for e in edits if e.filename in updated]))
+
+        if not trace and not migration_note:
+            return None, []  # nothing actually happened — defer to normal routing
+
+        # -- 4. persist ----------------------------------------------------
+        try:
+            spec.merge_delta(delta, request=user_message)
+            if spec.save(workdir):
+                self._spec = spec
+                self._write_readme(workdir, spec)
+                notes.append(
+                    f"Project memory updated to revision {spec.revision} "
+                    "(`/spec` shows it)."
+                )
+        except Exception:
+            logger.warning("amend: could not persist the spec", exc_info=True)
+
+        # -- 4b. did the amendment break something turn 1 built? -----------
+        regression_note = self._check_amendment_regressions(workdir, spec)
+        if regression_note:
+            notes.append(regression_note)
+
+        # -- 5. make the post-turn checks actually run ---------------------
+        self._blueprint = _blueprint_from_spec(spec)
+
+        return "\n\n".join(n for n in notes if n), trace
+
+    def _check_amendment_regressions(self, workdir: Path, spec: ProjectSpec) -> str:
+        """Restore or report routes the amendment deleted from an earlier turn.
+
+        The failure this exists for, measured on the live two-turn demo: the
+        surgical edit to `app.py` replaced turn 1's `/products` route with the
+        new `/admin/products` one, so a page that worked before the change 404'd
+        after it. Nothing else can see that — the file compiles, the new route
+        works, and the turn reports success.
+
+        A deleted GET page route is restored exactly (its body is just
+        `render_template`); anything else is reported, because inventing a POST
+        handler's body is generation rather than repair. Best-effort throughout.
+        """
+        app_py = workdir / "app.py"
+        if not app_py.is_file():
+            return ""
+        try:
+            source = app_py.read_text(encoding="utf-8", errors="replace")
+            missing = vanished_routes(spec, source)
+            if not missing:
+                return ""
+            updated, restored = restore_page_routes(source, missing)
+            if restored and not self._write_python_if_valid(app_py, updated):
+                restored = []  # declined: never leave app.py broken
+        except Exception:
+            logger.warning("amendment regression check failed", exc_info=True)
+            return ""
+
+        notes: list[str] = []
+        if restored:
+            notes.append(
+                "Restored "
+                + ", ".join(restored)
+                + " — the change had removed page route(s) that existed before it."
+            )
+        still_gone = [
+            f"{e.method} {e.path}" for e in missing if e.path not in set(restored)
+        ]
+        if still_gone:
+            notes.append(
+                "may not meet: these route(s) existed before this change and are "
+                "gone now — " + ", ".join(still_gone[:6])
+            )
+        return "\n\n".join(notes)
+
+    def _write_data_layer(
+        self, workdir: Path, blueprint: Blueprint
+    ) -> tuple[set[str], str]:
+        """Write `db.py`'s tables, `models.py` and `seed.py` from the entities.
+
+        Phase 4a/4d. These three files contain no decisions: the table IS the
+        fields, the query IS the table, the demo row IS the field types. Leaving
+        them to a 7B model produced, on live builds, an `init_db()` with no
+        `CREATE TABLE` at all and an `app.py` calling `models.get_all_posts`
+        against a `models.py` that defined only `add_post`.
+
+        Returns ``(files it now owns, the API description for the prompt)``. The
+        second half is not optional: taking the data layer away from the model is
+        only safe if the model is TOLD what replaced it. Without it, a live build
+        opened `app.py` with `from models import get_user_by_email,
+        get_all_products, User, Product` — four invented names — and died at
+        import before serving a page.
+
+        Returns empty — and changes nothing — when the blueprint declared no
+        schema, so a build with no data layer behaves exactly as before.
+        """
+        entities = []
+        for line in blueprint.contract.data_schema:
+            parsed = parse_schema_line(line)
+            if parsed and not any(e.table == parsed.table for e in entities):
+                entities.append(parsed)
+        if not entities:
+            return set(), ""
+
+        spec = ProjectSpec(name=project_name(workdir), entities=tuple(entities))
+        owned: set[str] = set()
+
+        # db.py: insert the CREATE TABLEs into the scaffold's init_db().
+        db_path = workdir / DB_FILE
+        if db_path.is_file():
+            try:
+                source = db_path.read_text(encoding="utf-8", errors="replace")
+                updated, changed = apply_table_block(source, spec)
+                if changed and self._write_python_if_valid(db_path, updated):
+                    owned.add(DB_FILE)
+            except Exception:
+                logger.warning("could not write the schema into db.py", exc_info=True)
+
+        for rel, render in (
+            ("models.py", models_source),
+            ("seed.py", seed_source),
+        ):
+            path = workdir / rel
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(render(spec), encoding="utf-8", newline="\n")
+                owned.add(rel)
+            except Exception:
+                logger.warning("could not write %s", rel, exc_info=True)
+        return owned, api_context(spec)
+
+    def _write_readme(self, workdir: Path, spec: ProjectSpec) -> None:
+        """Regenerate README.md from the spec (Phase 6). Best-effort.
+
+        The scaffold ships a generic README; this replaces it with the real
+        entity and route list, so the file describes THIS project. Rewritten on
+        every spec change, which is the only way it stays true after an
+        amendment — a README that documents turn 1 is worse than none by turn 3.
+        """
+        try:
+            (workdir / "README.md").write_text(
+                spec.to_readme(), encoding="utf-8", newline="\n"
+            )
+        except Exception:
+            logger.debug("could not write README.md", exc_info=True)
+
+    async def preview_amendment(self, message: str) -> dict:
+        """What an amendment WOULD change, without doing it — backs `/plan`.
+
+        Showing "these 4 existing files will be updated, and here's why" before
+        it happens is a stronger demo beat than showing it afterwards, and it is
+        the one place the impact rules are visible on their own. Costs the same
+        single delta-extraction call the real amendment would.
+
+        Returns ``{}`` when there is no spec, the request isn't an amendment, or
+        the delta is empty — the caller then shows the ordinary plan.
+        """
+        workdir = Path(self._project_path or Path.cwd())
+        spec = self._spec or ProjectSpec.load(workdir)
+        if spec is None or not should_amend(message, True):
+            return {}
+        try:
+            delta = await self._extract_delta(message, spec)
+        except Exception:
+            logger.debug("amendment preview failed", exc_info=True)
+            return {}
+        if delta is None or delta.is_empty():
+            return {}
+
+        edits = impacted_files(spec, delta, _existing_project_files(workdir))
+        changes: list[str] = []
+        for entity in delta.add_entities:
+            changes.append(f"new table {entity.table}")
+        for entity_name, field in delta.add_fields:
+            changes.append(f"{entity_name}.{field.name} ({field.type})")
+        for endpoint in delta.add_endpoints:
+            changes.append(f"{endpoint.method} {endpoint.path}")
+        for page in delta.add_pages:
+            changes.append(f"page {page.route or page.template}")
+        return {
+            "summary": delta.summary,
+            "revision": spec.revision,
+            "changes": changes,
+            "new_files": [name for name, _ in delta.new_files],
+            "edits": [(e.filename, e.reason) for e in edits],
+        }
+
+    def _seed_demo_data(self, workdir: Path) -> str:
+        """Actually RUN the generated `seed.py`, once, after the build.
+
+        Phase 4d's promise is that the storefront is never empty on first load —
+        and a `seed.py` nobody runs does not keep it. An empty list in a demo
+        reads as broken even when it is working perfectly.
+
+        Safe to execute despite the usual rule about running generated code:
+        `seed.py` and `db.py`'s schema are written by `crud.py`, not by the
+        model. Short timeout, output discarded, failure reported not raised.
+        """
+        seed = workdir / "seed.py"
+        if not seed.is_file():
+            return ""
+        try:
+            proc = subprocess.run(
+                [sys.executable, "seed.py"],
+                cwd=str(workdir),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception:
+            logger.debug("seeding failed to start", exc_info=True)
+            return ""
+        if proc.returncode == 0:
+            return "\n\nSeeded the database with demo rows, so no page starts empty."
+        first = (proc.stderr or "").strip().splitlines()
+        return (
+            "\n\nmay not meet: `python seed.py` failed, so pages that list data "
+            "will start empty — " + (first[-1][:160] if first else "no output")
+        )
+
+    def _apply_migrations(
+        self, workdir: Path, spec: ProjectSpec, delta: SpecDelta
+    ) -> str:
+        """Write db.py's new `ensure_column` calls from the spec, not the model.
+
+        Deterministic by design: the migration is exactly derivable from which
+        revision each field arrived in, so generating it would add risk without
+        adding information. Best-effort — a db.py we can't recognise is left
+        alone and reported rather than half-edited.
+        """
+        if not (delta.add_fields or delta.add_entities):
+            return ""
+        db_path = workdir / DB_FILE
+        if not db_path.is_file():
+            return ""
+
+        # Stamp the delta onto a copy so the migration reflects the NEW fields
+        # without mutating the spec before it is merged for real.
+        preview = ProjectSpec.from_dict(spec.to_dict())
+        preview.merge_delta(delta)
+        block = migration_block(preview, since=spec.revision)
+        if not block:
+            return ""
+
+        try:
+            source = db_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+        updated, changed = apply_migration_block(source, block)
+        if not changed or not self._write_python_if_valid(db_path, updated):
+            return (
+                "may not meet: could not place the schema migration in db.py — "
+                "add it by hand: " + "; ".join(preview.migrations(since=spec.revision))
+            )
+        calls = preview.migrations(since=spec.revision)
+        return (
+            f"Wrote {len(calls)} schema migration(s) into `db.py` from the project "
+            "spec — existing rows are kept, not recreated."
+        )
+
+    async def _run_blueprint(
+        self, user_message: str, blueprint: Blueprint, at_refs: list[str]
+    ) -> tuple[str, list[dict]]:
+        """Build a Blueprint by seeding `_multi_file_flow` with its files + contract.
+
+        The blueprint's default-tier files become the preplanned ops (so the
+        per-file planner LLM call is skipped), and its interface contract is
+        threaded in as `extra_context` exactly where the build spec goes — so the
+        form and the backend agree on routes and field names. Optional-tier
+        features are reported, not built.
+
+        Phase 1 (docs/fullstack-web-plan.md): for a web build on the Flask stack
+        a runnable skeleton is copied in FIRST, deterministically. The app
+        therefore starts before the model has written a line, and the planned
+        files that survive are *edited* onto a working base rather than written
+        from scratch — `_file_op_flow` sends an existing file to `_surgical_edit`.
+        """
+        self._blueprint = blueprint  # read by the post-build coverage check
+        workdir = Path(self._project_path or Path.cwd())
+
+        # Deterministic skeleton before any generation. Best-effort: a scaffold
+        # failure must not cost the turn, it just means today's behaviour.
+        scaffolded: list[str] = []
+        if is_web_app(blueprint) and blueprint.stack.backend == "flask":
+            try:
+                scaffolded = scaffold_flask(workdir, project_name(workdir))
+            except Exception:
+                logger.warning("flask scaffold failed", exc_info=True)
+
+        # Phase 4a/4d: the data layer is 100% derivable from the declared
+        # entities, so write it deterministically BEFORE generation and take it
+        # off the model's plate. This is what closes the two failures live builds
+        # kept producing: `init_db()` with no CREATE TABLE, and `app.py` calling
+        # a `models.` helper that was never written.
+        generated_data_layer, data_api = self._write_data_layer(workdir, blueprint)
+
+        planned = blueprint.build_files(
+            include_optional=settings.blueprint_optional_tier
+        )
+        if generated_data_layer:
+            planned = tuple(
+                pf
+                for pf in planned
+                if pf.filename.replace("\\", "/") not in generated_data_layer
+            )
+        if scaffolded:
+            # Drop only the files the scaffold finished for good (requirements,
+            # Procfile, .gitignore). Everything else it wrote stays in the plan
+            # and gets edited, so the domain layer still lands — dropping them
+            # all would leave the placeholder home page as the finished site.
+            planned = tuple(pf for pf in planned if not is_frozen(pf.filename))
+
+        files = planned[: settings.blueprint_max_files]
+        over_budget = planned[settings.blueprint_max_files :]
+        ops = [
+            FileOp(
+                filename=f.filename,
+                action=f.action or "create",
+                instruction=f.instruction,
+            )
+            for f in files
+        ]
+
+        # A screenshot referenced with the build is the visual reference for the
+        # whole thing — describe it once and thread it in (as _route_one does).
+        text_refs, image_refs = _split_image_refs(at_refs)
+        image_ctx = self._image_context(image_refs)
+        contract_block = blueprint.to_context_block()
+        scaffold_block = scaffold_context(scaffolded)
+        extra = "\n\n".join(
+            c for c in (contract_block, scaffold_block, data_api, image_ctx) if c
+        )
+
+        answer, trace = await self._multi_file_flow(
+            user_message, refs=text_refs, extra_context=extra, preplanned_ops=ops
+        )
+        if scaffolded:
+            answer = (
+                f"Scaffolded a runnable Flask project first ({len(scaffolded)} "
+                "files: app.py, db.py, models.py, templates/, static/, "
+                "requirements.txt, Procfile). Run it with `python app.py`.\n\n" + answer
+            )
+            answer += await self._restore_scaffold_invariants(workdir)
+        if generated_data_layer:
+            answer += self._seed_demo_data(workdir)
+            answer = (
+                "Wrote the data layer from the declared schema rather than "
+                "generating it — "
+                + ", ".join(sorted(generated_data_layer))
+                + " (parameterised SQL; the column lists and the tables are "
+                "printed from the same definition, so they cannot drift).\n\n" + answer
+            )
+        if over_budget:
+            # Never hide a truncation: the cap used to silently drop these AND
+            # the coverage check applied the same slice, so nothing could
+            # report them. A cap that reports is a budget; one that hides is a bug.
+            answer += (
+                f"\n\nmay not meet: the plan had {len(over_budget)} file(s) beyond "
+                f"the {settings.blueprint_max_files}-file budget, so they were not "
+                "built — "
+                + ", ".join(pf.filename for pf in over_budget[:8])
+                + ". Ask for them and I'll add them."
+            )
+        # Phase 2: persist the contract so turn 2 can amend it instead of
+        # re-inferring it from chat prose. Best-effort by design — a spec that
+        # won't save must never cost a turn whose files were written.
+        try:
+            spec = ProjectSpec.from_blueprint(blueprint, workdir, project_name(workdir))
+            if not spec.is_empty() and spec.save(workdir):
+                self._spec = spec
+                self._write_readme(workdir, spec)
+                answer += (
+                    f"\n\nRemembered this project ({len(spec.entities)} table(s), "
+                    f"{len(spec.endpoints)} route(s), {len(spec.pages)} page(s)) in "
+                    "`.coder/project.json` — `/spec` shows it."
+                )
+        except Exception:
+            logger.warning("could not build/save the project spec", exc_info=True)
+
+        note = blueprint.optional_note()
+        if note:
+            answer += "\n\n" + note
+        return answer, trace
+
+    @staticmethod
+    def _write_python_if_valid(path: Path, source: str) -> bool:
+        """Write generated Python only if it still compiles. Returns success.
+
+        The deterministic passes (`restore_index_route`, `restore_page_routes`,
+        the migration blocks) edit files by hand, outside `_verify_and_repair` —
+        so nothing else would notice if one of them produced source that does not
+        parse. Same discipline as the intent check: a rewrite that breaks
+        `check_file` is reverted, because a pass may leave a file unimproved but
+        must never leave one broken.
+        """
+        try:
+            compile(source, str(path), "exec")
+        except SyntaxError:
+            logger.warning("declined to write invalid Python to %s", path.name)
+            return False
+        try:
+            path.write_text(source, encoding="utf-8", newline="\n")
+            return True
+        except Exception:
+            logger.warning("could not write %s", path.name, exc_info=True)
+            return False
+
+    async def _restore_scaffold_invariants(self, workdir: Path) -> str:
+        """Put back what generation broke in the skeleton it was editing.
+
+        The scaffold's promise is a runnable app. Generation edits it, and a 7B
+        model's SEARCH/REPLACE routinely replaces the block it was meant to add
+        to — measured on two consecutive live `build me a blog` runs, both of
+        which deleted the `/` route, leaving the finished site 404ing on its own
+        home page. Deterministic, no LLM, best-effort.
+        """
+        notes: list[str] = []
+        app_py = workdir / "app.py"
+        if app_py.is_file():
+            try:
+                source = app_py.read_text(encoding="utf-8", errors="replace")
+                restored_source, restored = restore_index_route(source)
+                if restored and self._write_python_if_valid(app_py, restored_source):
+                    result = await self.executor.execute(
+                        "write_file",
+                        {"path": str(app_py), "content": restored_source},
+                    )
+                    if result.get("success"):
+                        notes.append(
+                            "\n\nRestored the home page: generation had removed the "
+                            "`/` route from app.py, so the site 404'd on its own "
+                            "front page."
+                        )
+            except Exception:
+                logger.warning("could not restore the index route", exc_info=True)
+
+        try:
+            orphans = templates_without_inheritance(workdir)
+        except Exception:
+            logger.warning("template inheritance check failed", exc_info=True)
+            orphans = []
+        converted: list[str] = []
+        stubborn: list[str] = []
+        for rel in orphans:
+            path = workdir / rel
+            try:
+                source = path.read_text(encoding="utf-8", errors="replace")
+                rewritten, ok = convert_to_child_template(source)
+            except Exception:
+                logger.warning("template conversion failed for %s", rel, exc_info=True)
+                stubborn.append(rel)
+                continue
+            if not ok:
+                stubborn.append(rel)
+                continue
+            result = await self.executor.execute(
+                "write_file", {"path": str(path), "content": rewritten}
+            )
+            (converted if result.get("success") else stubborn).append(rel)
+
+        if converted:
+            notes.append(
+                "\n\nRewrote "
+                + ", ".join(converted[:6])
+                + " to extend `base.html` — they were full HTML documents "
+                "carrying their own navigation, which is how pages drift apart."
+            )
+        if stubborn:
+            # Never claim a pass we didn't get.
+            notes.append(
+                "\n\nmay not meet: these page(s) are full HTML documents instead "
+                'of `{% extends "base.html" %}` and could not be converted '
+                "safely — " + ", ".join(stubborn[:6])
+            )
+
+        # Every file is final now, so a cross-module call check is meaningful
+        # here in a way it never is mid-build.
+        dangling = self._check_cross_module_calls(workdir)
+        if dangling:
+            notes.append(
+                "\n\nmay not meet: these calls have no matching function, so the "
+                "route will fail with AttributeError when opened — "
+                + ", ".join(dangling[:6])
+            )
+        return "".join(notes)
+
+    def _unwired_endpoints(self, blueprint: Blueprint, workdir: Path) -> list[str]:
+        """Contract endpoints not found in any backend file written for this build.
+
+        Deterministic: the endpoint path is a literal string the server must
+        contain to define the route. A form posting to `/api/login` while no
+        server file mentions `/api/login` is the characteristic full-stack break
+        (weaknesses.md #3) — surfaced here rather than shipped as 'verified OK'.
+        """
+        endpoints = [e.path for e in blueprint.contract.endpoints]
+        if not endpoints:
+            return []
+        backend_exts = (".py", ".js", ".mjs", ".ts", ".go", ".rb")
+        corpus = ""
+        for pf in blueprint.files:
+            path = workdir / pf.filename
+            if path.suffix.lower() in backend_exts and path.is_file():
+                try:
+                    corpus += "\n" + path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    logger.debug("coverage: could not read %s", pf.filename)
+        return [ep for ep in endpoints if ep not in corpus]
+
+    async def _verify_blueprint_coverage(
+        self, blueprint: Blueprint, trace: list[dict]
+    ) -> tuple[str, list[dict]]:
+        """Check the WHOLE blueprint shipped (weaknesses.md #3), best-effort.
+
+        Two deterministic checks, no extra classify/plan LLM calls:
+        1. Every planned file exists — CREATE the missing ones (threading the
+           interface contract so a late-created backend still lines up with the
+           form). This is the exact failure the user hit: the backend file never
+           got written.
+        2. Every declared endpoint is defined in some backend file — REPORTED as
+           `may not meet: …` when not (honest, like the intent check), never
+           silently passed. Auto-repair of an existing-but-mis-wired server is
+           deferred (Phase 3) — creating a missing file is safe; rewriting a
+           present one to invent a route is not.
+        """
+        workdir = Path(self._project_path or Path.cwd())
+        note_parts: list[str] = []
+        extra_trace: list[dict] = []
+
+        want = blueprint.build_files(include_optional=settings.blueprint_optional_tier)[
+            : settings.blueprint_max_files
+        ]
+        contract_block = blueprint.to_context_block()
+
+        created: list[str] = []
+        for pf in want:
+            if (workdir / pf.filename).is_file():
+                continue
+            instr = pf.instruction or f"Create {pf.filename} for this build."
+            prev = self._last_write_path  # don't hijack the follow-up edit target
+            try:
+                _, sub_trace = await self._file_op_flow(
+                    instr, target=pf.filename, extra_context=contract_block
+                )
+                extra_trace.extend(sub_trace)
+                if (workdir / pf.filename).is_file():
+                    created.append(pf.filename)
+            except Exception:
+                logger.warning(
+                    "coverage: failed to create %s", pf.filename, exc_info=True
+                )
+            finally:
+                self._last_write_path = prev
+        if created:
+            note_parts.append(
+                "\nCreated missing planned file(s): " + ", ".join(created) + "."
+            )
+
+        unwired = self._unwired_endpoints(blueprint, workdir)
+        if unwired:
+            note_parts.append(
+                "\nmay not meet: these endpoints aren't defined in any backend "
+                "file yet — " + ", ".join(unwired)
+            )
+
+        return ("\n".join(note_parts), extra_trace)
+
+    def _pick_backend_entry(self, blueprint: Blueprint, workdir: Path) -> Path | None:
+        """The generated server file to actually run for the smoke test.
+
+        Scores the build's `.py`/`.js` files: +2 for a backend/server role, +1
+        for a server-start marker in the source, and picks the best. None when
+        there's no runnable backend (a purely static build — nothing to smoke)."""
+        run_markers = (
+            "HTTPServer",
+            "TCPServer",
+            "serve_forever",
+            "app.run",
+            "uvicorn",
+            "createServer",
+            ".listen(",
+            "socketserver",
+            "wsgiref",
+            "run(host",
+        )
+        best: tuple[int, Path] | None = None
+        for pf in blueprint.build_files(
+            include_optional=settings.blueprint_optional_tier
+        ):
+            path = workdir / pf.filename
+            if path.suffix.lower() not in (".py", ".js", ".mjs") or not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            score = (2 if pf.role in ("backend", "server") else 0) + (
+                1 if any(m in text for m in run_markers) else 0
+            )
+            if score and (best is None or score > best[0]):
+                best = (score, path)
+        return best[1] if best else None
+
+    async def _smoke_test_backend(self, blueprint: Blueprint) -> tuple[str, list[dict]]:
+        """Start the generated backend, probe it, kill it — does it RUN?
+
+        The only check that executes the server instead of reading it
+        (weaknesses.md #2). On a startup crash it feeds the traceback back for up
+        to `settings.max_smoke_repairs` regeneration passes, then re-tests. The
+        subprocess work runs off the event loop via `asyncio.to_thread`.
+        """
+        workdir = Path(self._project_path or Path.cwd())
+        entry = self._pick_backend_entry(blueprint, workdir)
+        if entry is None:
+            return "", []  # nothing runnable to smoke-test
+
+        endpoint_paths = [e.path for e in blueprint.contract.endpoints]
+        contract_block = blueprint.to_context_block()
+        trace: list[dict] = []
+
+        # Phase 5: hand the spec over so the server is EXERCISED, not just
+        # pinged. Without it a build whose every POST returned 500 still reported
+        # a passing smoke test, because any HTTP status counted as alive.
+        spec = self._spec or ProjectSpec.load(workdir)
+
+        result = await asyncio.to_thread(
+            run_smoke_test,
+            entry,
+            workdir,
+            endpoint_paths,
+            settings.smoke_test_timeout,
+            1.5,
+            spec,
+        )
+        repairs = 0
+        while repairs < settings.max_smoke_repairs:
+            instruction = self._smoke_repair_instruction(entry, result)
+            if instruction is None:
+                break
+            repairs += 1
+            prev = self._last_write_path
+            try:
+                _, sub = await self._file_op_flow(
+                    instruction, target=entry.name, extra_context=contract_block
+                )
+                trace.extend(sub)
+            except Exception:
+                logger.warning("smoke-test repair failed", exc_info=True)
+                break
+            finally:
+                self._last_write_path = prev
+            result = await asyncio.to_thread(
+                run_smoke_test,
+                entry,
+                workdir,
+                endpoint_paths,
+                settings.smoke_test_timeout,
+                1.5,
+                spec,
+            )
+
+        return "\n" + result.note(), trace
+
+    def _smoke_repair_instruction(self, entry: Path, result) -> str | None:
+        """What to tell the model about a failing run, or None if nothing failed.
+
+        A traceback, or "posting to /admin/products returned 500", is a far
+        better repair prompt than anything static analysis produces — it names
+        the exact request that broke. Startup crashes take priority: a server
+        that never came up makes every functional check meaningless.
+        """
+        if not result.started and result.stderr:
+            return (
+                f"The server file {entry.name} fails to start. Running it produced "
+                f"this error:\n{result.stderr[:800]}\n\nFix {entry.name} so it starts "
+                "and serves without error. Keep the same routes, fields and "
+                "behavior — change only what's needed to make it run."
+            )
+        failures = result.failures() if hasattr(result, "failures") else ()
+        if not failures:
+            return None
+        listed = "\n".join(f"- {c.label}: {c.detail}" for c in failures[:6])
+        return (
+            f"The app starts, but these checks against the running server failed:\n"
+            f"{listed}\n\nFix {entry.name} so each of them works. A 5xx means the "
+            "handler raised; a value that does not come back means the write "
+            "never reached the database, or the page does not render what was "
+            "stored. Keep every route and field name exactly as they are."
+        )
 
     async def _route_one(
         self,
@@ -2342,47 +3756,110 @@ class AgentCore:
         clean_message = _strip_at_refs(user_message)
 
         self._build_spec = None  # this turn's shared spec, set by _multi_file_flow
+        self._blueprint = None  # this turn's blueprint, set by _run_blueprint
+        # Phase 2: unlike the blueprint, the spec is NOT reset per turn — it is
+        # the project's living state, reloaded from disk so an edit made outside
+        # this session is picked up. Absent or corrupt → None, and the turn
+        # behaves exactly as it did before the spec existed.
+        self._spec = ProjectSpec.load(Path(self._project_path or Path.cwd()))
         self._update_skills_context(clean_message)
         await self.memory.add_human(user_message)
+
+        answer: str | None = None
+        trace: list[dict] = []
+
+        # Requirements Blueprint: a greenfield build ("build me a login page") is
+        # expanded into the WHOLE build — the implied features, a backend, and an
+        # interface contract that keeps the files consistent — BEFORE routing, so
+        # the button actually does something (docs/requirements-blueprint.md).
+        # Gated to build requests. On by default since docs/fullstack-web-plan.md
+        # Phase 0 — but still only for a greenfield build, so when the flag is off
+        # (or the request isn't a greenfield build, or the blueprint doesn't
+        # expand anything) `answer` stays None and the ORIGINAL routing below runs
+        # unchanged.
+        # Amendment first (Phase 3): a request to CHANGE a project we already
+        # remember is routed against its stored contract, so turn N sees turn
+        # 1's schema and routes instead of re-inferring them from chat prose.
+        # Inert without a spec, and inert for a greenfield build (no incremental
+        # verb), so the blueprint gate below is reached exactly as before.
+        if (
+            settings.expand_requirements
+            and self._spec is not None
+            and should_amend(clean_message, True)
+        ):
+            answer, trace = await self._amend_project(
+                clean_message, self._spec, at_refs
+            )
+
+        if (
+            answer is None
+            and settings.expand_requirements
+            and should_blueprint(clean_message)
+        ):
+            blueprint = await self._expand_requirements(clean_message)
+            if blueprint is not None and blueprint.is_actionable():
+                answer, trace = await self._run_blueprint(
+                    clean_message, blueprint, at_refs
+                )
 
         # M1: decompose a multi-task request into ordered sub-tasks so each is
         # routed and completed (with shared context), instead of only the first.
         # Fast path: the cheap splitter catches delimited prompts ("do A, then B").
-        subtasks = _split_compound(clean_message)
-        if len(subtasks) >= 2:
-            answer, trace = await self._run_subtasks(
-                subtasks[: settings.max_plan_tasks], at_refs
-            )
-        elif wants_multifile(clean_message):
-            # Explicit multi-file build → _multi_file_flow (via _route_one).
-            # It has its own per-file planner that must see the FULL spec; LLM
-            # pre-decomposition would fragment it, and classify() is unused on
-            # that branch — so skip both LLM calls.
-            answer, trace = await self._route_one(
-                clean_message, at_refs, on_token=on_token
-            )
-        else:
-            # One task per the cheap splitter. Classify once; then for a request
-            # that reads as multi-part prose (a build spanning several files/
-            # pages, no explicit "then"/"also"), ask the LLM planner to break it
-            # into ordered steps — this is the natural-language path.
-            task_type = self.planner.classify(clean_message)
-            should_plan = settings.decompose_multitask and (
-                task_type == "multi_step"
-                or (
-                    task_type in ("code_generation", "file_edit")
-                    and _looks_multipart(clean_message)
-                )
-            )
-            planned = self.planner.decompose(clean_message) if should_plan else []
-            if len(planned) >= 2:
+        if answer is None:
+            subtasks = _split_compound(clean_message)
+            if len(subtasks) >= 2:
                 answer, trace = await self._run_subtasks(
-                    planned[: settings.max_plan_tasks], at_refs
+                    subtasks[: settings.max_plan_tasks], at_refs
+                )
+            elif wants_multifile(clean_message):
+                # Explicit multi-file build → _multi_file_flow (via _route_one).
+                # It has its own per-file planner that must see the FULL spec; LLM
+                # pre-decomposition would fragment it, and classify() is unused on
+                # that branch — so skip both LLM calls.
+                answer, trace = await self._route_one(
+                    clean_message, at_refs, on_token=on_token
                 )
             else:
-                answer, trace = await self._route_one(
-                    clean_message, at_refs, task_type=task_type, on_token=on_token
+                # One task per the cheap splitter. Classify once; then for a
+                # request that reads as multi-part prose (a build spanning several
+                # files/pages, no explicit "then"/"also"), ask the LLM planner to
+                # break it into ordered steps — this is the natural-language path.
+                task_type = self.planner.classify(clean_message)
+                should_plan = settings.decompose_multitask and (
+                    task_type == "multi_step"
+                    or (
+                        task_type in ("code_generation", "file_edit")
+                        and _looks_multipart(clean_message)
+                    )
                 )
+                planned = self.planner.decompose(clean_message) if should_plan else []
+                if len(planned) >= 2:
+                    answer, trace = await self._run_subtasks(
+                        planned[: settings.max_plan_tasks], at_refs
+                    )
+                else:
+                    answer, trace = await self._route_one(
+                        clean_message, at_refs, task_type=task_type, on_token=on_token
+                    )
+
+        # Blueprint coverage (weaknesses.md #3): if this turn was a blueprint
+        # build, verify the whole thing shipped — create any planned file that's
+        # still missing (so the backend file the model forgot actually appears)
+        # and report endpoints left unwired. Runs BEFORE the reference repairs so
+        # a file it creates still gets its own dead-links checked. Inert unless a
+        # blueprint ran (self._blueprint is None on every ordinary turn).
+        if self._blueprint is not None and settings.check_blueprint_coverage:
+            try:
+                cov_note, cov_trace = await self._verify_blueprint_coverage(
+                    self._blueprint, trace
+                )
+            except Exception:
+                logger.warning("blueprint coverage check failed", exc_info=True)
+                cov_note, cov_trace = "", []
+            if cov_note:
+                answer += cov_note
+            if cov_trace:
+                trace.extend(cov_trace)
 
         # Close the loop: create any files this turn references but never wrote,
         # so a build actually resolves instead of just parsing (weaknesses.md #2).
@@ -2424,6 +3901,25 @@ class AgentCore:
                 answer += link_note
             if link_trace:
                 trace.extend(link_trace)
+
+        # Phase 3: the only check that runs the backend instead of reading it —
+        # start the generated server, probe it, kill it (weaknesses.md #2). Runs
+        # last, so it tests the final files (after coverage + reference repair).
+        # On by default since docs/fullstack-web-plan.md Phase 0 (it executes
+        # generated code, so `blueprint_smoke_test` stays the kill switch) and
+        # inert unless a blueprint ran.
+        if self._blueprint is not None and settings.blueprint_smoke_test:
+            try:
+                smoke_note, smoke_trace = await self._smoke_test_backend(
+                    self._blueprint
+                )
+            except Exception:
+                logger.warning("blueprint smoke test failed", exc_info=True)
+                smoke_note, smoke_trace = "", []
+            if smoke_note:
+                answer += smoke_note
+            if smoke_trace:
+                trace.extend(smoke_trace)
 
         await self.memory.add_ai(answer)
         return answer, trace

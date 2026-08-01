@@ -17,9 +17,20 @@ from evals.checks import Check
 
 @dataclass(frozen=True)
 class EvalTask:
+    """One eval: a prompt (or an ordered conversation) plus its checks.
+
+    ``prompts`` turns a task into a MULTI-TURN one — the shape the demo actually
+    has, where turn 3 must not break what turn 1 built. ``prompt`` still works
+    exactly as before, so every single-turn task is untouched.
+    """
+
     id: str
-    prompt: str
     checks: list[Check]
+    prompt: str = ""
+    prompts: list[str] | None = None
+
+    def turns(self) -> list[str]:
+        return list(self.prompts) if self.prompts else [self.prompt]
 
 
 @dataclass
@@ -27,6 +38,9 @@ class CheckContext:
     answer: str
     trace: list[dict]
     workdir: Path
+    # Every turn's answer, in order — so a check can look at what turn 2 said
+    # rather than only the last thing printed.
+    answers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -68,26 +82,37 @@ class SuiteReport:
 async def run_task(agent, task: EvalTask, workdir: Path) -> TaskResult:
     """Run one task in ``workdir`` (cwd is switched for the call, then restored).
 
+    A multi-turn task runs every prompt against **one** workdir with **one**
+    agent, and the checks run only after the last turn. The shared agent is not
+    an optimisation: a fresh one per turn would reload the spec from disk and
+    mask exactly the in-memory staleness bugs this suite exists to catch.
+
     Any exception from the agent is caught and recorded as a failure so one bad
-    task never aborts the suite.
+    task never aborts the suite — and a turn that raises stops the conversation,
+    since every later turn would be measuring the wrong thing.
     """
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     prev_cwd = os.getcwd()
+    answers: list[str] = []
     answer, trace = "", []
     error: str | None = None
     try:
         os.chdir(workdir)
-        answer, trace = await agent.chat(task.prompt)
-    except Exception as e:  # noqa: BLE001 — evals must be robust to any failure
-        error = f"agent raised {type(e).__name__}: {e}"
+        for index, prompt in enumerate(task.turns(), 1):
+            try:
+                answer, trace = await agent.chat(prompt)
+            except Exception as e:  # noqa: BLE001 — evals survive any failure
+                error = f"turn {index} raised {type(e).__name__}: {e}"
+                break
+            answers.append(answer or "")
     finally:
         os.chdir(prev_cwd)
 
     if error is not None:
         return TaskResult(task_id=task.id, passed=False, details=[error])
 
-    ctx = CheckContext(answer=answer, trace=trace, workdir=workdir)
+    ctx = CheckContext(answer=answer, trace=trace, workdir=workdir, answers=answers)
     details: list[str] = []
     passed = True
     for check in task.checks:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rich.console import Console
@@ -24,6 +25,10 @@ HELP_TEXT = """
   /load <path>          Load and index a project folder
   /project              Show the currently loaded project
   /index                Re-index the current project
+  /spec                 Show what the agent remembers about this project
+                        (tables, routes, pages — from .coder/project.json)
+  /run [restart|stop|status]  Start the generated app and keep it up across
+                        turns; prints the URL to open
 
 [yellow]Tools & Context[/yellow]
   /tools                List all registered tools (builtin + MCP)
@@ -108,12 +113,87 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
         console.print(table)
         return True
 
+    # ── /run ───────────────────────────────────────────────────────────
+    # Keep the generated app up ACROSS turns, so the demo has a live URL while
+    # the next turn amends the project (docs/fullstack-web-plan.md Phase 6).
+    if cmd == "run":
+        from app.agent.apprunner import get_runner
+
+        runner = get_runner()
+        action = args[0].lower() if args else "start"
+
+        if action in ("stop", "kill"):
+            console.print(
+                "[green]Stopped.[/green]"
+                if runner.stop()
+                else "[yellow]Nothing was running.[/yellow]"
+            )
+            return True
+
+        if action == "status":
+            console.print(f"[cyan]App:[/cyan] {runner.status()}")
+            return True
+
+        if action == "restart":
+            ok, message = runner.restart()
+            console.print(
+                f"[green]Restarted:[/green] {message}"
+                if ok
+                else f"[red]{message}[/red]"
+            )
+            return True
+
+        workdir = repl.agent.project_path or str(Path.cwd())
+        ok, message = runner.start(workdir)
+        if ok:
+            console.print(f"[green]App {message}[/green]")
+            console.print(
+                "[dim]It stays up across turns. `/run restart` after a change, "
+                "`/run stop` when you're done.[/dim]"
+            )
+        else:
+            console.print(f"[red]{message}[/red]")
+        return True
+
     # ── /plan ──────────────────────────────────────────────────────────
     if cmd == "plan":
         if not args:
             console.print("[red]Usage: /plan <task description>[/red]")
             return True
         task = " ".join(args)
+
+        # When the project is remembered, a change request has a far more useful
+        # preview than a generic step list: the delta, and the existing files it
+        # will drag along. Showing that BEFORE it happens is the demo beat.
+        preview = await repl.agent.preview_amendment(task)
+        if preview:
+            console.print(
+                f"[bold]Amendment[/bold] to revision {preview['revision']}"
+                + (f" — {preview['summary']}" if preview.get("summary") else "")
+            )
+            if preview["changes"]:
+                console.print("[bold]Adds[/bold]")
+                for change in preview["changes"]:
+                    console.print(f"  [green]+[/green] {change}")
+            if preview["new_files"]:
+                console.print("[bold]New files[/bold]")
+                for name in preview["new_files"]:
+                    console.print(f"  [green]+[/green] {name}")
+            if preview["edits"]:
+                table = Table(
+                    title="Existing files that will be updated", show_lines=False
+                )
+                table.add_column("File", style="cyan")
+                table.add_column("Why")
+                for filename, reason in preview["edits"]:
+                    table.add_row(filename, reason)
+                console.print(table)
+            else:
+                console.print("[dim]No existing files need updating.[/dim]")
+            console.print(
+                "[dim]Nothing has been changed — run the request to apply it.[/dim]"
+            )
+            return True
         # Cheap regex decomposition first (what chat() would auto-split).
         cheap = repl.agent.split_tasks(task)
         if len(cheap) > 1:
@@ -134,6 +214,73 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
                 str(s.get("suggested_tool") or "-"),
             )
         console.print(table)
+        return True
+
+    # ── /spec ──────────────────────────────────────────────────────────
+    # The visible proof that the agent REMEMBERS the project between turns
+    # (docs/fullstack-web-plan.md Phase 2). Small command, disproportionate
+    # value: it is the answer to "does it actually know what it built?"
+    if cmd == "spec":
+        spec = repl.agent.get_spec()
+        if spec is None:
+            console.print(
+                "[yellow]No project spec yet.[/yellow] One is written after a "
+                "build — e.g. [cyan]build me a blog[/cyan]."
+            )
+            return True
+
+        console.print(
+            f"[bold]{spec.name or 'project'}[/bold] "
+            f"[dim]revision {spec.revision} · {spec.language}/{spec.backend}[/dim]"
+        )
+        if spec.summary:
+            console.print(f"[dim]{spec.summary}[/dim]")
+
+        if spec.entities:
+            table = Table(title="Data", show_lines=False)
+            table.add_column("Entity", style="cyan")
+            table.add_column("Table", style="yellow")
+            table.add_column("Fields")
+            for e in spec.entities:
+                fields = ", ".join(
+                    f"{f.name} {f.type}"
+                    + (" PK" if f.pk else "")
+                    + (f" (rev {f.added_in})" if f.added_in > 1 else "")
+                    for f in e.fields
+                )
+                table.add_row(e.name, e.table, fields)
+            console.print(table)
+
+        if spec.endpoints:
+            table = Table(title="Routes", show_lines=False)
+            table.add_column("Method", style="cyan")
+            table.add_column("Path", style="yellow")
+            table.add_column("Reads/writes")
+            table.add_column("Rev", justify="right")
+            for e in spec.endpoints:
+                table.add_row(e.method, e.path, e.entity or "-", str(e.added_in))
+            console.print(table)
+
+        if spec.pages:
+            table = Table(title="Pages", show_lines=False)
+            table.add_column("Route", style="cyan")
+            table.add_column("Template", style="yellow")
+            table.add_column("Nav label")
+            table.add_column("Rev", justify="right")
+            for p in spec.pages:
+                table.add_row(
+                    p.route or "-",
+                    p.template or "-",
+                    p.nav_label or "-",
+                    str(p.added_in),
+                )
+            console.print(table)
+
+        if spec.history:
+            console.print("[bold]History[/bold]")
+            for h in spec.history:
+                added = ", ".join(h.added) if h.added else "-"
+                console.print(f"  [cyan]rev {h.revision}[/cyan] {h.request} → {added}")
         return True
 
     # ── /model ─────────────────────────────────────────────────────────

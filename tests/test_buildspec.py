@@ -365,8 +365,15 @@ async def test_multi_file_flow_threads_the_spec_into_every_file(tmp_path, monkey
     page_prompt = a._llm_direct.prompts[3]
     # The planner sees the nav the user dictated…
     assert "Our Story" in plan_prompt and "rsvp.html" in plan_prompt
-    # …the stylesheet gets the concrete fonts/colours, not the adjectives…
-    assert "Great Vibes" in css_prompt and "#f6e7ef" in css_prompt
+    # …the stylesheet gets the concrete design, not the adjectives. Offline
+    # (settings.allow_network is False by default) "concrete fonts" means a real
+    # system font stack rather than a Google Fonts family: the CDN link would be
+    # a dead dependency here and the page would silently lose its typography.
+    # See buildspec.to_context_block; the online branch is covered in
+    # tests/test_scaffold.py.
+    assert "#f6e7ef" in css_prompt
+    assert "--font-heading" in css_prompt
+    assert "googleapis" not in css_prompt.lower()
     # …and every page gets the same canonical nav list.
     assert "Our Story" in page_prompt and "RSVP" in page_prompt
     # The spec is retained for the post-generation nav check.

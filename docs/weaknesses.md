@@ -53,6 +53,22 @@ What's missing: dead-reference checks (does every `href`/`src`/`import` resolve?
 project's tests/linter, and any behavioral smoke test. The `verify` step is the natural home for
 this and today does the least useful 20%.
 
+**Largely addressed (2026-07-22).** Three of the four gaps are closed, in the order they were found:
+- Dead references → `_repair_dead_references` (`app/agent/references.py`), plus nav-consistency and
+  page-link passes.
+- *Does the code do what was asked* → `_intent_repair` (`app/agent/intent.py`), a second
+  verification stage that judges the file against the **user's message** — which the old repair
+  prompt never even received. Live-caught a `median()` that returned the mean and a login page with
+  no password field, both of which the syntax check called `verified OK`. Deliberately conservative:
+  unreadable verdicts pass, complaints are filtered deterministically, and a rewrite that breaks the
+  syntax check is reverted.
+- The status line is no longer a bare syntax claim: it reads `verified OK; intent OK`, or
+  `may not meet: …` when a requirement survives the repair attempt.
+
+**Still open:** running the project's real tests/linter, and any actual behavioral smoke test (does
+the JS *execute* correctly). The intent check is an LLM's reading of the file, not an execution of
+it — a stronger claim than "it parses", still weaker than "it works".
+
 ---
 
 ## 3. Nothing checks that the *whole* request was satisfied 🔴

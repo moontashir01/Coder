@@ -1,0 +1,184 @@
+/* {{PROJECT_NAME}} — site styles.
+ *
+ * Fonts are declared ONCE here as custom properties. Every other rule (and
+ * every stylesheet added later) must use var(--font-heading) / var(--font-body)
+ * rather than naming a family directly, so changing the typography is a
+ * two-line edit in this file.
+ *
+ * These are system font stacks on purpose: they need no network, so the site
+ * renders with the intended typography even with no internet connection. Do not
+ * add a Google Fonts <link> unless the site is known to be online — offline it
+ * costs a few seconds of blocked DNS per page and then falls back anyway.
+ */
+
+:root {
+  --font-heading: ui-sans-serif, system-ui, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  --font-body: ui-sans-serif, system-ui, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+
+  --color-bg: #ffffff;
+  --color-surface: #f6f7f9;
+  --color-border: #e3e6ea;
+  --color-text: #16191d;
+  --color-muted: #5c6673;
+  --color-accent: #2563eb;
+
+  --space: 1rem;
+  --radius: 8px;
+  --max-width: 68rem;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  color: var(--color-text);
+  background: var(--color-bg);
+  line-height: 1.6;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-heading);
+  line-height: 1.25;
+  margin: 0 0 0.5em;
+}
+
+a {
+  color: var(--color-accent);
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+}
+
+/* --- layout ------------------------------------------------------------ */
+
+.site-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space);
+  padding: var(--space) calc(var(--space) * 1.5);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.brand {
+  font-family: var(--font-heading);
+  font-weight: 700;
+  font-size: 1.15rem;
+  text-decoration: none;
+  color: var(--color-text);
+}
+
+.site-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: calc(var(--space) * 1.25);
+}
+
+.site-nav a {
+  text-decoration: none;
+  color: var(--color-muted);
+}
+
+.site-nav a:hover,
+.site-nav a.active {
+  color: var(--color-text);
+}
+
+.site-main {
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: calc(var(--space) * 2) calc(var(--space) * 1.5);
+}
+
+.site-footer {
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: calc(var(--space) * 2) calc(var(--space) * 1.5);
+  border-top: 1px solid var(--color-border);
+  color: var(--color-muted);
+  font-size: 0.9rem;
+}
+
+.hero h1 {
+  font-size: clamp(1.9rem, 4vw, 3rem);
+}
+
+.lede {
+  color: var(--color-muted);
+  font-size: 1.05rem;
+  max-width: 45rem;
+}
+
+/* --- common pieces ------------------------------------------------------ */
+
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+  gap: var(--space);
+}
+
+label {
+  display: block;
+  margin-bottom: 0.25rem;
+  font-weight: 600;
+}
+
+input,
+select,
+textarea {
+  width: 100%;
+  padding: 0.55rem 0.7rem;
+  margin-bottom: var(--space);
+  font: inherit;
+  color: inherit;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+button,
+.button {
+  display: inline-block;
+  padding: 0.55rem 1.1rem;
+  font: inherit;
+  font-weight: 600;
+  color: #ffffff;
+  background: var(--color-accent);
+  border: 0;
+  border-radius: var(--radius);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+button:hover,
+.button:hover {
+  filter: brightness(1.08);
+}
+
+.flash {
+  padding: 0.75rem var(--space);
+  margin-bottom: var(--space);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}

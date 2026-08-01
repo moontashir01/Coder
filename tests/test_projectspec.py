@@ -1,0 +1,761 @@
+"""ProjectSpec — persistent project memory (app/agent/projectspec.py), Phase 2.
+
+Fully offline. The DDL tests execute against a real in-memory sqlite3, because
+"emits SQL-shaped text" and "emits SQL that works" are different claims and only
+one of them is worth making.
+"""
+
+import io
+import json
+import sqlite3
+
+import pytest
+from rich.console import Console
+
+import app.cli.commands as commands_mod
+from app.agent.blueprint import (
+    TIER_CORE,
+    TIER_REQUESTED,
+    ApiContract,
+    Blueprint,
+    Endpoint,
+    Feature,
+    PlannedFile,
+)
+from app.agent.projectspec import (
+    CONTEXT_BUDGET_CHARS,
+    Entity,
+    Field,
+    Page,
+    ProjectSpec,
+    SpecDelta,
+    SpecEndpoint,
+    entities_from_sql,
+    parse_schema_line,
+    routes_from_source,
+)
+from app.agent.runtime_probe import Stack
+from app.cli.commands import handle_command
+
+FLASK_STACK = Stack(language="python", backend="flask", note="Flask is installed")
+
+
+# ---------------------------------------------------------------------------
+# parse_schema_line — free text becomes something diffable
+# ---------------------------------------------------------------------------
+
+
+def test_parses_the_blueprints_own_schema_format():
+    """This exact string shape comes from app/resources/prompts/blueprint.md."""
+    entity = parse_schema_line(
+        "users(email TEXT PRIMARY KEY, password_hash TEXT NOT NULL) — seed a demo user"
+    )
+
+    assert entity is not None
+    assert entity.table == "users"
+    assert entity.name == "user"  # singularised for a readable label
+    assert [f.name for f in entity.fields] == ["email", "password_hash"]
+    email = entity.field("email")
+    assert email.pk is True and email.required is True and email.type == "TEXT"
+    assert entity.field("password_hash").required is True
+
+
+def test_types_are_normalised_to_sqlite_storage_classes():
+    entity = parse_schema_line(
+        "products(id INT PRIMARY KEY, title VARCHAR(255), price DECIMAL(10,2), "
+        "live BOOLEAN, added DATETIME)"
+    )
+    types = {f.name: f.type for f in entity.fields}
+    assert types == {
+        "id": "INTEGER",
+        "title": "TEXT",
+        "price": "REAL",
+        "live": "INTEGER",
+        "added": "TEXT",
+    }
+
+
+def test_parenthesised_types_are_not_split_on_their_comma():
+    """`DECIMAL(10,2)` must stay one column, not become two."""
+    entity = parse_schema_line("t(a DECIMAL(10,2), b TEXT)")
+    assert [f.name for f in entity.fields] == ["a", "b"]
+
+
+def test_table_level_constraints_are_not_columns():
+    entity = parse_schema_line(
+        "orders(id INTEGER PRIMARY KEY, user_id INTEGER, "
+        "FOREIGN KEY (user_id) REFERENCES users(id))"
+    )
+    assert [f.name for f in entity.fields] == ["id", "user_id"]
+
+
+@pytest.mark.parametrize(
+    "line", ["", "not a schema at all", "users", "users()", "(a TEXT)"]
+)
+def test_unparseable_schema_lines_return_none(line):
+    assert parse_schema_line(line) is None
+
+
+@pytest.mark.parametrize(
+    "table,expected",
+    [("products", "product"), ("categories", "category"), ("status", "status")],
+)
+def test_singularisation(table, expected):
+    entity = parse_schema_line(f"{table}(id INTEGER PRIMARY KEY)")
+    assert entity.name == expected
+
+
+# ---------------------------------------------------------------------------
+# ddl() / migrations() — the reason fields are structured at all
+# ---------------------------------------------------------------------------
+
+
+def _spec_with_product():
+    return ProjectSpec(
+        name="bookshop",
+        entities=(
+            Entity(
+                name="product",
+                table="products",
+                fields=(
+                    Field("id", "INTEGER", pk=True, required=True),
+                    Field("title", "TEXT", required=True),
+                    Field("price", "REAL"),
+                ),
+            ),
+        ),
+    )
+
+
+def test_ddl_executes_against_real_sqlite():
+    """'Looks like SQL' is not the claim being made — 'sqlite accepts it' is."""
+    spec = _spec_with_product()
+    conn = sqlite3.connect(":memory:")
+    try:
+        for statement in spec.ddl():
+            conn.execute(statement)
+        conn.execute(
+            "INSERT INTO products (title, price) VALUES (?, ?)", ("Dune", 9.99)
+        )
+        row = conn.execute("SELECT title, price FROM products").fetchone()
+        assert row == ("Dune", 9.99)
+    finally:
+        conn.close()
+
+
+def test_ddl_is_idempotent():
+    spec = _spec_with_product()
+    conn = sqlite3.connect(":memory:")
+    try:
+        for _ in range(2):
+            for statement in spec.ddl():
+                conn.execute(statement)
+    finally:
+        conn.close()
+
+
+def test_migrations_only_cover_fields_added_after_the_given_revision():
+    spec = _spec_with_product()
+    spec.entities = (
+        Entity(
+            name="product",
+            table="products",
+            fields=spec.entities[0].fields + (Field("image_path", "TEXT", added_in=2),),
+        ),
+    )
+
+    assert spec.migrations(since=2) == []  # nothing newer than rev 2
+    later = spec.migrations(since=1)
+    assert later == ['ensure_column(conn, "products", "image_path", "TEXT")']
+
+
+def test_a_field_added_later_is_a_migration_not_part_of_create_table():
+    """Otherwise adding a field in turn 3 would mean dropping turn 1's data."""
+    spec = _spec_with_product()
+    spec.entities = (
+        Entity(
+            name="product",
+            table="products",
+            fields=spec.entities[0].fields + (Field("image_path", "TEXT", added_in=2),),
+        ),
+    )
+    assert "image_path" not in spec.ddl()[0]
+    assert any("image_path" in m for m in spec.migrations(since=1))
+
+
+def test_migrations_never_try_to_add_a_primary_key():
+    """SQLite cannot ALTER TABLE ADD COLUMN a PRIMARY KEY."""
+    spec = ProjectSpec(
+        entities=(
+            Entity("thing", "things", (Field("id", "INTEGER", pk=True, added_in=3),)),
+        )
+    )
+    assert spec.migrations(since=1) == []
+
+
+def test_ensure_column_migration_actually_works_against_sqlite():
+    """Exercise the real primitive the scaffold ships, on a table with data."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, title TEXT)")
+        conn.execute("INSERT INTO products (title) VALUES ('Dune')")
+
+        def ensure_column(c, table, column, decl):
+            cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+        for _ in range(2):  # idempotent
+            ensure_column(conn, "products", "image_path", "TEXT")
+
+        row = conn.execute("SELECT title, image_path FROM products").fetchone()
+        assert row == ("Dune", None)  # the existing row survived
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+
+def test_round_trip_save_and_load(tmp_path):
+    spec = _spec_with_product()
+    spec.endpoints = (SpecEndpoint("POST", "/admin/products", "{title,price}"),)
+    spec.pages = (
+        Page("/", "templates/index.html", "Home", "storefront", ("product",)),
+    )
+    spec.summary = "Online bookstore"
+    spec.language, spec.backend = "python", "flask"
+
+    assert spec.save(tmp_path) is True
+    loaded = ProjectSpec.load(tmp_path)
+
+    assert loaded is not None
+    assert loaded.name == spec.name
+    assert loaded.summary == "Online bookstore"
+    assert loaded.backend == "flask"
+    assert [e.table for e in loaded.entities] == ["products"]
+    assert [f.name for f in loaded.entities[0].fields] == ["id", "title", "price"]
+    assert loaded.entities[0].field("id").pk is True
+    assert [(e.method, e.path) for e in loaded.endpoints] == [
+        ("POST", "/admin/products")
+    ]
+    assert loaded.pages[0].nav_label == "Home"
+
+
+def test_spec_lands_in_the_dot_coder_directory(tmp_path):
+    """Inside the project (diffable, travels with the folder) and dot-prefixed,
+    so the RAG indexer and project_memory already skip it."""
+    _spec_with_product().save(tmp_path)
+    assert (tmp_path / ".coder" / "project.json").is_file()
+
+
+def test_load_returns_none_when_absent(tmp_path):
+    assert ProjectSpec.load(tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "content", ["{not json", "", "[]", '"a string"', '{"entities": "not a list"}']
+)
+def test_corrupt_spec_returns_none_never_raises(tmp_path, content):
+    """A garbled spec must degrade to 'no memory' — today's behaviour — not to a
+    broken turn."""
+    path = ProjectSpec.path_for(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+    spec = ProjectSpec.load(tmp_path)
+    assert spec is None or spec.entities == ()
+
+
+def test_save_is_atomic_and_leaves_no_temp_file(tmp_path):
+    spec = _spec_with_product()
+    spec.save(tmp_path)
+    leftovers = list((tmp_path / ".coder").glob("*.tmp"))
+    assert leftovers == []
+    # And the file that landed is complete, parseable JSON.
+    data = json.loads(ProjectSpec.path_for(tmp_path).read_text(encoding="utf-8"))
+    assert data["spec_version"] == 1 and data["revision"] == 1
+
+
+def test_save_returns_false_rather_than_raising_when_it_cannot_write(tmp_path):
+    blocker = tmp_path / ".coder"
+    blocker.write_text("I am a file, not a directory", encoding="utf-8")
+    assert _spec_with_product().save(tmp_path) is False
+
+
+def test_hostile_values_are_rejected_on_load(tmp_path):
+    """The spec is read back and fed to a model, so it gets the same validation
+    discipline as blueprint._norm_filename / _clean_endpoints."""
+    path = ProjectSpec.path_for(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "revision": 1,
+                "entities": [
+                    {"table": "ok_table", "fields": [{"name": "a", "type": "TEXT"}]},
+                    {"table": "drop table x;--", "fields": [{"name": "b"}]},
+                ],
+                "endpoints": [
+                    {"method": "POST", "path": "/fine"},
+                    {"method": "STEAL", "path": "/bad"},
+                    {"method": "GET", "path": "not-absolute"},
+                ],
+                "pages": [{"template": "../../etc/passwd"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    spec = ProjectSpec.load(tmp_path)
+
+    assert [e.table for e in spec.entities] == ["ok_table"]
+    assert [e.path for e in spec.endpoints] == ["/fine"]
+    assert all(".." not in p.template for p in spec.pages)
+
+
+# ---------------------------------------------------------------------------
+# to_context_block — the method that replaces "re-read the chat history"
+# ---------------------------------------------------------------------------
+
+
+def test_context_block_states_the_contract():
+    spec = _spec_with_product()
+    spec.endpoints = (SpecEndpoint("POST", "/admin/products", "{title,price}"),)
+    spec.pages = (Page("/", "templates/index.html", "Home"),)
+
+    block = spec.to_context_block()
+
+    assert "products(" in block and "title TEXT" in block
+    assert "POST /admin/products" in block
+    assert "revision 1" in block
+
+
+def test_context_block_stays_inside_its_budget():
+    """It rides in the same prompt as the plan manifest and sibling context."""
+    spec = ProjectSpec(
+        name="big",
+        summary="x" * 300,
+        entities=tuple(
+            Entity(
+                f"e{i}",
+                f"table{i}",
+                tuple(Field(f"field_{j}", "TEXT") for j in range(20)),
+            )
+            for i in range(10)
+        ),
+        endpoints=tuple(
+            SpecEndpoint("POST", f"/route/{i}", "{a,b,c}") for i in range(20)
+        ),
+        pages=tuple(Page(f"/p{i}", f"templates/p{i}.html", f"P{i}") for i in range(20)),
+    )
+    assert len(spec.to_context_block()) <= CONTEXT_BUDGET_CHARS
+
+
+def test_context_block_drops_pages_before_schema():
+    """Schema is what a migration depends on, so it is the last thing to go."""
+    spec = ProjectSpec(
+        entities=(
+            Entity(
+                "product", "products", tuple(Field(f"f{i}", "TEXT") for i in range(20))
+            ),
+        ),
+        pages=tuple(
+            Page(f"/p{i}", f"templates/page{i}.html", f"Page {i}") for i in range(30)
+        ),
+    )
+    block = spec.to_context_block()
+    assert "products(" in block
+
+
+def test_empty_spec_still_produces_a_header():
+    assert "revision 1" in ProjectSpec().to_context_block()
+
+
+# ---------------------------------------------------------------------------
+# from_blueprint
+# ---------------------------------------------------------------------------
+
+
+def _bookshop_blueprint():
+    return Blueprint(
+        summary="Online bookstore with admin product management",
+        features=(
+            Feature("Product catalog", TIER_REQUESTED, ("templates/index.html",)),
+            Feature("Backend", TIER_CORE, ("app.py",)),
+        ),
+        files=(
+            PlannedFile("app.py", "create", "routes", "backend"),
+            PlannedFile("templates/index.html", "create", "storefront product grid"),
+            PlannedFile("templates/admin.html", "create", "admin form"),
+        ),
+        contract=ApiContract(
+            endpoints=(
+                Endpoint("GET", "/products", "", "200 list"),
+                Endpoint("POST", "/admin/products", "{title, price}", "302"),
+            ),
+            data_schema=(
+                "products(id INTEGER PRIMARY KEY, title TEXT NOT NULL, price REAL)",
+            ),
+        ),
+        stack=FLASK_STACK,
+    )
+
+
+def test_from_blueprint_maps_the_contract_to_structured_entities(tmp_path):
+    spec = ProjectSpec.from_blueprint(_bookshop_blueprint(), tmp_path, "bookshop")
+
+    assert spec.name == "bookshop"
+    assert spec.backend == "flask"
+    assert spec.revision == 1
+    product = spec.entity("product")
+    assert product is not None and product.table == "products"
+    assert [f.name for f in product.fields] == ["id", "title", "price"]
+    assert [(e.method, e.path) for e in spec.endpoints] == [
+        ("GET", "/products"),
+        ("POST", "/admin/products"),
+    ]
+    assert {p.template for p in spec.pages} == {
+        "templates/index.html",
+        "templates/admin.html",
+    }
+    assert spec.entity("product") is spec.entity("products")  # name or table
+
+
+def test_base_html_is_not_recorded_as_a_page(tmp_path):
+    """Live build recorded `templates/base.html` with the invented route `/base`
+    and nav label "Base". It is the shell every page extends; an amendment turn
+    would have tried to add a nav link to it."""
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "templates" / "base.html").write_text(
+        "<html><body>{% block content %}{% endblock %}</body></html>", encoding="utf-8"
+    )
+    bp = Blueprint(
+        files=(
+            PlannedFile("templates/base.html", "create", "the shell"),
+            PlannedFile("templates/index.html", "create", "home"),
+        ),
+        contract=ApiContract(endpoints=(Endpoint("GET", "/"),)),
+        stack=FLASK_STACK,
+    )
+
+    spec = ProjectSpec.from_blueprint(bp, tmp_path)
+
+    assert [p.template for p in spec.pages] == ["templates/index.html"]
+    assert not any(p.route == "/base" for p in spec.pages)
+
+
+def test_declared_but_unbuilt_endpoints_are_not_claimed_to_exist(tmp_path):
+    """The context block says "routes that already exist — do not redefine".
+    Listing one that was never written tells the model not to build it. Measured
+    live: the blueprint declared POST /api/login and the coverage check reported
+    it unwired on the same turn."""
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask, render_template\n\n"
+        "app = Flask(__name__)\n\n\n"
+        '@app.route("/login", methods=["GET", "POST"])\n'
+        "def login():\n"
+        '    return render_template("login.html")\n',
+        encoding="utf-8",
+    )
+    bp = Blueprint(
+        files=(PlannedFile("templates/login.html"),),
+        contract=ApiContract(
+            endpoints=(
+                Endpoint("POST", "/api/login", "{email, password}"),
+                Endpoint("POST", "/login"),
+            )
+        ),
+        stack=FLASK_STACK,
+    )
+
+    spec = ProjectSpec.from_blueprint(bp, tmp_path)
+
+    paths = {e.path for e in spec.endpoints}
+    assert "/api/login" not in paths  # declared, never built
+    assert "/login" in paths
+
+
+def test_declared_endpoints_survive_when_there_is_no_backend_to_check(tmp_path):
+    """With no .py on disk there is nothing to verify against, so the contract
+    is all we have — keep it rather than silently emptying the spec."""
+    bp = Blueprint(
+        files=(PlannedFile("templates/login.html"),),
+        contract=ApiContract(endpoints=(Endpoint("POST", "/api/login"),)),
+        stack=FLASK_STACK,
+    )
+    spec = ProjectSpec.from_blueprint(bp, tmp_path)
+    assert [e.path for e in spec.endpoints] == ["/api/login"]
+
+
+def test_pages_include_a_route_the_blueprint_never_planned(tmp_path):
+    """`GET /` renders the scaffold's index.html, which was copied in rather
+    than planned — without this the home page is missing from the spec."""
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "templates" / "index.html").write_text(
+        '{% extends "base.html" %}', encoding="utf-8"
+    )
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask, render_template\n\n"
+        "app = Flask(__name__)\n\n\n"
+        '@app.route("/")\n'
+        "def index():\n"
+        '    return render_template("index.html")\n',
+        encoding="utf-8",
+    )
+    bp = Blueprint(
+        files=(PlannedFile("app.py"), PlannedFile("templates/products.html")),
+        contract=ApiContract(endpoints=(Endpoint("GET", "/products"),)),
+        stack=FLASK_STACK,
+    )
+
+    spec = ProjectSpec.from_blueprint(bp, tmp_path)
+
+    home = next((p for p in spec.pages if p.route == "/"), None)
+    assert home is not None
+    assert home.template == "templates/index.html"
+
+
+def test_from_blueprint_reads_real_routes_off_app_py(tmp_path):
+    """The spec should describe what was BUILT, so the route→template mapping is
+    read from the generated app.py rather than guessed from a filename."""
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask, render_template\n\n"
+        "app = Flask(__name__)\n\n\n"
+        '@app.route("/")\n'
+        "def index():\n"
+        '    return render_template("index.html")\n\n\n'
+        '@app.route("/admin/products", methods=["GET", "POST"])\n'
+        "def admin_products():\n"
+        '    return render_template("admin.html")\n',
+        encoding="utf-8",
+    )
+    bp = _bookshop_blueprint()
+
+    spec = ProjectSpec.from_blueprint(bp, tmp_path, "bookshop")
+
+    admin = next(p for p in spec.pages if p.template == "templates/admin.html")
+    assert admin.route == "/admin/products"  # from app.py, not from the filename
+    assert any(e.path == "/" for e in spec.endpoints)  # route the contract missed
+
+
+def test_from_blueprint_falls_back_to_create_table_on_disk(tmp_path):
+    """No declared schema, but the build really made a table — record it."""
+    (tmp_path / "db.py").write_text(
+        "def init_db():\n"
+        "    conn.execute('''CREATE TABLE IF NOT EXISTS posts (\n"
+        "        id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+        "        title TEXT NOT NULL,\n"
+        "        body TEXT)''')\n",
+        encoding="utf-8",
+    )
+    bp = Blueprint(
+        files=(PlannedFile("app.py"), PlannedFile("templates/index.html")),
+        contract=ApiContract(endpoints=(Endpoint("GET", "/posts"),)),
+        stack=FLASK_STACK,
+    )
+
+    spec = ProjectSpec.from_blueprint(bp, tmp_path)
+
+    post = spec.entity("post")
+    assert post is not None and post.table == "posts"
+    assert [f.name for f in post.fields] == ["id", "title", "body"]
+
+
+def test_entities_from_sql_ignores_commented_examples():
+    """The scaffold ships a COMMENTED CREATE TABLE. It creates nothing, so
+    counting it would invent a table the database does not have."""
+    commented = (
+        "def init_db():\n"
+        "    # conn.execute('''CREATE TABLE IF NOT EXISTS products (id INTEGER)''')\n"
+        "    pass\n"
+    )
+    assert entities_from_sql({"db": commented}) == []
+
+
+def test_entities_from_sql_finds_statements_mid_file():
+    """The statement is rarely the last thing in the file."""
+    source = (
+        "def init_db():\n"
+        "    conn.execute('''CREATE TABLE IF NOT EXISTS posts (\n"
+        "        id INTEGER PRIMARY KEY, title TEXT)''')\n"
+        "    conn.commit()\n"
+        "    conn.close()\n"
+    )
+    entities = entities_from_sql({"db": source})
+    assert [e.table for e in entities] == ["posts"]
+
+
+def test_entities_from_sql_handles_parenthesised_types():
+    """`DECIMAL(10,2)` means the closing paren is not the first one."""
+    source = (
+        "conn.execute('''CREATE TABLE items (\n"
+        "    id INTEGER PRIMARY KEY,\n"
+        "    price DECIMAL(10,2),\n"
+        "    name VARCHAR(255))''')\n"
+    )
+    entities = entities_from_sql({"db": source})
+    assert [f.name for f in entities[0].fields] == ["id", "price", "name"]
+    assert entities[0].field("price").type == "REAL"
+
+
+# ---------------------------------------------------------------------------
+# routes_from_source
+# ---------------------------------------------------------------------------
+
+
+def test_routes_and_templates_are_read_together():
+    source = (
+        '@app.route("/")\n'
+        "def index():\n"
+        '    return render_template("index.html")\n\n'
+        '@app.route("/posts/new", methods=["GET", "POST"])\n'
+        "def new_post():\n"
+        "    if request.method == 'POST':\n"
+        "        return redirect('/posts')\n"
+        '    return render_template("new_post.html")\n'
+    )
+    routes = routes_from_source(source)
+
+    assert ("GET", "/", "index", "index.html") in routes
+    assert ("GET", "/posts/new", "new_post", "new_post.html") in routes
+    assert ("POST", "/posts/new", "new_post", "new_post.html") in routes
+
+
+def test_routes_from_empty_or_route_free_source():
+    assert routes_from_source("") == []
+    assert routes_from_source("x = 1\n") == []
+
+
+# ---------------------------------------------------------------------------
+# merge_delta
+# ---------------------------------------------------------------------------
+
+
+def test_merge_delta_bumps_the_revision_and_stamps_new_fields():
+    spec = _spec_with_product()
+    delta = SpecDelta(
+        summary="add product images",
+        add_fields=(("product", Field("image_path", "TEXT")),),
+    )
+
+    impacted = spec.merge_delta(delta, request="add a picture to products")
+
+    assert spec.revision == 2
+    added = spec.entity("product").field("image_path")
+    assert added is not None and added.added_in == 2
+    # …which is exactly what makes the migration fall out for free.
+    assert spec.migrations(since=1) == [
+        'ensure_column(conn, "products", "image_path", "TEXT")'
+    ]
+    assert {"db.py", "models.py", "seed.py"} <= set(impacted)
+
+
+def test_merge_delta_records_history():
+    spec = _spec_with_product()
+    spec.merge_delta(
+        SpecDelta(add_endpoints=(SpecEndpoint("POST", "/cart"),)), request="add a cart"
+    )
+    assert len(spec.history) == 1
+    assert spec.history[0].revision == 2
+    assert spec.history[0].request == "add a cart"
+    assert "POST /cart" in spec.history[0].added
+
+
+def test_merge_delta_is_idempotent_for_things_that_already_exist():
+    spec = _spec_with_product()
+    delta = SpecDelta(add_fields=(("product", Field("title", "TEXT")),))
+    spec.merge_delta(delta)
+    assert len([f for f in spec.entity("product").fields if f.name == "title"]) == 1
+
+
+def test_merge_delta_survives_a_round_trip(tmp_path):
+    spec = _spec_with_product()
+    spec.merge_delta(
+        SpecDelta(add_fields=(("product", Field("image_path", "TEXT")),)),
+        request="add images",
+    )
+    spec.save(tmp_path)
+
+    loaded = ProjectSpec.load(tmp_path)
+
+    assert loaded.revision == 2
+    assert loaded.entity("product").field("image_path").added_in == 2
+    assert loaded.history[0].request == "add images"
+
+
+# ---------------------------------------------------------------------------
+# /spec — the visible proof that the agent remembers
+# ---------------------------------------------------------------------------
+
+
+class _FakeAgent:
+    def __init__(self, spec):
+        self._spec = spec
+
+    def get_spec(self):
+        return self._spec
+
+
+class _FakeRepl:
+    def __init__(self, spec):
+        self.agent = _FakeAgent(spec)
+
+
+@pytest.fixture
+def captured_console(monkeypatch):
+    buf = io.StringIO()
+    monkeypatch.setattr(
+        commands_mod, "console", Console(file=buf, force_terminal=False, width=200)
+    )
+    return buf
+
+
+async def test_spec_command_shows_the_contract(captured_console):
+    spec = _spec_with_product()
+    spec.name = "bookshop"
+    spec.language, spec.backend = "python", "flask"
+    spec.endpoints = (SpecEndpoint("POST", "/admin/products", entity="product"),)
+    spec.pages = (Page("/", "templates/index.html", "Home"),)
+
+    handled = await handle_command("/spec", _FakeRepl(spec))
+
+    out = captured_console.getvalue()
+    assert handled is True
+    assert "bookshop" in out and "revision 1" in out
+    assert "products" in out and "title" in out
+    assert "/admin/products" in out
+    assert "templates/index.html" in out
+
+
+async def test_spec_command_when_there_is_nothing_remembered(captured_console):
+    handled = await handle_command("/spec", _FakeRepl(None))
+    assert handled is True
+    assert "No project spec yet" in captured_console.getvalue()
+
+
+async def test_spec_command_shows_the_revision_a_field_arrived_in(captured_console):
+    """The demo beat: proof that turn 2's column is recorded as turn 2's."""
+    spec = _spec_with_product()
+    spec.merge_delta(
+        SpecDelta(add_fields=(("product", Field("image_path", "TEXT")),)),
+        request="add a picture",
+    )
+
+    await handle_command("/spec", _FakeRepl(spec))
+
+    out = captured_console.getvalue()
+    assert "image_path" in out and "rev 2" in out
+    assert "add a picture" in out  # history line
+
+
+def test_new_page_marks_base_html_impacted():
+    """The nav lives in base.html, so a new page always touches it."""
+    spec = _spec_with_product()
+    impacted = spec.merge_delta(
+        SpecDelta(add_pages=(Page("/cart", "templates/cart.html", "Cart"),))
+    )
+    assert "templates/base.html" in impacted
+    assert "templates/cart.html" in impacted

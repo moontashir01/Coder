@@ -1,4 +1,5 @@
 """Pytest bootstrap: put the project root on sys.path so `app` and `config` import."""
+
 import sys
 from pathlib import Path
 
@@ -18,3 +19,38 @@ def _isolate_embed_cache(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(
         settings, "embed_cache_dir", tmp_path_factory.mktemp("embed_cache")
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_intent_check(monkeypatch):
+    """Default the intent check OFF in tests — it must be opted into explicitly.
+
+    It runs inside `_verify_and_repair`, so it fires on EVERY file-writing test,
+    and it calls `_llm_edit` — which the file-flow tests script only when they
+    exercise a surgical edit. Left on, the rest reach a real ChatOllama and the
+    suite stops being offline (measured: 28s → 611s, all still "passing", which
+    is exactly how a silent network dependency gets into a test suite).
+
+    `tests/test_intent.py` turns it back on for the tests that are about it.
+    """
+    monkeypatch.setattr(settings, "check_intent", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_blueprint(monkeypatch):
+    """Default the blueprint stage OFF in tests — same reason as `_no_intent_check`.
+
+    `expand_requirements` and `blueprint_smoke_test` ship ON (Phase 0 of
+    docs/fullstack-web-plan.md), but `should_blueprint()` matches ordinary
+    file-writing prompts like "Create an index.html file for a simple landing
+    page" (evals/tasks.py::create_html_page, and several tests). Left on, those
+    tests would call `_expand_requirements` → a real ChatOllama, and the suite
+    would silently stop being offline while still reporting green — exactly the
+    trap `_no_intent_check` documents (28s → 611s, all still "passing").
+    The smoke test is worse: it would *execute* a scripted-LLM file as a server
+    subprocess.
+
+    `tests/test_blueprint.py` and `tests/test_evals.py` opt back in explicitly.
+    """
+    monkeypatch.setattr(settings, "expand_requirements", False)
+    monkeypatch.setattr(settings, "blueprint_smoke_test", False)
