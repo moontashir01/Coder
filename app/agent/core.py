@@ -54,9 +54,11 @@ from app.agent.intent import (
 from app.agent.planner import Planner, _extract_json
 from app.agent.projectspec import (
     README_MARKER,
+    Entity,
     ProjectSpec,
     SpecDelta,
     delta_from_data,
+    entities_from_data,
     parse_schema_line,
 )
 from app.agent.pyimports import (
@@ -234,6 +236,22 @@ def _load_blueprint_prompt() -> str:
         return (
             "You expand a build request into a JSON blueprint with keys "
             '"summary", "features", "files", "contract". Output ONLY JSON.'
+        )
+
+
+_SCHEMA_PROMPT_PATH = settings.prompts_dir / "schema.md"
+
+
+def _load_schema_prompt() -> str:
+    """The schema-first extraction prompt (Phase C1, bundled resource)."""
+    try:
+        return _SCHEMA_PROMPT_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return (
+            "You decide what a web app STORES. Reply with ONLY JSON: "
+            '{"summary": "...", "entities": [{"name": "product", "table": '
+            '"products", "fields": [{"name": "id", "type": "INTEGER", "pk": '
+            "true}]}]}. SQLite types only. Output ONLY JSON."
         )
 
 
@@ -2454,7 +2472,38 @@ class AgentCore:
         answer = f"Handled {len(ops)} file(s):\n" + "\n".join(summaries)
         return answer, trace
 
-    async def _expand_requirements(self, user_message: str) -> Blueprint | None:
+    async def _extract_schema(self, user_message: str) -> tuple[Entity, ...]:
+        """What this app STORES — one temperature-0 call, before any layout.
+
+        Phase C1 of `docs/always-fullstack-plan.md`. The schema used to arrive as
+        free text inside the blueprint's own answer, which meant the pages and
+        the tables that back them were invented in the same breath and agreed
+        only by luck: `Page.reads` came out empty, `_guess_entity` matched
+        entities by substring, and `parse_schema_line` had to reverse-engineer
+        columns out of prose before a migration could exist.
+
+        Asking first, on its own, in an already-structured shape, makes the
+        layout call a *derivation* instead of a second invention.
+
+        Returns ``()`` on any failure — the caller then behaves exactly as it did
+        before this stage existed, taking the schema from the blueprint's own
+        free-text `data_schema`.
+        """
+        messages = [
+            SystemMessage(content=_load_schema_prompt()),
+            HumanMessage(content=f"Request: {user_message}\n\nOutput the JSON now:"),
+        ]
+        try:
+            raw = self._llm_blueprint.invoke(messages).content
+            parsed = _extract_json(str(raw))
+        except Exception as e:
+            logger.debug("schema extraction failed: %s", e)
+            return ()
+        return entities_from_data(parsed if isinstance(parsed, dict) else None)
+
+    async def _expand_requirements(
+        self, user_message: str, entities: tuple[Entity, ...] = ()
+    ) -> Blueprint | None:
         """Infer the WHOLE build from a short request (Requirements Blueprint).
 
         ONE LLM call, reached only when `should_blueprint()` matched and
@@ -2463,16 +2512,31 @@ class AgentCore:
         style/nav spec is deliberately NOT computed here — `_multi_file_flow`'s
         own `_extract_build_spec` still owns it; this stage owns the features,
         the file list, and the API contract. See docs/requirements-blueprint.md.
+
+        Phase C2: ``entities`` is the schema decided by `_extract_schema`, handed
+        over as a table the model plans AGAINST rather than one it invents while
+        planning. Empty means the schema call failed or the app stores nothing,
+        and this behaves exactly as it did before Phase C.
         """
         stack = detect_stack(
             allow_network=settings.allow_network, prefer=settings.web_stack
         )
+        schema_block = ""
+        if entities:
+            schema_block = (
+                "The data model is already decided. These tables exist — plan the "
+                "pages and routes AROUND them, use these EXACT table and column "
+                "names, and do not invent, rename or drop any of them:\n"
+                + "\n".join(f"- {e.summary()}" for e in entities)
+                + "\n\n"
+            )
         messages = [
             SystemMessage(content=_load_blueprint_prompt()),
             HumanMessage(
                 content=(
                     "Stack to build on: "
                     f"{stack.note or '(frontend only — no backend runtime detected)'}\n\n"
+                    f"{schema_block}"
                     f"Request: {user_message}\n\nOutput the JSON now:"
                 )
             ),
@@ -2486,7 +2550,7 @@ class AgentCore:
             return None
         if data is None:
             return None
-        return blueprint_from_data(data, user_message, stack)
+        return blueprint_from_data(data, user_message, stack, entities)
 
     async def _extract_delta(
         self, user_message: str, spec: ProjectSpec
@@ -2713,12 +2777,17 @@ class AgentCore:
 
         Returns empty — and changes nothing — when the blueprint declared no
         schema, so a build with no data layer behaves exactly as before.
+
+        Phase C1: `blueprint.entities` is the schema decided before the layout,
+        already structured. `data_schema` prose is only parsed when that is
+        absent — a failed schema call, or a build from before Phase C.
         """
-        entities = []
-        for line in blueprint.contract.data_schema:
-            parsed = parse_schema_line(line)
-            if parsed and not any(e.table == parsed.table for e in entities):
-                entities.append(parsed)
+        entities = list(blueprint.entities)
+        if not entities:
+            for line in blueprint.contract.data_schema:
+                parsed = parse_schema_line(line)
+                if parsed and not any(e.table == parsed.table for e in entities):
+                    entities.append(parsed)
         if not entities:
             return set(), ""
 
@@ -3856,7 +3925,16 @@ class AgentCore:
             and settings.expand_requirements
             and should_blueprint(clean_message)
         ):
-            blueprint = await self._expand_requirements(clean_message)
+            # Phase C: decide what the app STORES before deciding what it looks
+            # like, so the layout call derives pages from a schema instead of
+            # inventing both at once. One extra temp-0 call; () on failure, and
+            # the blueprint call then behaves exactly as it did before.
+            entities = (
+                await self._extract_schema(clean_message)
+                if settings.schema_first
+                else ()
+            )
+            blueprint = await self._expand_requirements(clean_message, entities)
             if blueprint is not None and blueprint.is_actionable():
                 answer, trace = await self._run_blueprint(
                     clean_message, blueprint, at_refs

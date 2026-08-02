@@ -7,6 +7,14 @@ All notable changes to Coder are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Schema-first builds** — a build request now decides what the app *stores*
+  before it decides what it looks like, in its own short call, and the pages are
+  planned around that schema instead of invented alongside it. Every table then
+  gets a page that lists it, a form that adds to it, and the routes behind both
+  — deterministically, so a four-table request can't come back with pages for
+  two. Uploaded-image columns keep working (`IMAGE` becomes a `_path` column, so
+  the upload wiring still fires). `SCHEMA_FIRST=false` restores the old
+  behaviour, where the schema arrived as free text inside the build plan.
 - **Project memory for projects Coder didn't build** — an existing Flask project
   (cloned from git, built before project memory existed, or with its
   `.coder/project.json` deleted) now has its contract read off the files on the

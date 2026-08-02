@@ -443,7 +443,7 @@ async def test_seam_runs_blueprint_when_on_and_actionable(tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "blueprint_optional_tier", False)
     a = AgentCore(session_id="pytest_bp_on")
 
-    async def _fake_expand(msg):
+    async def _fake_expand(msg, entities=()):
         return _actionable_blueprint()
 
     monkeypatch.setattr(a, "_expand_requirements", _fake_expand)
@@ -471,7 +471,7 @@ async def test_seam_falls_through_when_blueprint_not_actionable(tmp_path, monkey
     monkeypatch.setattr(settings, "expand_requirements", True)
     a = AgentCore(session_id="pytest_bp_thin")
 
-    async def _fake_expand(msg):
+    async def _fake_expand(msg, entities=()):
         return Blueprint(files=(PlannedFile("index.html"),))  # 1 file, not actionable
 
     monkeypatch.setattr(a, "_expand_requirements", _fake_expand)
@@ -578,3 +578,344 @@ async def test_coverage_inert_when_no_blueprint_ran(tmp_path, monkeypatch):
 
     await a.chat("create a notes.md file")  # ordinary single-file turn
     assert (tmp_path / "notes.md").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Phase C — schema first, layout derived from it
+# ---------------------------------------------------------------------------
+
+
+FLASK = Stack(language="python", backend="flask", note="Flask + Jinja2 + sqlite3")
+
+
+def _entities(*specs):
+    """Build entities the way `entities_from_data` would, from (table, fields)."""
+    from app.agent.projectspec import entities_from_data
+
+    return entities_from_data(
+        {
+            "entities": [
+                {"name": name, "table": table, "fields": fields}
+                for name, table, fields in specs
+            ]
+        }
+    )
+
+
+_PRODUCT = ("product", "products", [{"name": "title", "type": "TEXT"}])
+_REVIEW = ("review", "reviews", [{"name": "body", "type": "TEXT"}])
+
+
+def test_entities_from_data_parses_the_schema_calls_shape():
+    from app.agent.projectspec import entities_from_data
+
+    entities = entities_from_data(
+        {
+            "entities": [
+                {
+                    "name": "product",
+                    "table": "products",
+                    "fields": [
+                        {"name": "id", "type": "INTEGER", "pk": True},
+                        {"name": "title", "type": "VARCHAR(200)", "required": True},
+                        {"name": "image_path", "type": "IMAGE"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert len(entities) == 1
+    product = entities[0]
+    assert (product.name, product.table) == ("product", "products")
+    assert product.field("title").type == "TEXT"  # VARCHAR normalised
+    assert product.field("title").required is True
+    assert product.field("image_path").type == "TEXT"  # IMAGE stored as a path
+    assert product.field("image_path").is_upload() is True
+
+
+def test_entities_from_data_adds_a_primary_key_when_the_model_forgets():
+    """A products table with no id makes edit and delete unwriteable."""
+    entities = _entities(("product", "products", [{"name": "title"}]))
+    assert entities[0].fields[0].name == "id"
+    assert entities[0].fields[0].pk is True
+
+
+def test_entities_from_data_drops_what_it_cannot_use():
+    from app.agent.projectspec import entities_from_data
+
+    assert entities_from_data(None) == ()
+    assert entities_from_data({"entities": []}) == ()
+    assert entities_from_data({"entities": [{"table": "no fields here"}]}) == ()
+    assert entities_from_data({"entities": ["not a dict"]}) == ()
+
+
+def test_the_schema_is_authoritative_over_the_models_own_free_text():
+    """Two sources of truth for the tables is one too many: the data layer is
+    generated from `entities`, so `data_schema` must print from the same list."""
+    bp = blueprint_from_data(
+        {
+            "files": [{"filename": "app.py"}, {"filename": "templates/x.html"}],
+            "contract": {"data_schema": ["widgets(name TEXT)"]},
+        },
+        "build a shop",
+        FLASK,
+        _entities(_PRODUCT),
+    )
+    assert bp.contract.data_schema == ("products(id INTEGER, title TEXT)",)
+    assert [e.table for e in bp.entities] == ["products"]
+
+
+def test_every_entity_gets_a_list_page_a_form_and_routes():
+    """Phase C3's postcondition. The model planned pages for products only; the
+    reviews table must not silently become unreachable."""
+    bp = blueprint_from_data(
+        {
+            "files": [
+                {"filename": "app.py", "role": "backend"},
+                {"filename": "templates/products.html", "reads": ["product"]},
+            ],
+            "contract": {"endpoints": [{"method": "GET", "path": "/products"}]},
+        },
+        "build a shop with reviews",
+        FLASK,
+        _entities(_PRODUCT, _REVIEW),
+    )
+
+    planned = {pf.filename for pf in bp.files}
+    assert "templates/reviews.html" in planned  # list page, synthesized
+    assert "templates/new_review.html" in planned  # create form, synthesized
+    assert "templates/new_product.html" in planned  # products had no form either
+    routes = {(e.method, e.path) for e in bp.contract.endpoints}
+    assert ("GET", "/reviews") in routes
+    assert ("POST", "/reviews/new") in routes
+    assert ("POST", "/products/new") in routes
+
+
+def test_completion_keeps_what_the_model_already_planned():
+    """It fills holes; it never renames or replaces the model's own pages."""
+    bp = blueprint_from_data(
+        {
+            "files": [
+                {"filename": "app.py", "role": "backend"},
+                {
+                    "filename": "templates/catalogue.html",
+                    "reads": ["product"],
+                    "instruction": "the shop front",
+                },
+                {"filename": "templates/add_product.html", "reads": ["product"]},
+            ],
+            "contract": {
+                "endpoints": [
+                    {"method": "GET", "path": "/catalogue", "entity": "product"},
+                    {"method": "POST", "path": "/catalogue/add", "entity": "product"},
+                ]
+            },
+        },
+        "build a shop",
+        FLASK,
+        _entities(_PRODUCT),
+    )
+
+    planned = {pf.filename for pf in bp.files}
+    assert "templates/catalogue.html" in planned
+    assert "templates/add_product.html" in planned
+    # Its own listing and form were recognised, so no duplicates were invented.
+    assert "templates/products.html" not in planned
+    assert "templates/new_product.html" not in planned
+
+
+def test_completion_is_flask_only():
+    """The fixed templates/ layout is what makes the synthesized paths correct;
+    on another stack the file layout is the model's own."""
+    bp = blueprint_from_data(
+        {"files": [{"filename": "server.py"}, {"filename": "index.html"}]},
+        "build a shop",
+        STDLIB_STACK,
+        _entities(_PRODUCT),
+    )
+    assert "templates/products.html" not in {pf.filename for pf in bp.files}
+
+
+def test_no_entities_leaves_the_blueprint_exactly_as_before():
+    """Phase C is inert when the schema call failed or the app stores nothing."""
+    data = {
+        "files": [{"filename": "index.html"}, {"filename": "style.css"}],
+        "contract": {"data_schema": ["notes(body TEXT)"]},
+    }
+    assert blueprint_from_data(data, "build a page", FLASK) == blueprint_from_data(
+        data, "build a page", FLASK, ()
+    )
+
+
+def test_declared_entity_and_reads_survive_parsing():
+    bp = blueprint_from_data(
+        {
+            "files": [
+                {"filename": "templates/products.html", "reads": ["product", "Review"]}
+            ],
+            "contract": {
+                "endpoints": [
+                    {
+                        "method": "GET",
+                        "path": "/products",
+                        "entity": "product",
+                        "template": "templates/products.html",
+                    }
+                ]
+            },
+        },
+        "build a shop",
+        FLASK,
+    )
+    assert bp.files[0].reads == ("product", "review")  # normalised, lowercased
+    assert bp.contract.endpoints[0].entity == "product"
+    assert bp.contract.endpoints[0].template == "templates/products.html"
+
+
+async def test_the_schema_is_decided_before_the_layout(tmp_path, monkeypatch):
+    """The seam: one temp-0 call decides what is stored, and its entities are
+    handed to the layout call rather than being invented there."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "expand_requirements", True)
+    monkeypatch.setattr(settings, "schema_first", True)
+    a = AgentCore(session_id="pytest_schema_seam")
+    a._llm_blueprint = ScriptedLLM(
+        [
+            '{"summary": "a shop", "entities": [{"name": "product", "table": '
+            '"products", "fields": [{"name": "title", "type": "TEXT"}]}]}'
+        ]
+    )
+
+    seen = {}
+
+    async def _fake_expand(msg, entities=()):
+        seen["entities"] = entities
+        return _actionable_blueprint()
+
+    async def _fake_run(msg, blueprint, refs):
+        return "built", []
+
+    monkeypatch.setattr(a, "_expand_requirements", _fake_expand)
+    monkeypatch.setattr(a, "_run_blueprint", _fake_run)
+
+    await a.chat("build me a shop")
+
+    assert [e.table for e in seen["entities"]] == ["products"]
+    assert a._llm_blueprint.calls == 1  # exactly one extra call, not one per file
+
+
+async def test_schema_extraction_failure_falls_back_to_the_old_path(
+    tmp_path, monkeypatch
+):
+    """A failed schema call must cost nothing: the layout call then behaves
+    exactly as it did before Phase C."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "expand_requirements", True)
+    monkeypatch.setattr(settings, "schema_first", True)
+    a = AgentCore(session_id="pytest_schema_fail")
+    a._llm_blueprint = ScriptedLLM(["not json at all"])
+
+    seen = {}
+
+    async def _fake_expand(msg, entities=()):
+        seen["entities"] = entities
+        return _actionable_blueprint()
+
+    async def _fake_run(msg, blueprint, refs):
+        return "built", []
+
+    monkeypatch.setattr(a, "_expand_requirements", _fake_expand)
+    monkeypatch.setattr(a, "_run_blueprint", _fake_run)
+
+    await a.chat("build me a shop")
+
+    assert seen["entities"] == ()
+
+
+async def test_schema_stage_is_skipped_when_switched_off(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "expand_requirements", True)
+    monkeypatch.setattr(settings, "schema_first", False)
+    a = AgentCore(session_id="pytest_schema_off")
+    a._llm_blueprint = ScriptedLLM(["{}"])
+
+    async def _fake_expand(msg, entities=()):
+        return _actionable_blueprint()
+
+    async def _fake_run(msg, blueprint, refs):
+        return "built", []
+
+    monkeypatch.setattr(a, "_expand_requirements", _fake_expand)
+    monkeypatch.setattr(a, "_run_blueprint", _fake_run)
+
+    await a.chat("build me a shop")
+
+    assert a._llm_blueprint.calls == 0  # no schema call was made
+
+
+def test_an_image_column_keeps_its_upload_signal():
+    """IMAGE/FILE are not SQLite types and normalise to TEXT, which would throw
+    away the only marker that this column holds an upload. The signal moves into
+    the name, which is what the upload wiring actually keys off."""
+    entities = _entities(
+        ("book", "books", [{"name": "cover", "type": "IMAGE"}, {"name": "title"}])
+    )
+    cover = entities[0].field("cover_path")
+    assert cover is not None and cover.type == "TEXT"
+    assert cover.is_upload() is True
+    # A column already named for it is left alone, not doubled up.
+    already = _entities(("book", "books", [{"name": "cover_path", "type": "IMAGE"}]))
+    assert already[0].field("cover_path") is not None
+    assert already[0].field("cover_path_path") is None
+
+
+def test_a_synthesized_form_page_gets_both_of_its_routes():
+    """A form page with only a POST route cannot be opened at all — the same
+    dead end, one step earlier."""
+    bp = blueprint_from_data(
+        {
+            "files": [
+                {"filename": "app.py", "role": "backend"},
+                {"filename": "templates/books.html", "reads": ["book"]},
+            ],
+            "contract": {
+                "endpoints": [{"method": "GET", "path": "/books", "entity": "book"}]
+            },
+        },
+        "build a bookshop",
+        FLASK,
+        _entities(("book", "books", [{"name": "title"}])),
+    )
+
+    routes = {(e.method, e.path) for e in bp.contract.endpoints}
+    assert ("GET", "/books/new") in routes  # serves the form
+    assert ("POST", "/books/new") in routes  # accepts it
+
+
+def test_completion_does_not_re_route_pages_the_model_planned():
+    """Routes are synthesized only for templates this pass creates. Adding
+    `GET /books` beside the model's own listing route would leave one of them
+    rendering a template nobody created."""
+    bp = blueprint_from_data(
+        {
+            "files": [
+                {"filename": "app.py", "role": "backend"},
+                {"filename": "templates/catalogue.html", "reads": ["book"]},
+                {"filename": "templates/add_book.html", "reads": ["book"]},
+            ],
+            "contract": {
+                "endpoints": [
+                    {"method": "GET", "path": "/catalogue", "entity": "book"},
+                    {"method": "POST", "path": "/catalogue/add", "entity": "book"},
+                ]
+            },
+        },
+        "build a bookshop",
+        FLASK,
+        _entities(("book", "books", [{"name": "title"}])),
+    )
+
+    paths = {e.path for e in bp.contract.endpoints}
+    assert paths == {"/catalogue", "/catalogue/add"}
+    assert not any(f.filename.startswith("templates/books") for f in bp.files)

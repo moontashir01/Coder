@@ -507,6 +507,51 @@ from cwd or the repo layout — always via `settings.prompts_dir` / `skills_dir`
 dotfiles, which is why `scaffolds/flask/` stores `.gitignore`/`.gitkeep` as `gitignore`/`gitkeep`
 and `scaffold.py` restores the dot on the way out.
 
+### Schema first, layout derived from it (Phase C, `settings.schema_first`)
+
+Phase C of `docs/always-fullstack-plan.md`. The schema used to arrive as free text inside the
+blueprint's own answer (`"users(email TEXT PRIMARY KEY, …)"`), so the pages and the tables
+backing them were invented in the same breath and agreed only by luck. It is now decided
+first, on its own:
+
+1. **`_extract_schema`** — one temp-0 call against `prompts/schema.md`, parsed by the pure
+   `projectspec.entities_from_data`. Returns `()` on any failure, and everything downstream
+   then behaves exactly as it did before Phase C.
+2. **`_expand_requirements(msg, entities)`** — the layout call is handed the tables as a
+   block it plans AROUND. When entities are present they are **authoritative**:
+   `contract.data_schema` is printed from them rather than taken from the model's own free
+   text, so the tables `crud.py` generates and the tables the prompt describes cannot differ.
+3. **`blueprint.derive_pages_from_entities`** — pure, no LLM. Every entity gets a list page,
+   a create form, and the routes behind them. A prompt rule is a hope on a 7B model (a
+   four-table request routinely comes back with pages for two); this makes "every entity is
+   reachable" a postcondition, the same way `scaffold.py` and `crud.py` do for boilerplate.
+4. `ProjectSpec.from_blueprint` then takes `Page.reads` and `SpecEndpoint.entity` from what
+   the layout call **declared**, with the old prose inference and `_guess_entity`'s substring
+   match demoted to fallbacks.
+
+Four rules that are easy to get wrong, three of them learned by breaking them here:
+- **Routes are synthesized only for templates this pass creates.** Routing the model's own
+  pages too breaks both ways: `GET /<table>` lands beside the model's own listing route (one
+  of them rendering a template nobody created), and the coarse "this entity already has a
+  GET" guard that was meant to prevent that swallowed `GET /<table>/new`, leaving the form
+  page unreachable — the exact dead end the pass exists to prevent.
+- **A synthesized form gets BOTH routes.** GET serves it, POST accepts it; with only the POST
+  the page cannot be opened at all.
+- **`IMAGE`/`FILE` are not SQLite types**, so `_norm_type` collapses them to TEXT — which
+  would throw away the only signal that the column holds an upload. `_fields_from_data`
+  moves the signal into the *name* (`cover` → `cover_path`), because `Field.is_upload`,
+  `crud.upload_helper_source` and `verify.fix_form_enctype` all key off the name.
+- **Form-word detection tokenizes the stem**, it does not use `\b`: `_` is a word character,
+  so `\badd\b` does not match `add_product` and the model's own form page reads as a listing,
+  earning the entity a second, duplicate form.
+
+`blueprint.py` must NOT import `projectspec` at runtime (that module imports it) — `Entity`
+is a `TYPE_CHECKING`-only import, which works because `from __future__ import annotations`
+keeps every annotation a string. **`conftest.py` defaults `schema_first` OFF in tests** for a
+sharper version of the `check_intent` trap: it runs *before* `_expand_requirements`, so a
+test that opts back into the blueprint stage and patches only that method would still reach a
+real ChatOllama.
+
 ### Forcing the stack (`app/agent/runtime_probe.py`, `settings.web_stack`)
 
 Phase A of `docs/always-fullstack-plan.md`. `detect_stack()` used to *probe* — richest

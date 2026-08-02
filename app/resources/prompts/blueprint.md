@@ -19,11 +19,13 @@ shape:
   "files": [
     {"filename": "<relative filename>", "action": "create",
      "role": "frontend|backend|data|glue",
+     "reads": ["<entity names this page shows or writes>"],
      "instruction": "<what this file must contain and how it connects to the others>"}
   ],
   "contract": {
     "endpoints": [
-      {"method": "POST", "path": "/api/login",
+      {"method": "POST", "path": "/api/login", "entity": "user",
+       "template": "templates/login.html",
        "request": "{email, password}", "response": "200 {ok, redirect} | 401 {error}"}
     ],
     "form_bindings": [
@@ -93,6 +95,22 @@ Rules:
   - Routes call helpers in `models.py`; they never write SQL inline.
   - Do NOT plan `requirements.txt`, `Procfile` or `.gitignore` — they are
     already written for you.
+
+- **When you are given a data model, plan AROUND it.** The tables and columns
+  above the request are already decided — they are what the app stores. Use
+  those exact names, invent no table, drop none, and rename nothing. Your job is
+  the layout that makes that data usable.
+
+- **Every table needs a way to see it and a way to add to it.** For each one:
+  a page listing its rows (`templates/<table>.html`, `GET /<table>`) and a page
+  with a form that creates one (`templates/new_<name>.html`, `GET` and `POST
+  /<table>/new`). A table the user can never see or add to is a table that may
+  as well not exist.
+
+- **Say which entity each thing is about.** Every page file gets `reads`: the
+  entity names it displays or writes. Every endpoint gets `entity` (the one it
+  reads or writes) and `template` (the page it renders, for a GET). These are
+  what keep the later steps from having to guess.
 
 - **Make the files line up.** The form's submit target must be one of the
   endpoints; the endpoint must read the form's field names; the data_schema must

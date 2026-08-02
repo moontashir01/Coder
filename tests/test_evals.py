@@ -258,7 +258,7 @@ async def test_blueprint_task_end_to_end_offline(tmp_path, monkeypatch):
         ),
     )
 
-    async def _fake_expand(msg):
+    async def _fake_expand(msg, entities=()):
         return bp
 
     monkeypatch.setattr(a, "_expand_requirements", _fake_expand)

@@ -373,6 +373,96 @@ def parse_schema_line(line: str, added_in: int = 1) -> Entity | None:
     return Entity(name=_singular(table), table=table, fields=fields)
 
 
+def _fields_from_data(raw_fields, added_in: int = 1) -> list[Field]:
+    """Validated `Field`s from a model's JSON list.
+
+    Accepts both shapes the model reaches for: `"title TEXT"` and
+    `{"name": "title", "type": "TEXT", "required": true}`. Unknown types collapse
+    to TEXT via `_norm_type`, unusable names are dropped rather than guessed at,
+    and the list is capped — the same discipline as every other parser here,
+    because this is model output that ends up in a `CREATE TABLE`.
+    """
+    out: list[Field] = []
+    seen: set[str] = set()
+    for item in raw_fields or []:
+        if isinstance(item, str):
+            bits = item.split()
+            name = _ident(bits[0] if bits else "")
+            raw_type = bits[1] if len(bits) > 1 else "TEXT"
+            rest = " ".join(bits[1:]).upper()
+            pk = "PRIMARY KEY" in rest
+            required = pk or "NOT NULL" in rest
+        elif isinstance(item, dict):
+            name = _ident(item.get("name"))
+            raw_type = str(item.get("type") or "TEXT")
+            pk = bool(item.get("pk") or item.get("primary_key"))
+            required = pk or bool(item.get("required") or item.get("not_null"))
+        else:
+            continue
+        ftype = _norm_type(raw_type)
+        if not name or name.lower() in seen:
+            continue
+        # `IMAGE`/`FILE` normalise to TEXT — they are not SQLite types — which
+        # would throw away the only signal that this column holds an uploaded
+        # file, and with it the Phase 4b upload wiring. Everything downstream
+        # (`Field.is_upload`, `crud.upload_helper_source`, `fix_form_enctype`)
+        # keys off the NAME, so carry the signal there: `cover` -> `cover_path`.
+        if raw_type.strip().upper() in UPLOAD_TYPES and not name.lower().endswith(
+            ("_path", "_image", "_file")
+        ):
+            name = f"{name}_path"[:40]
+            if name.lower() in seen:
+                continue
+        seen.add(name.lower())
+        out.append(
+            Field(name=name, type=ftype, pk=pk, required=required, added_in=added_in)
+        )
+        if len(out) >= MAX_FIELDS:
+            break
+    return out
+
+
+def entities_from_data(data: dict | None) -> tuple[Entity, ...]:
+    """The schema call's JSON, validated into diffable entities (Phase C1).
+
+    The schema used to arrive as free text inside the blueprint's own answer
+    (`"users(email TEXT PRIMARY KEY, …)"`) and had to be reverse-engineered by
+    `parse_schema_line` afterwards. Asking for it FIRST, on its own, in a shape
+    that is already structured, removes that round-trip — and, more importantly,
+    means the layout can be planned against a schema that already exists rather
+    than invented in the same breath as the pages that read it.
+
+    Pure and total: anything unparseable is dropped, never guessed at, and a
+    failed call (``None``) yields ``()`` so the caller falls back to the old
+    free-text path.
+    """
+    data = data if isinstance(data, dict) else {}
+    out: list[Entity] = []
+    seen: set[str] = set()
+    for item in data.get("entities") or []:
+        if not isinstance(item, dict):
+            continue
+        name = _ident(item.get("name") or item.get("entity"))
+        table = _ident(item.get("table")) or (f"{name}s" if name else "")
+        if not table:
+            continue
+        fields = _fields_from_data(item.get("fields"))
+        if not fields or table.lower() in seen:
+            continue
+        # Every table needs a key the CRUD helpers can address a row by. The
+        # model omits it perhaps a third of the time (it is "obvious"), and a
+        # products table with no id makes edit/delete unwriteable.
+        if not any(f.pk for f in fields):
+            fields.insert(0, Field(name="id", type="INTEGER", pk=True, required=True))
+        seen.add(table.lower())
+        out.append(
+            Entity(name=name or _singular(table), table=table, fields=tuple(fields))
+        )
+        if len(out) >= MAX_ENTITIES:
+            break
+    return tuple(out)
+
+
 def _create_table_blocks(text: str) -> list[tuple[str, str]]:
     """`(table, column blob)` for each CREATE TABLE, matching parens properly.
 
@@ -541,26 +631,7 @@ def delta_from_data(data: dict | None, spec: "ProjectSpec") -> SpecDelta:
         raw_name = _ident(item.get("name") or item.get("entity") or item.get("table"))
         if not raw_name:
             continue
-        raw_fields = item.get("add_fields") or item.get("fields") or []
-        parsed: list[Field] = []
-        for f in raw_fields:
-            if isinstance(f, str):
-                bits = f.split()
-                fname, ftype = _ident(bits[0] if bits else ""), _norm_type(
-                    bits[1] if len(bits) > 1 else "TEXT"
-                )
-            elif isinstance(f, dict):
-                fname, ftype = _ident(f.get("name")), _norm_type(f.get("type"))
-            else:
-                continue
-            if not fname:
-                continue
-            required = bool(
-                isinstance(f, dict) and (f.get("required") or f.get("not_null"))
-            )
-            parsed.append(Field(name=fname, type=ftype, required=required))
-            if len(parsed) >= MAX_FIELDS:
-                break
+        parsed = _fields_from_data(item.get("add_fields") or item.get("fields"))
         if not parsed:
             continue
 
@@ -1085,15 +1156,19 @@ class ProjectSpec:
         root = Path(root)
         stack: Stack = bp.stack
 
-        entities: list[Entity] = []
-        seen_tables: set[str] = set()
-        for line in bp.contract.data_schema:
-            parsed = parse_schema_line(line)
-            if parsed and parsed.table.lower() not in seen_tables:
-                seen_tables.add(parsed.table.lower())
-                entities.append(parsed)
-            if len(entities) >= MAX_ENTITIES:
-                break
+        # Phase C1: the schema was decided structurally, before the layout, so
+        # take it as-is. Parsing it back out of `data_schema` prose would be a
+        # lossless-to-lossy-to-lossless round trip that can only lose.
+        entities: list[Entity] = list(bp.entities[:MAX_ENTITIES])
+        seen_tables: set[str] = {e.table.lower() for e in entities}
+        if not entities:
+            for line in bp.contract.data_schema:
+                parsed = parse_schema_line(line)
+                if parsed and parsed.table.lower() not in seen_tables:
+                    seen_tables.add(parsed.table.lower())
+                    entities.append(parsed)
+                if len(entities) >= MAX_ENTITIES:
+                    break
 
         py_sources = _read_python(root)
         if not entities:
@@ -1135,7 +1210,11 @@ class ProjectSpec:
                     request=ep.request,
                     response=ep.response,
                     handler="app.py" if (root / "app.py").is_file() else "",
-                    entity=_guess_entity(ep.path, entities),
+                    template=_norm_filename(ep.template),
+                    # Declared by the layout call (Phase C2) when it said so;
+                    # `_guess_entity`'s substring match on the path is now the
+                    # fallback rather than the only answer.
+                    entity=ep.entity or _guess_entity(ep.path, entities),
                 )
             )
         # Routes the build really defined but the contract never mentioned.
@@ -1177,11 +1256,18 @@ class ProjectSpec:
                     template=fname,
                     nav_label=_nav_label(stem),
                     purpose=" ".join((pf.instruction or "").split())[:100],
-                    reads=tuple(
-                        e.name
-                        for e in entities
-                        if e.name in (pf.instruction or "").lower()
-                    )[:3],
+                    # Declared by the layout call (Phase C2) if it declared any;
+                    # inferring it from instruction prose is the fallback, and
+                    # was "routinely empty on the very listing page that
+                    # matters" — the reason `smoke.py` probes every page.
+                    reads=(
+                        tuple(pf.reads)[:3]
+                        or tuple(
+                            e.name
+                            for e in entities
+                            if e.name in (pf.instruction or "").lower()
+                        )[:3]
+                    ),
                 )
             )
 

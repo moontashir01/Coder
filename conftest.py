@@ -51,6 +51,13 @@ def _no_blueprint(monkeypatch):
     subprocess.
 
     `tests/test_blueprint.py` and `tests/test_evals.py` opt back in explicitly.
+
+    `schema_first` (Phase C) is defaulted off for a sharper version of the same
+    reason: it runs BEFORE `_expand_requirements`, so a test that opts back into
+    the blueprint stage and scripts/monkeypatches only that method would still
+    reach a real ChatOllama through `_extract_schema`. A test that wants the
+    schema stage must script it.
     """
     monkeypatch.setattr(settings, "expand_requirements", False)
     monkeypatch.setattr(settings, "blueprint_smoke_test", False)
+    monkeypatch.setattr(settings, "schema_first", False)

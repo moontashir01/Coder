@@ -31,8 +31,15 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from app.agent.runtime_probe import NO_STACK, Stack
+
+if TYPE_CHECKING:  # pragma: no cover
+    # Type-only: `projectspec` imports THIS module at runtime, so importing it
+    # back would be circular. `from __future__ import annotations` keeps every
+    # annotation a string, so the name is never resolved at run time.
+    from app.agent.projectspec import Entity
 
 # ---------------------------------------------------------------------------
 # The gate — which requests get a blueprint
@@ -199,6 +206,11 @@ class PlannedFile:
     action: str = "create"
     instruction: str = ""
     role: str = ""
+    # Phase C2: entity names this file displays or writes, as DECLARED by the
+    # layout call rather than guessed from its instruction prose. This is what
+    # `ProjectSpec.from_blueprint` turns into `Page.reads`, which impact
+    # analysis and the functional probe both key off.
+    reads: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -216,6 +228,11 @@ class Endpoint:
     path: str
     request: str = ""  # e.g. "{email, password}"
     response: str = ""  # e.g. "200 {ok, redirect} | 401 {error}"
+    # Phase C2, both declared by the layout call: which entity this route reads
+    # or writes, and which template it renders. Previously `from_blueprint` had
+    # to recover the first by substring-matching the path against table names.
+    entity: str = ""
+    template: str = ""
 
     def to_line(self) -> str:
         line = f"{self.method} {self.path}"
@@ -223,6 +240,8 @@ class Endpoint:
             line += f"  body: {self.request}"
         if self.response:
             line += f"  -> {self.response}"
+        if self.entity:
+            line += f"  [{self.entity}]"
         return line
 
 
@@ -250,6 +269,11 @@ class Blueprint:
     files: tuple[PlannedFile, ...] = ()
     contract: ApiContract = field(default_factory=ApiContract)
     stack: Stack = field(default_factory=lambda: NO_STACK)
+    # Phase C1: the schema decided BEFORE the layout, structured and diffable.
+    # `contract.data_schema` still carries the same tables as free text for the
+    # prompt block; this is the authoritative copy that `crud.py` generates the
+    # data layer from and `ProjectSpec` stores. Empty = pre-Phase-C behaviour.
+    entities: tuple["Entity", ...] = ()
 
     # -- selection -------------------------------------------------------
 
@@ -360,11 +384,13 @@ def _clean_files(items) -> tuple[PlannedFile, ...]:
     for item in items or []:
         if isinstance(item, str):
             fname, action, instruction, role = item, "create", "", ""
+            reads: tuple[str, ...] = ()
         elif isinstance(item, dict):
             fname = item.get("filename") or item.get("file") or item.get("name")
             action = str(item.get("action") or "create").strip().lower()
             instruction = " ".join(str(item.get("instruction") or "").split())[:400]
             role = str(item.get("role") or "").strip().lower()[:20]
+            reads = _norm_idents(item.get("reads"))
         else:
             continue
         fname = _norm_filename(fname)
@@ -373,7 +399,7 @@ def _clean_files(items) -> tuple[PlannedFile, ...]:
         if action not in _VALID_ACTIONS:
             action = "create"
         seen.add(fname.lower())
-        out.append(PlannedFile(fname, action, instruction, role))
+        out.append(PlannedFile(fname, action, instruction, role, reads))
     return tuple(out)
 
 
@@ -410,11 +436,14 @@ def _clean_endpoints(items) -> tuple[Endpoint, ...]:
             method = bits[0].upper() if bits else ""
             path = bits[1] if len(bits) > 1 else ""
             request = response = ""
+            entity = template = ""
         elif isinstance(item, dict):
             method = str(item.get("method") or "GET").strip().upper()
             path = str(item.get("path") or item.get("route") or "").strip()
             request = " ".join(str(item.get("request") or "").split())[:120]
             response = " ".join(str(item.get("response") or "").split())[:120]
+            entity = (_norm_idents([item.get("entity")]) or ("",))[0]
+            template = _norm_filename(item.get("template"))
         else:
             continue
         if not path.startswith("/") or method not in (
@@ -429,8 +458,28 @@ def _clean_endpoints(items) -> tuple[Endpoint, ...]:
         if key in seen:
             continue
         seen.add(key)
-        out.append(Endpoint(method, path, request, response))
+        out.append(Endpoint(method, path, request, response, entity, template))
         if len(out) >= MAX_ENDPOINTS:
+            break
+    return tuple(out)
+
+
+_ENTITY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _norm_idents(items, limit: int = 5) -> tuple[str, ...]:
+    """Entity names from model output: plain identifiers, lowercased, deduped.
+
+    Mirrors `projectspec._ident` — this module cannot import it (that module
+    imports this one), and the rule is short enough that restating it beats
+    inventing a shared package for two regexes.
+    """
+    out: list[str] = []
+    for item in items or []:
+        name = str(item or "").strip().strip("\"'`").replace("-", "_").lower()[:40]
+        if name and _ENTITY_NAME_RE.match(name) and name not in out:
+            out.append(name)
+        if len(out) >= limit:
             break
     return tuple(out)
 
@@ -510,8 +559,182 @@ def _ensure_backend(
     return files, features
 
 
+def _mentions(entity: "Entity", *texts: str) -> bool:
+    """Does any of ``texts`` name this entity, by singular or table name?"""
+    blob = " ".join(t or "" for t in texts).lower()
+    return entity.name.lower() in blob or entity.table.lower() in blob
+
+
+# Words in a template's name that say "this is the form for creating one", not
+# "this is the list of them" — the distinction `derive_pages_from_entities` needs
+# to tell which of the two pages an entity is still missing.
+#
+# Matched against the stem's TOKENS, not with `\b`: `_` is a word character, so
+# `\badd\b` does not match `add_product` and the model's own form page would be
+# read as a listing, earning the entity a second, duplicate form.
+_FORM_WORDS = frozenset({"new", "add", "create", "edit", "update", "form"})
+_STEM_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _is_form_stem(stem: str) -> bool:
+    return bool(_FORM_WORDS & set(_STEM_SPLIT_RE.split(stem.lower())))
+
+
+def derive_pages_from_entities(
+    files: tuple[PlannedFile, ...],
+    features: tuple[Feature, ...],
+    contract: ApiContract,
+    entities: tuple["Entity", ...],
+    stack: Stack,
+) -> tuple[tuple[PlannedFile, ...], tuple[Feature, ...], ApiContract]:
+    """Give every stored thing a way in and a way to see it (Phase C3).
+
+    The point of deciding the schema first is that the layout can be *derived*
+    from it. The layout call is asked to do that, but a prompt rule is a hope: on
+    a 7B model a four-table request routinely comes back with pages for two of
+    them. This closes the gap deterministically — the same "deterministic beats
+    generated" rule that already produced `scaffold.py` and `crud.py`, applied to
+    routes and pages, so "every entity is reachable" is a postcondition rather
+    than an aspiration.
+
+    Per entity, three things must exist: a page that LISTS it, a page that
+    CREATES one, and the routes behind both. Whatever the model already planned
+    is kept as-is — this only fills holes, and it never renames or removes.
+
+    Flask only. The fixed `templates/`+`@app.route` layout is what makes the
+    synthesized paths correct; on the stdlib or Node stacks the file layout is
+    the model's own, so guessing filenames there would create files nothing
+    serves. Those stacks simply keep whatever the layout call produced.
+    """
+    if not entities or stack.backend != "flask":
+        return files, features, contract
+
+    planned_pages = [pf for pf in files if pf.filename.lower().endswith(".html")]
+    new_files: list[PlannedFile] = []
+    new_features: list[Feature] = []
+    new_endpoints: list[Endpoint] = []
+    taken = {pf.filename.lower() for pf in files}
+    routes = {(e.method, e.path) for e in contract.endpoints}
+
+    for entity in entities:
+        list_tpl = f"templates/{entity.table}.html"
+        form_tpl = f"templates/new_{entity.name}.html"
+        list_path = f"/{entity.table}"
+        form_path = f"/{entity.table}/new"
+
+        # Already covered? A page counts for this entity if it declared `reads`
+        # for it (Phase C2) or its filename names it. `new_*.html` is the form,
+        # anything else naming the entity is the listing.
+        has_list = False
+        has_form = False
+        for pf in planned_pages:
+            stem = pf.filename.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+            if not (entity.name in pf.reads or _mentions(entity, pf.filename)):
+                continue
+            if _is_form_stem(stem):
+                has_form = True
+            else:
+                has_list = True
+
+        # Routes are synthesized ONLY for the templates this pass creates, and
+        # tracked here per page. Routing the model's own pages too was the first
+        # version, and it broke both ways: `GET /<table>` was added beside the
+        # model's own listing route (two routes, one of them rendering a
+        # template nobody created), while a coarse "this entity already has a
+        # GET" guard then swallowed `GET /<table>/new`, leaving the form page
+        # unreachable — the dead end this pass exists to prevent. Whatever the
+        # model planned, it also routed; the coverage check owns gaps there.
+        wants_list_route = False
+        wants_form_routes = False
+
+        if not has_list and list_tpl.lower() not in taken:
+            taken.add(list_tpl.lower())
+            wants_list_route = True
+            new_files.append(
+                PlannedFile(
+                    filename=list_tpl,
+                    action="create",
+                    instruction=(
+                        f"List every row of `{entity.table}` "
+                        f"({', '.join(f.name for f in entity.fields)}), one card or "
+                        f"table row each, with a link to the page that adds a new "
+                        f"{entity.name}. Extends base.html; the rows come from the "
+                        f"route as a `{entity.table}` variable."
+                    ),
+                    role="frontend",
+                    reads=(entity.name,),
+                )
+            )
+            new_features.append(
+                Feature(f"Browse {entity.table}", TIER_CORE, (list_tpl,))
+            )
+
+        if not has_form and form_tpl.lower() not in taken:
+            writable = [f.name for f in entity.fields if not f.pk]
+            taken.add(form_tpl.lower())
+            wants_form_routes = True
+            new_files.append(
+                PlannedFile(
+                    filename=form_tpl,
+                    action="create",
+                    instruction=(
+                        f"A form that adds one {entity.name}: "
+                        f'<form method="post" action="{form_path}"> with an input '
+                        f"named exactly for each of {', '.join(writable)}. Extends "
+                        "base.html. No fetch() — a plain form post."
+                    ),
+                    role="frontend",
+                    reads=(entity.name,),
+                )
+            )
+            new_features.append(Feature(f"Add a {entity.name}", TIER_CORE, (form_tpl,)))
+
+        wanted = ()
+        if wants_list_route:
+            wanted += (("GET", list_path, list_tpl),)
+        if wants_form_routes:
+            # Both halves: the GET serves the form, the POST accepts it. A form
+            # page with only a POST route cannot be opened at all.
+            wanted += (("GET", form_path, form_tpl), ("POST", form_path, form_tpl))
+        for method, path, tpl in wanted:
+            if (method, path) in routes:
+                continue
+            routes.add((method, path))
+            new_endpoints.append(
+                Endpoint(
+                    method=method,
+                    path=path,
+                    request=(
+                        "{" + ", ".join(f.name for f in entity.fields if not f.pk) + "}"
+                        if method == "POST"
+                        else ""
+                    ),
+                    response=(
+                        f"302 -> {list_path}" if method == "POST" else "200 HTML page"
+                    ),
+                    entity=entity.name,
+                    template=tpl,
+                )
+            )
+
+    if not (new_files or new_endpoints):
+        return files, features, contract
+    return (
+        files + tuple(new_files),
+        features + tuple(new_features),
+        ApiContract(
+            endpoints=contract.endpoints + tuple(new_endpoints),
+            form_bindings=contract.form_bindings,
+            data_schema=contract.data_schema,
+        ),
+    )
+
+
 def blueprint_from_data(
-    data: dict | None, message: str, stack: Stack | None = None
+    data: dict | None,
+    message: str,
+    stack: Stack | None = None,
+    entities: tuple["Entity", ...] = (),
 ) -> Blueprint:
     """Turn a parsed extraction response into a filtered Blueprint.
 
@@ -519,6 +742,12 @@ def blueprint_from_data(
     blueprint, so the caller falls back to ordinary routing. Everything is
     bounded and validated: filenames must be safe relative paths, tiers must be
     known, endpoints must have a method and an absolute path.
+
+    ``entities`` is the schema decided by the Phase C1 call. When present it is
+    AUTHORITATIVE: `data_schema` is printed from it rather than taken from the
+    model's own free text, so the tables the data layer generates and the tables
+    the prompt describes are the same tables by construction. Empty entities
+    leave every line of this function behaving as it did before Phase C.
     """
     data = data if isinstance(data, dict) else {}
     stack = stack or NO_STACK
@@ -533,11 +762,19 @@ def blueprint_from_data(
     contract = ApiContract(
         endpoints=_clean_endpoints(contract_raw.get("endpoints")),
         form_bindings=_clean_str_list(contract_raw.get("form_bindings"), MAX_BINDINGS),
-        data_schema=_clean_str_list(contract_raw.get("data_schema"), MAX_SCHEMA),
+        data_schema=(
+            tuple(e.summary() for e in entities[:MAX_SCHEMA])
+            if entities
+            else _clean_str_list(contract_raw.get("data_schema"), MAX_SCHEMA)
+        ),
     )
 
     # Net for the "declared a backend, forgot the file" failure (7B under-spec).
     files, features = _ensure_backend(files, features, contract, stack)
+    # Phase C3: every entity gets a list page, a create form and their routes.
+    files, features, contract = derive_pages_from_entities(
+        files, features, contract, entities, stack
+    )
 
     return Blueprint(
         summary=summary,
@@ -545,4 +782,5 @@ def blueprint_from_data(
         files=files,
         contract=contract,
         stack=stack,
+        entities=entities,
     )

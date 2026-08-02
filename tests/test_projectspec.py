@@ -1000,3 +1000,94 @@ def test_the_scaffolds_readme_is_recognised_as_ours(tmp_path):
 
     shipped = (flask_scaffold_dir() / "README.md").read_text(encoding="utf-8")
     assert README_MARKER in shipped
+
+
+# ---------------------------------------------------------------------------
+# from_blueprint takes DECLARED relationships, not guessed ones (Phase C4)
+# ---------------------------------------------------------------------------
+
+
+def test_from_blueprint_takes_the_structured_schema_over_the_prose(tmp_path):
+    """Phase C1 decided the schema structurally; parsing it back out of the
+    prose copy would be a round trip that can only lose."""
+    from app.agent.projectspec import entities_from_data
+
+    entities = entities_from_data(
+        {
+            "entities": [
+                {
+                    "name": "product",
+                    "table": "products",
+                    "fields": [
+                        {"name": "id", "type": "INTEGER", "pk": True},
+                        {"name": "title", "type": "TEXT", "required": True},
+                    ],
+                }
+            ]
+        }
+    )
+    bp = Blueprint(
+        summary="a shop",
+        files=(PlannedFile("templates/products.html", role="frontend"),),
+        contract=ApiContract(data_schema=("something_else(x TEXT)",)),
+        stack=FLASK_STACK,
+        entities=entities,
+    )
+
+    spec = ProjectSpec.from_blueprint(bp, tmp_path, "shop")
+
+    assert [e.table for e in spec.entities] == ["products"]
+    assert spec.entities[0].field("title").required is True
+
+
+def test_from_blueprint_uses_the_declared_entity_and_reads(tmp_path):
+    """`_guess_entity` substring-matched the path, and `reads` was inferred from
+    instruction prose — both are now the fallback, not the answer."""
+    from app.agent.projectspec import entities_from_data
+
+    entities = entities_from_data(
+        {
+            "entities": [
+                {"name": "product", "table": "products", "fields": [{"name": "title"}]}
+            ]
+        }
+    )
+    bp = Blueprint(
+        files=(
+            PlannedFile(
+                "templates/catalogue.html",  # name does NOT contain "product"
+                role="frontend",
+                instruction="the shop front",  # prose does NOT mention it either
+                reads=("product",),
+            ),
+        ),
+        contract=ApiContract(
+            endpoints=(Endpoint("GET", "/catalogue", entity="product"),)
+        ),
+        stack=FLASK_STACK,
+        entities=entities,
+    )
+
+    spec = ProjectSpec.from_blueprint(bp, tmp_path, "shop")
+
+    page = next(p for p in spec.pages if p.template == "templates/catalogue.html")
+    assert page.reads == ("product",)
+    # The endpoint isn't in app.py (no backend written here), so it is dropped by
+    # the "declared but not built" rule — the declaration still has to survive
+    # parsing, which the blueprint-level test covers.
+    assert bp.contract.endpoints[0].entity == "product"
+
+
+def test_from_blueprint_without_entities_behaves_as_before(tmp_path):
+    """Phase C is inert when the schema call failed."""
+    bp = Blueprint(
+        files=(PlannedFile("templates/products.html", role="frontend"),),
+        contract=ApiContract(
+            data_schema=("products(id INTEGER PRIMARY KEY, title TEXT)",)
+        ),
+        stack=FLASK_STACK,
+    )
+
+    spec = ProjectSpec.from_blueprint(bp, tmp_path, "shop")
+
+    assert [e.table for e in spec.entities] == ["products"]

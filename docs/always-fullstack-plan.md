@@ -114,9 +114,34 @@ static page must still get one. Keep an explicit opt-out (`"just html"`, `"stati
 
 ---
 
-## Phase C — Schema first, layout derived from it
+## Phase C — Schema first, layout derived from it — **DONE (2026-08-02)**
 
 The heart of the request, and the only phase that changes the pipeline's shape.
+
+Shipped as C1–C4 below, behind `settings.schema_first` (default on). Three defects were
+found by running the assembled pipeline rather than by the unit tests, and each is now
+pinned by one:
+
+1. **`GET /<table>/new` went missing.** The first version guarded route synthesis with "this
+   entity already has a route for this method", which is too coarse — the listing's
+   `GET /<table>` swallowed the form's `GET /<table>/new`, leaving a form page that could not
+   be opened. Routes are now synthesized **only for templates this pass creates**, which also
+   removes the opposite risk: adding `GET /<table>` beside the model's own listing route, one
+   of them rendering a template nobody created.
+2. **`IMAGE` lost its meaning.** It is not a SQLite type, so `_norm_type` collapses it to
+   TEXT — discarding the only signal that the column holds an upload, and with it the Phase
+   4b wiring. The signal now moves into the *name* (`cover` → `cover_path`), which is what
+   `Field.is_upload`, `crud.upload_helper_source` and `verify.fix_form_enctype` already
+   key off.
+3. **`\badd\b` does not match `add_product`** — `_` is a word character. The model's own form
+   page was read as a listing, earning the entity a second, duplicate form. Form-word
+   detection tokenizes the stem instead.
+
+`blueprint.py` imports `Entity` under `TYPE_CHECKING` only: `projectspec` imports it at
+runtime, so the reverse would be circular, and `from __future__ import annotations` keeps the
+annotation a string. `conftest.py` defaults `schema_first` OFF in tests — it runs *before*
+`_expand_requirements`, so a test that opts into the blueprint stage and patches only that
+method would otherwise reach a real Ollama. Full suite: **947 passed**.
 
 Today one call produces files and schema simultaneously, and the schema arrives as free
 text (`"users(email TEXT PRIMARY KEY, …)"`) that `parse_schema_line` has to reverse-engineer

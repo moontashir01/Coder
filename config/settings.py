@@ -168,6 +168,13 @@ class Settings(BaseSettings):
     # A forced stack that ISN'T installed is reported (Stack.runnable=False +
     # install_hint), never swapped for another one — see runtime_probe.py.
     web_stack: str = "flask"
+    # Phase C: spend ONE extra temperature-0 call deciding what the app STORES
+    # before planning what it looks like, so the layout is derived from a schema
+    # rather than invented alongside it (app/resources/prompts/schema.md). Every
+    # entity then gets a list page, a create form and their routes
+    # deterministically (blueprint.derive_pages_from_entities). Off = the schema
+    # arrives as free text inside the blueprint's own answer, exactly as before.
+    schema_first: bool = True
     # Build the 'optional' tier too (OAuth, 2FA, email delivery, …). Default off:
     # optional features are reported, not silently built.
     blueprint_optional_tier: bool = False
