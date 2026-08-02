@@ -210,7 +210,15 @@ def should_blueprint(message: str) -> bool:
 # bounds what the tier-2 classifier is allowed to look at.
 _WANT_RE = re.compile(
     r"\b(?:i|we)\s+(?:want|need|would like|'d like)\b|"
-    r"\b(?:help me|make me|set (?:me )?up|put together|working on|building)\b",
+    r"\b(?:help me|make me|set (?:me )?up|put together|working on|building)\b|"
+    # A bare noun phrase IS the request: "something to organize my recipes",
+    # "somewhere to track expenses", "a place my club can post events". These
+    # carry no verb and no noun the build regexes know, which is exactly the
+    # class tier 2 exists for — found by writing the Phase E eval for it.
+    # The lookahead drops the report-a-problem sense of the same words, so
+    # "something is wrong with the parser" does not buy a classifier call.
+    r"\b(?:something|somewhere|some way|a way|a place|an app|a tool|a site)\b"
+    r"(?!\s+(?:is|was|are|were|isn't|seems|looks|went|broke|happened|failed))",
     re.IGNORECASE,
 )
 

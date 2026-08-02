@@ -442,3 +442,219 @@ def backend_reads_fields(fields) -> Check:
         )
 
     return check
+
+
+# ---------------------------------------------------------------------------
+# Phase E (docs/always-fullstack-plan.md) — measure what phases A–D promised.
+#
+# The earlier checks name the table and the route they expect, which only works
+# when the eval author already knows the schema. These derive both from the
+# project's own spec, so one check covers any request shape — including the ones
+# no noun list anticipates, which is the point of Phase B.
+# ---------------------------------------------------------------------------
+
+
+def is_full_stack_app() -> Check:
+    """A Flask app with routes and templates — not a page of static HTML.
+
+    Phases A and B in one assertion. Before them a request whose wording missed
+    the gate's noun list, or a machine where Flask happened not to be importable,
+    both produced a plausible-looking pile of HTML with no server and no
+    database — and every file-level check still passed.
+    """
+
+    def check(ctx: "CheckContext") -> tuple[bool, str]:
+        workdir = Path(ctx.workdir)
+        entry = workdir / "app.py"
+        if not entry.is_file():
+            html = sorted(p.name for p in workdir.rglob("*.html"))[:4]
+            return False, (
+                "no app.py — this build is static"
+                + (f" ({', '.join(html)})" if html else " and empty")
+            )
+        try:
+            source = entry.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:  # pragma: no cover - unreadable file
+            return False, f"could not read app.py: {e}"
+
+        missing = []
+        if "flask" not in source.lower():
+            missing.append("app.py does not import flask")
+        if "@app.route" not in source:
+            missing.append("app.py defines no route")
+        if not (workdir / "templates").is_dir():
+            missing.append("no templates/ directory")
+        if missing:
+            return False, "; ".join(missing)
+        return True, "flask app with routes and templates"
+
+    return check
+
+
+def every_entity_has_a_table() -> Check:
+    """Every table the project DECLARES exists in the database, with its columns.
+
+    The dynamic form of `db_has_column`: it asks the spec what was promised and
+    the database whether it was delivered, so it works for a request whose schema
+    the eval author could not have known in advance.
+    """
+
+    def check(ctx: "CheckContext") -> tuple[bool, str]:
+        import sqlite3
+
+        spec = _spec(ctx)
+        if spec is None or not spec.entities:
+            return False, "no project spec with entities"
+        dbs = sorted(Path(ctx.workdir).glob("*.db"))
+        if not dbs:
+            return False, f"no .db file for {len(spec.entities)} declared table(s)"
+
+        found: dict[str, set[str]] = {}
+        for path in dbs:
+            conn = sqlite3.connect(path)
+            try:
+                for entity in spec.entities:
+                    try:
+                        cols = {
+                            r[1]
+                            for r in conn.execute(f"PRAGMA table_info({entity.table})")
+                        }
+                    except Exception:
+                        cols = set()
+                    if cols:
+                        found.setdefault(entity.table, set()).update(cols)
+            finally:
+                conn.close()
+
+        problems = []
+        for entity in spec.entities:
+            cols = found.get(entity.table)
+            if not cols:
+                problems.append(f"{entity.table}: table missing")
+                continue
+            absent = [f.name for f in entity.fields if f.name not in cols]
+            if absent:
+                problems.append(f"{entity.table}: no column {', '.join(absent)}")
+        if problems:
+            return False, "; ".join(problems)
+        return True, f"all {len(spec.entities)} table(s) exist: {', '.join(found)}"
+
+    return check
+
+
+def _entity_routes(spec, entity) -> tuple[str, str]:
+    """`(list route, create route)` for an entity.
+
+    Read from the spec when it recorded them, falling back to the convention
+    `derive_pages_from_entities` synthesizes — which is what the routes will be
+    whenever the model did not name its own.
+    """
+    gets = [
+        e.path
+        for e in spec.endpoints
+        if e.method == "GET" and e.entity == entity.name and "new" not in e.path
+    ]
+    posts = [
+        e.path for e in spec.endpoints if e.method == "POST" and e.entity == entity.name
+    ]
+    return (
+        gets[0] if gets else f"/{entity.table}",
+        posts[0] if posts else f"/{entity.table}/new",
+    )
+
+
+def entities_are_usable(check_persistence: bool = True) -> Check:
+    """Every declared table is browsable AND writable, in the running app.
+
+    Phase C3's postcondition, measured: "every entity gets a list page, a create
+    form and the routes behind them" is a claim about the finished app, and only
+    running it can settle it. A four-table build that shipped pages for two used
+    to pass everything else in this file.
+
+    Starts the app ONCE and loops the entities inside it — a start per entity
+    turns a four-table check into four server launches.
+    """
+    marker = "EvalProbe7f1e"
+
+    def check(ctx: "CheckContext") -> tuple[bool, str]:
+        from urllib.parse import urlencode
+
+        from app.agent.apprunner import AppRunner
+        from app.agent.smoke import _encode_multipart, _png_1x1, _request, server_error
+
+        spec = _spec(ctx)
+        if spec is None or not spec.entities:
+            return False, "no project spec with entities"
+        if not (Path(ctx.workdir) / "app.py").is_file():
+            return False, "no app.py to run"
+
+        runner = AppRunner()
+        problems: list[str] = []
+        passed: list[str] = []
+        try:
+            ok, message = runner.start(ctx.workdir)
+            if not ok:
+                return False, f"app did not start: {message}"
+            port = runner._port
+
+            for entity in spec.entities:
+                list_route, form_route = _entity_routes(spec, entity)
+                status, _ = _request(port, "GET", list_route)
+                if not (status and 200 <= status < 400):
+                    problems.append(f"{entity.table}: GET {list_route} -> {status}")
+                    continue
+                if not check_persistence:
+                    passed.append(entity.table)
+                    continue
+
+                fields: dict = {}
+                files: dict = {}
+                for f in entity.fields:
+                    if f.pk:
+                        continue
+                    if f.is_upload():
+                        files[f.name] = (f"{f.name}.png", _png_1x1())
+                    elif f.type in ("INTEGER", "REAL", "NUMERIC"):
+                        # A foreign key or a price. Text here would fail the
+                        # insert for a reason that is not the build's fault.
+                        fields[f.name] = "7"
+                    else:
+                        fields[f.name] = f"{marker} {f.name}"
+                if not fields and not files:
+                    passed.append(f"{entity.table} (nothing writable)")
+                    continue
+
+                if files:
+                    body, content_type = _encode_multipart(fields, files)
+                else:
+                    body = urlencode(fields).encode()
+                    content_type = "application/x-www-form-urlencoded"
+                status, text = _request(
+                    port, "POST", form_route, body=body, content_type=content_type
+                )
+                if status is None:
+                    problems.append(f"{entity.table}: POST {form_route} no response")
+                    continue
+                if status >= 400:
+                    why = server_error(text) if status >= 500 else ""
+                    problems.append(
+                        f"{entity.table}: POST {form_route} -> {status}"
+                        + (f" ({why})" if why else "")
+                    )
+                    continue
+                _, listing = _request(port, "GET", list_route)
+                if marker in (listing or ""):
+                    passed.append(entity.table)
+                else:
+                    problems.append(
+                        f"{entity.table}: posted, but the value never appeared "
+                        f"on {list_route}"
+                    )
+        finally:
+            runner.stop()
+
+        if problems:
+            return False, "; ".join(problems)
+        return True, f"usable: {', '.join(passed)}"
+
+    return check

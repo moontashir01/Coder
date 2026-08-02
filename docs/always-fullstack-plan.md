@@ -265,6 +265,34 @@ this the memory drifts the moment someone edits a file the ordinary way.
 
 ---
 
+## Phase E — Prove it — **DONE (2026-08-02)**
+
+Five `web_shape_*` tasks added to the `--webapp` suite, plus three spec-driven checks that
+name no table and no route (`is_full_stack_app`, `every_entity_has_a_table`,
+`entities_are_usable`), so a request whose schema was not known in advance is measured as
+strictly as the e-commerce one. `entities_are_usable` starts the app once and loops the
+entities inside it; the two tests covering it start a **real** Flask subprocess, like
+`tests/test_functional_probe.py`, because a probe only ever tested against a fake has not
+been tested.
+
+**Writing the eval found a Phase B gap, which is what evals are for.** The plan's own example
+`"something to organize my recipes"` has no build verb and no want-phrasing, so
+`may_be_web_build` rejected it before tier 2 could ever be asked — the task would have
+measured a request that never reached the classifier. `_WANT_RE` now recognises a bare noun
+phrase (`something|somewhere|a place|a way|an app|a tool|a site`), with a lookahead that drops
+the report-a-problem sense of the same words so "something is wrong with the parser" does not
+buy a classifier call. Both directions are pinned in `test_blueprint.py`.
+
+Two suite tests pinned `WEBAPP_TASKS` by exact list equality, which made every new task an
+edit to a test rather than a decision about the suite; they now assert the demo spine by
+containment and the "did turn 3 break turn 1" rule across *all* multi-turn tasks.
+
+Offline suite: **1008 passed**. The live numbers need `python -m evals.run --webapp` against
+a running Ollama — that is the run to do before the demo, and per the eval lesson below, a
+single run of a suspect task proves nothing.
+
+### Original plan
+
 ## Phase E — Prove it
 
 Extend the `--webapp` eval suite; the checks that matter already exist (`db_has_column`,

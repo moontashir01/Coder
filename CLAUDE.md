@@ -948,6 +948,17 @@ optimisation — a fresh one per turn would reload the spec from disk and mask e
 staleness the suite exists to catch. A turn that raises stops the conversation; `prompt` still works
 so every single-turn task is untouched.
 
+**Phase E (`docs/always-fullstack-plan.md`) added request-SHAPE tasks** (`web_shape_*`) next
+to the demo turns. Their point is that the checks name **no table and no route** — they read
+the project's own spec — so a request whose schema the eval author could not have guessed is
+measured as strictly as the e-commerce one: `is_full_stack_app` (A+B: a server exists at all),
+`every_entity_has_a_table` (C1: the declared schema really ran), `entities_are_usable`
+(C3: every table is browsable AND writable, checked by starting the app **once** and looping
+the entities inside it). `web_shape_offlist` is the Phase B regression test — not one word of
+"something to organize my recipes and what goes in them" is in `_BLUEPRINT_NOUN_RE` and there
+is no build verb either, so before Phase B it shipped static HTML and every file-level check
+still passed.
+
 The checks assert the app WORKS, not that plausibly-named files appeared:
 - **`db_has_column` asks the database, not the source.** A `CREATE TABLE` in a file nobody executes
   proves nothing — Phase 1 and Phase 4 both shipped builds that would pass a source-level check and

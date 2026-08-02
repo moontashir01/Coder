@@ -10,11 +10,20 @@ from types import SimpleNamespace
 
 import pytest
 
-from evals.checks import (answer_contains, any_file_matches,
-                          backend_defines_route, backend_reads_fields,
-                          file_contains, file_excludes, file_exists,
-                          frontend_calls_route, has_backend_server,
-                          min_files_written, route_wired, used_tool)
+from evals.checks import (
+    answer_contains,
+    any_file_matches,
+    backend_defines_route,
+    backend_reads_fields,
+    file_contains,
+    file_excludes,
+    file_exists,
+    frontend_calls_route,
+    has_backend_server,
+    min_files_written,
+    route_wired,
+    used_tool,
+)
 from evals.harness import CheckContext, EvalTask, run_suite, run_task
 from evals.tasks import BLUEPRINT_TASKS, GOLDEN_TASKS
 
@@ -163,7 +172,9 @@ def test_backend_reads_fields(tmp_path):
     (tmp_path / "server.py").write_text(
         "email = form['email']\npassword = form['password']\n", encoding="utf-8"
     )
-    assert backend_reads_fields(["email", "password"])(_ctx(workdir=tmp_path))[0] is True
+    assert (
+        backend_reads_fields(["email", "password"])(_ctx(workdir=tmp_path))[0] is True
+    )
     ok, detail = backend_reads_fields(["email", "token"])(_ctx(workdir=tmp_path))
     assert ok is False
     assert "token" in detail
@@ -235,8 +246,13 @@ async def test_blueprint_task_end_to_end_offline(tmp_path, monkeypatch):
     """Run a blueprint golden task through run_task with the flag on, a canned
     blueprint and scripted file bodies — proving the coherence checks pass
     against the files the pipeline actually writes (no live Ollama)."""
-    from app.agent.blueprint import (ApiContract, Blueprint, Endpoint, Feature,
-                                     PlannedFile)
+    from app.agent.blueprint import (
+        ApiContract,
+        Blueprint,
+        Endpoint,
+        Feature,
+        PlannedFile,
+    )
     from app.agent.core import AgentCore
     from config.settings import settings
 
@@ -265,8 +281,8 @@ async def test_blueprint_task_end_to_end_offline(tmp_path, monkeypatch):
     a._llm_edit = ScriptedLLM(["no blocks"])
     a._llm_direct = ScriptedLLM(
         [
-            'FILENAME: login.html\n<!doctype html>\n<html><body>'
-            '<form id="login-form" onsubmit="fetch(\'/api/login\',{method:\'POST\'})">'
+            "FILENAME: login.html\n<!doctype html>\n<html><body>"
+            "<form id=\"login-form\" onsubmit=\"fetch('/api/login',{method:'POST'})\">"
             '<input name="email"><input name="password"></form></body></html>\n',
             "FILENAME: server.py\nfrom http.server import BaseHTTPRequestHandler\n"
             "# POST /api/login reads email and password\n"
@@ -294,3 +310,229 @@ async def test_run_suite_scores(tmp_path, monkeypatch):
     assert report.score == 0.5
     # each task gets an isolated subdir so files don't collide
     assert {r.task_id for r in report.results} == {"good", "bad"}
+
+
+# ---------------------------------------------------------------------------
+# Phase E checks (docs/always-fullstack-plan.md) — the spec-driven ones.
+#
+# `entities_are_usable` starts a REAL Flask app in a subprocess, like
+# tests/test_functional_probe.py: a check that only ever runs against a fake has
+# not been tested at all, and this one exists to catch apps that answer but do
+# nothing.
+# ---------------------------------------------------------------------------
+
+import json
+import sqlite3
+import textwrap
+
+from evals.checks import (
+    _entity_routes,
+    entities_are_usable,
+    every_entity_has_a_table,
+    is_full_stack_app,
+)
+
+
+def _wctx(workdir):
+    """A context for a check that only looks at the workdir. Distinct from the
+    module's `_ctx`, which builds one from an answer/trace."""
+    return CheckContext(workdir=Path(workdir), answer="", trace=[])
+
+
+def _write_spec(workdir, tables):
+    """A `.coder/project.json` declaring `tables` = {name: (table, [fields])}."""
+    entities = []
+    for name, (table, fields) in tables.items():
+        entities.append(
+            {
+                "name": name,
+                "table": table,
+                "fields": [{"name": "id", "type": "INTEGER", "pk": True}]
+                + [{"name": f, "type": "TEXT"} for f in fields],
+            }
+        )
+    (Path(workdir) / ".coder").mkdir(parents=True, exist_ok=True)
+    (Path(workdir) / ".coder" / "project.json").write_text(
+        json.dumps({"spec_version": 1, "revision": 1, "entities": entities}),
+        encoding="utf-8",
+    )
+
+
+def test_a_static_build_is_not_a_full_stack_app(tmp_path):
+    """Phase B's regression signal: plausible HTML, no server."""
+    (tmp_path / "index.html").write_text("<html><body>hi</body></html>")
+    (tmp_path / "style.css").write_text("body{}")
+
+    ok, detail = is_full_stack_app()(_wctx(tmp_path))
+
+    assert ok is False
+    assert "static" in detail and "index.html" in detail
+
+
+def test_an_app_py_with_no_routes_is_not_a_full_stack_app(tmp_path):
+    (tmp_path / "app.py").write_text("from flask import Flask\napp = Flask(__name__)\n")
+    (tmp_path / "templates").mkdir()
+
+    ok, detail = is_full_stack_app()(_wctx(tmp_path))
+
+    assert ok is False
+    assert "no route" in detail
+
+
+def test_a_flask_build_is_a_full_stack_app(tmp_path):
+    (tmp_path / "app.py").write_text(
+        'from flask import Flask\napp = Flask(__name__)\n@app.route("/")\ndef i(): ...\n'
+    )
+    (tmp_path / "templates").mkdir()
+
+    ok, detail = is_full_stack_app()(_wctx(tmp_path))
+
+    assert ok is True and "flask" in detail
+
+
+def test_every_entity_has_a_table_asks_the_database(tmp_path):
+    """A CREATE TABLE in a file nobody executes proves nothing."""
+    _write_spec(tmp_path, {"recipe": ("recipes", ["title"])})
+    conn = sqlite3.connect(tmp_path / "app.db")
+    conn.execute("CREATE TABLE recipes (id INTEGER PRIMARY KEY, title TEXT)")
+    conn.commit()
+    conn.close()
+
+    ok, detail = every_entity_has_a_table()(_wctx(tmp_path))
+
+    assert ok is True and "recipes" in detail
+
+
+def test_every_entity_has_a_table_catches_the_table_that_was_skipped(tmp_path):
+    """The four-table build that shipped two — invisible to a check that names
+    the one table it already knew about."""
+    _write_spec(
+        tmp_path,
+        {"recipe": ("recipes", ["title"]), "ingredient": ("ingredients", ["name"])},
+    )
+    conn = sqlite3.connect(tmp_path / "app.db")
+    conn.execute("CREATE TABLE recipes (id INTEGER PRIMARY KEY, title TEXT)")
+    conn.commit()
+    conn.close()
+
+    ok, detail = every_entity_has_a_table()(_wctx(tmp_path))
+
+    assert ok is False
+    assert "ingredients" in detail and "missing" in detail
+
+
+def test_every_entity_has_a_table_catches_a_missing_column(tmp_path):
+    _write_spec(tmp_path, {"recipe": ("recipes", ["title", "prep_minutes"])})
+    conn = sqlite3.connect(tmp_path / "app.db")
+    conn.execute("CREATE TABLE recipes (id INTEGER PRIMARY KEY, title TEXT)")
+    conn.commit()
+    conn.close()
+
+    ok, detail = every_entity_has_a_table()(_wctx(tmp_path))
+
+    assert ok is False and "prep_minutes" in detail
+
+
+def test_entity_routes_fall_back_to_the_synthesized_convention():
+    from app.agent.projectspec import Entity, Field, ProjectSpec, SpecEndpoint
+
+    entity = Entity("recipe", "recipes", (Field("id", "INTEGER", pk=True),))
+    bare = ProjectSpec()
+    assert _entity_routes(bare, entity) == ("/recipes", "/recipes/new")
+
+    # …but the spec's own routes win when it recorded them.
+    named = ProjectSpec(
+        endpoints=(
+            SpecEndpoint("GET", "/cookbook", entity="recipe"),
+            SpecEndpoint("POST", "/cookbook/add", entity="recipe"),
+        )
+    )
+    assert _entity_routes(named, entity) == ("/cookbook", "/cookbook/add")
+
+
+_USABLE_APP = """
+import sqlite3
+from flask import Flask, request, redirect
+
+app = Flask(__name__)
+DB = "app.db"
+
+
+def db():
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@app.route("/recipes")
+def recipes():
+    rows = db().execute("SELECT title FROM recipes").fetchall()
+    return "<ul>" + "".join(f"<li>{r['title']}</li>" for r in rows) + "</ul>"
+
+
+@app.route("/recipes/new", methods=["GET", "POST"])
+def new_recipe():
+    if request.method == "POST":
+        conn = db()
+        conn.execute("INSERT INTO recipes (title) VALUES (?)", (request.form["title"],))
+        conn.commit()
+        return redirect("/recipes")
+    return "<form method=post><input name=title></form>"
+
+
+if __name__ == "__main__":
+    conn = sqlite3.connect(DB)
+    conn.execute("CREATE TABLE IF NOT EXISTS recipes (id INTEGER PRIMARY KEY, title TEXT)")
+    conn.commit()
+    conn.close()
+    app.run(port=int(__import__("os").environ.get("PORT", 5000)))
+"""
+
+# Same app, one line removed: it answers 302 and writes nothing. Every other
+# check in checks.py passes this; only the persistence probe fails it.
+_SILENT_APP = _USABLE_APP.replace(
+    'conn.execute("INSERT INTO recipes (title) VALUES (?)", (request.form["title"],))',
+    "pass",
+)
+
+
+def _usable_project(tmp_path, source):
+    (tmp_path / "app.py").write_text(textwrap.dedent(source), encoding="utf-8")
+    _write_spec(tmp_path, {"recipe": ("recipes", ["title"])})
+    conn = sqlite3.connect(tmp_path / "app.db")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS recipes (id INTEGER PRIMARY KEY, title TEXT)"
+    )
+    conn.commit()
+    conn.close()
+    return tmp_path
+
+
+def test_entities_are_usable_passes_a_working_app(tmp_path):
+    pytest.importorskip("flask")
+    workdir = _usable_project(tmp_path, _USABLE_APP)
+
+    ok, detail = entities_are_usable()(_wctx(workdir))
+
+    assert ok is True, detail
+    assert "recipes" in detail
+
+
+def test_entities_are_usable_catches_an_app_that_never_writes(tmp_path):
+    """Answers 302, stores nothing. This is the only check that can see it."""
+    pytest.importorskip("flask")
+    workdir = _usable_project(tmp_path, _SILENT_APP)
+
+    ok, detail = entities_are_usable()(_wctx(workdir))
+
+    assert ok is False
+    assert "never appeared" in detail
+
+
+def test_entities_are_usable_needs_a_spec_and_an_app(tmp_path):
+    ok, detail = entities_are_usable()(_wctx(tmp_path))
+    assert ok is False and "no project spec" in detail
+
+    _write_spec(tmp_path, {"recipe": ("recipes", ["title"])})
+    ok, detail = entities_are_usable()(_wctx(tmp_path))
+    assert ok is False and "no app.py" in detail

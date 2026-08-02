@@ -238,26 +238,50 @@ def test_app_serves_without_an_app(tmp_path):
 
 
 def test_the_webapp_suite_mirrors_the_demo():
+    """The demo turns are the spine of the suite and must stay in order.
+
+    Asserted by containment, not equality: Phase E added request-shape tasks
+    alongside these, and pinning the exact list would make every future task an
+    edit to this test rather than a decision about the suite.
+    """
+    demo = ["web_turn1_build", "web_turn2_amend", "web_turn3_cart", "web_turn4_search"]
     ids = [t.id for t in WEBAPP_TASKS]
-    assert ids == [
-        "web_turn1_build",
-        "web_turn2_amend",
-        "web_turn3_cart",
-        "web_turn4_search",
-    ]
-    # Each task is the whole conversation up to its turn.
-    assert [len(t.turns()) for t in WEBAPP_TASKS] == [1, 2, 3, 4]
-    assert WEBAPP_TASKS[0].turns()[0].startswith("build me an e-commerce")
+    assert [i for i in ids if i in demo] == demo
+
+    by_id = {t.id: t for t in WEBAPP_TASKS}
+    # Each demo task is the whole conversation up to its turn.
+    assert [len(by_id[i].turns()) for i in demo] == [1, 2, 3, 4]
+    assert by_id["web_turn1_build"].turns()[0].startswith("build me an e-commerce")
 
 
 def test_every_multi_turn_task_checks_that_turn_1_survived():
     """The headline number — it is not "did turn 3 work" but "did turn 3 break
-    turn 1"."""
-    for task in WEBAPP_TASKS[1:]:
+    turn 1". Every task that runs more than one turn has to ask it."""
+    multi = [t for t in WEBAPP_TASKS if len(t.turns()) > 1]
+    assert len(multi) >= 4  # the three demo amendments + Phase E's off-list one
+    for task in multi:
         names = [getattr(c, "__qualname__", "") for c in task.checks]
         assert any("app_serves" in n or "check" in n for n in names), task.id
-    # And the first turn's route is what they assert on.
-    assert len(WEBAPP_TASKS) == 4
+
+
+def test_phase_e_covers_several_request_shapes():
+    """One task per shape, all asserting the same three spec-driven checks — and
+    one whose wording is deliberately outside `_BLUEPRINT_NOUN_RE`, which is the
+    Phase B regression test."""
+    shapes = [t for t in WEBAPP_TASKS if t.id.startswith("web_shape_")]
+    assert len(shapes) >= 4
+
+    off_list = next(t for t in WEBAPP_TASKS if t.id == "web_shape_offlist")
+    from app.agent.blueprint import may_be_web_build, should_blueprint
+
+    prompt = off_list.turns()[0]
+    assert should_blueprint(prompt) is False  # tier 1 cannot see it…
+    assert may_be_web_build(prompt) is True  # …and tier 2 is what catches it
+
+    # Every shape task asserts a real server, a real schema and a usable app.
+    for task in shapes:
+        names = [getattr(c, "__qualname__", "") for c in task.checks]
+        assert len(names) >= 3, task.id
 
 
 def test_run_py_exposes_the_webapp_flag():

@@ -14,10 +14,13 @@ from evals.checks import (
     backend_reads_fields,
     db_has_column,
     earlier_pages_still_work,
+    entities_are_usable,
+    every_entity_has_a_table,
     file_contains,
     file_excludes,
     file_exists,
     has_backend_server,
+    is_full_stack_app,
     min_files_written,
     spec_has_endpoint,
     spec_has_entity,
@@ -206,6 +209,73 @@ WEBAPP_TASKS: list[EvalTask] = [
         checks=[
             spec_has_endpoint("GET", "search"),
             earlier_pages_still_work(["/"]),
+        ],
+    ),
+    # -----------------------------------------------------------------------
+    # Phase E (docs/always-fullstack-plan.md): one task per REQUEST SHAPE, all
+    # asserting the same three things. The point is that the checks name no
+    # table and no route — they read the project's own spec — so a request whose
+    # schema the eval author could not have guessed is measured just as
+    # strictly as the e-commerce one above.
+    #
+    #   is_full_stack_app        A + B: a server exists at all
+    #   every_entity_has_a_table C1: the declared schema really ran
+    #   entities_are_usable      C3: every table is browsable and writable
+    # -----------------------------------------------------------------------
+    EvalTask(
+        id="web_shape_blog",
+        prompt="build me a blog where I can write posts and readers can comment",
+        checks=[
+            is_full_stack_app(),
+            every_entity_has_a_table(),
+            entities_are_usable(),
+        ],
+    ),
+    EvalTask(
+        id="web_shape_shop",
+        prompt="build me a shop for selling handmade candles with pictures",
+        checks=[
+            is_full_stack_app(),
+            every_entity_has_a_table(),
+            entities_are_usable(),
+        ],
+    ),
+    EvalTask(
+        id="web_shape_booking",
+        prompt="build a booking system for a barber shop",
+        checks=[
+            is_full_stack_app(),
+            every_entity_has_a_table(),
+            entities_are_usable(),
+        ],
+    ),
+    # THE Phase B regression test. Not one word here is in `_BLUEPRINT_NOUN_RE`,
+    # and there is no build verb either: before Phase B this shipped static HTML
+    # with no server and no database, and every file-level check still passed.
+    # If tier 2 ever regresses, `is_full_stack_app` is what says so.
+    EvalTask(
+        id="web_shape_offlist",
+        prompt="something to organize my recipes and what goes in them",
+        checks=[
+            is_full_stack_app(),
+            every_entity_has_a_table(),
+            entities_are_usable(),
+        ],
+    ),
+    # And the same off-list project amended twice — the headline question asked
+    # of a request the gate was never written for: did turn 3 break turn 1?
+    EvalTask(
+        id="web_shape_offlist_amended",
+        prompts=[
+            "something to organize my recipes and what goes in them",
+            "add a prep time in minutes to each recipe",
+            "add a page listing recipes I have marked as favourites",
+        ],
+        checks=[
+            is_full_stack_app(),
+            every_entity_has_a_table(),  # incl. the column turn 2 added
+            earlier_pages_still_work(["/"]),
+            entities_are_usable(),
         ],
     ),
 ]

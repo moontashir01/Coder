@@ -970,6 +970,11 @@ def test_should_blueprint_still_skips_these(msg):
         "I need somewhere to track my expenses",  # no build verb at all
         "help me make a place where my club can post events",
         "i want an inventory thing for my workshop",
+        # A bare noun phrase, no verb and no want-phrasing at all. This is the
+        # shape the Phase E eval task uses, and it did NOT reach tier 2 until
+        # writing that task exposed it.
+        "something to organize my recipes and what goes in them",
+        "a place my club can post events",
     ],
 )
 def test_tier_two_candidates_are_the_ones_the_regex_misses(msg):
@@ -990,6 +995,10 @@ def test_tier_two_candidates_are_the_ones_the_regex_misses(msg):
         "create a css file",  # single file, no application
         "the tests are failing",  # no sign anything should be built
         "run the build",
+        # The report-a-problem sense of the same noun phrase: a bug report, not
+        # a request for an application.
+        "something is wrong with the parser",
+        "something broke in the login flow",
         "",
     ],
 )
