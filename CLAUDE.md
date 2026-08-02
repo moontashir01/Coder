@@ -507,6 +507,31 @@ from cwd or the repo layout — always via `settings.prompts_dir` / `skills_dir`
 dotfiles, which is why `scaffolds/flask/` stores `.gitignore`/`.gitkeep` as `gitignore`/`gitkeep`
 and `scaffold.py` restores the dot on the way out.
 
+### Forcing the stack (`app/agent/runtime_probe.py`, `settings.web_stack`)
+
+Phase A of `docs/always-fullstack-plan.md`. `detect_stack()` used to *probe* — richest
+importable framework wins — so the full-stack promise silently depended on Flask being
+importable, which it is here only because Coder's own environment installs it. `web_stack`
+(default `"flask"`) is now passed as `prefer=` at both call sites, and `"auto"` restores
+probing.
+
+**A forced stack is never silently downgraded.** `prefer="flask"` with Flask absent returns
+the Flask stack with `runnable=False` and an `install_hint`, NOT the stdlib stack —
+downstream cannot tell a downgraded build apart from one that was always meant to be
+stdlib, which is the same silent-truncation failure class `blueprint_max_files` and the
+coverage check exist to prevent. Two consequences, both deliberate:
+- **`install_hint` is separate from `note`, and must stay separate.** `note` is the
+  generation instruction and still says "build on Flask"; `prompts/blueprint.md` tells the
+  model *not* to use a framework that isn't available, so folding the warning into `note`
+  would make it quietly write a stdlib app — the exact downgrade being reported.
+  `_run_blueprint` leads its answer with `install_hint`; the model never sees it.
+- **The smoke test is skipped when `stack.runnable` is False.** The app would die on
+  `import flask` and `_smoke_repair_instruction` would send the model to rewrite code that
+  is correct.
+
+Flask is declared in `pyproject.toml` for this reason — it is the *generated* apps' runtime
+(`smoke.py`/`apprunner.py` launch them with `sys.executable`), not something Coder imports.
+
 ### Deterministic project scaffold (`app/agent/scaffold.py`)
 
 The highest-leverage rule in `docs/fullstack-web-plan.md`: **deterministic beats generated.** Before
@@ -766,8 +791,9 @@ the next step of a multi-file build — see `_sibling_context`. `extract_build_s
 allows the one extra pre-planning LLM call that distils the shared nav/design spec
 (`app/agent/buildspec.py`); turning it off reverts multi-file builds to the pre-spec behavior.
 Full-stack web knobs (`docs/fullstack-web-plan.md`): `expand_requirements` and
-`blueprint_smoke_test` both ship **on** (Phase 0); `scaffolds_dir` locates the runnable project
-skeletons; `blueprint_max_files` (24) caps one build's fan-out and now **reports** what it drops as
+`blueprint_smoke_test` both ship **on** (Phase 0); **`web_stack` (default `"flask"`) forces the
+backend stack** rather than probing for one — `detect_stack(prefer=…)`, see "Forcing the stack"
+below; `scaffolds_dir` locates the runnable project skeletons; `blueprint_max_files` (24) caps one build's fan-out and now **reports** what it drops as
 `may not meet:` rather than truncating silently — `_run_blueprint` and `_verify_blueprint_coverage`
 apply the same slice, so a hidden truncation was invisible to the check that exists to catch missing
 files. `allow_network` additionally decides whether generated pages may reference CDN fonts/scripts.

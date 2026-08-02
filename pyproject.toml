@@ -17,6 +17,14 @@ dynamic = ["version"]
 dependencies = [
     "aiosqlite>=0.22",
     "chromadb>=1.5",
+    # NOT imported by Coder anywhere — it is the runtime of the apps Coder
+    # GENERATES (settings.web_stack, default "flask"). It has to live in Coder's
+    # own environment for two reasons: runtime_probe.detect_stack() find_spec's
+    # it to confirm the forced stack is installed, and smoke.py / apprunner.py
+    # launch generated apps with `sys.executable` — the same interpreter. It was
+    # previously present only by accident of the frozen requirements.txt, which
+    # made "Coder always builds Flask apps" depend on an unstated coincidence.
+    "Flask>=3.1",
     "GitPython>=3.1",
     "httpx>=0.28",
     "langchain-core>=1.4",

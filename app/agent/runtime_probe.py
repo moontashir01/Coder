@@ -14,6 +14,18 @@ The default is the Python standard library — `http.server`/`wsgiref` + stdlib
 `sqlite3` + `json` — which needs no install and runs fully offline everywhere,
 turning "offline" from a limitation into the feature's grounding principle.
 
+**`prefer` forces a stack, and a forced stack is never silently downgraded**
+(`settings.web_stack`, default `"flask"` — Phase A of
+`docs/always-fullstack-plan.md`). Probing is the right default for a generic
+agent; it is the wrong one for a tool that promises "every website is built on
+Flask/Jinja/SQLite", because the promise then quietly depends on what happens to
+be importable. When a forced stack is absent this returns it anyway with
+`runnable=False` and an `install_hint`, so the caller reports "install Flask"
+rather than building a different kind of app under the same description.
+Returning the stdlib stack there would be indistinguishable downstream from a
+build that was always meant to be stdlib — the silent-truncation failure class
+that `blueprint_max_files` and the coverage check already exist to prevent.
+
 Pure and cheap: `find_spec`/`which` only, no imports of the frameworks
 themselves, no network. Fully injectable for offline tests.
 """
@@ -27,12 +39,20 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Stack:
-    """A backend runtime chosen because it is installed on THIS machine."""
+    """A backend runtime, either probed as present or forced by the caller."""
 
     language: str  # "python" | "node" | "none"
     backend: str  # "stdlib" | "flask" | "fastapi" | "express" | "none"
     runnable: bool = True  # proven present (find_spec / which succeeded)
-    note: str = ""  # human line threaded into the generation prompt
+    note: str = ""  # instruction block threaded into the generation prompt
+    # User-facing, and deliberately NOT part of `note`: when a forced stack is
+    # absent, the model must still be told to write that stack (it is what the
+    # generated project's own requirements.txt declares), while the *user* is
+    # told to install it. Folding this into `note` would do the opposite —
+    # `prompts/blueprint.md` says "do NOT use a framework that isn't listed —
+    # it is not installed", so the model would read the warning and quietly
+    # write a stdlib app instead. That is the exact downgrade this reports.
+    install_hint: str = ""
 
     def to_prompt_line(self) -> str:
         return self.note or f"{self.language} / {self.backend}"
@@ -69,30 +89,34 @@ def detect_stack(
     _has_module=_has_module,
     _which=shutil.which,
 ) -> Stack:
-    """Pick a backend stack that is proven to run on this machine.
+    """Pick a backend stack: the one the caller forced, else one proven present.
 
-    Preference order, each step gated on real presence:
-      1. An explicit ``prefer`` the caller forced (flask/fastapi/node/stdlib),
-         but only if it's actually present — otherwise fall through.
-      2. A Python web framework already importable in the venv (Flask, then
+    ``prefer`` names the stack to build on (flask/fastapi/node/stdlib/none) and
+    is **honoured whether or not it is installed** — an absent one comes back
+    with ``runnable=False`` and an ``install_hint`` instead of being swapped for
+    something else. See the module docstring for why the swap is the bug.
+
+    ``prefer="auto"`` restores pure probing, in preference order:
+      1. A Python web framework already importable in the venv (Flask, then
          FastAPI) — richer than stdlib and no install needed.
-      3. Node + a resolvable express (or ``allow_network`` so npm may install).
-      4. The stdlib stack — the always-safe offline default.
+      2. Node + a resolvable express (or ``allow_network`` so npm may install).
+      3. The stdlib stack — the always-safe offline default.
 
     ``prefer="none"`` forces a frontend-only build (no backend proposed).
-    The ``_has_module`` / ``_which`` seams are injected in tests so the choice is
-    deterministic offline.
+    An unrecognised ``prefer`` falls through to auto. The ``_has_module`` /
+    ``_which`` seams are injected in tests so the choice is deterministic
+    offline.
     """
     if prefer == "none":
         return NO_STACK
     if prefer == "stdlib":
-        return STDLIB_STACK
-    if prefer == "flask" and _has_module("flask"):
-        return _flask()
-    if prefer == "fastapi" and _has_module("fastapi"):
-        return _fastapi()
-    if prefer == "node" and _which("node"):
-        return _node(allow_network, _has_module)
+        return STDLIB_STACK  # stdlib is always present, so always runnable
+    if prefer == "flask":
+        return _flask(runnable=_has_module("flask"))
+    if prefer == "fastapi":
+        return _fastapi(runnable=_has_module("fastapi"))
+    if prefer == "node":
+        return _node(allow_network, runnable=bool(_which("node")))
 
     # auto: richest present option wins, else stdlib.
     if _has_module("flask"):
@@ -100,18 +124,30 @@ def detect_stack(
     if _has_module("fastapi"):
         return _fastapi()
     if _which("node") and (allow_network or _node_dep_present(_has_module)):
-        return _node(allow_network, _has_module)
+        return _node(allow_network)
     return STDLIB_STACK
 
 
-def _flask() -> Stack:
+def _flask(runnable: bool = True) -> Stack:
     return Stack(
         language="python",
         backend="flask",
-        runnable=True,
+        runnable=runnable,
+        install_hint=(
+            ""
+            if runnable
+            else (
+                "Flask is not installed in this environment, so the generated "
+                "app cannot start here yet — run `pip install flask` in the "
+                "venv Coder runs from. The project's own requirements.txt "
+                "already declares it; Coder launches generated apps with "
+                "`sys.executable`, so it is the same interpreter."
+            )
+        ),
         note=(
-            "Flask is installed — server-rendered Flask + Jinja2 templates + "
-            "stdlib sqlite3. One process serves pages, static files and uploads; "
+            "The stack for this build is server-rendered Flask + Jinja2 "
+            "templates + stdlib sqlite3. One process serves pages, static "
+            "files and uploads; "
             "no separate frontend server, no build step, no React.\n"
             "Use EXACTLY this layout:\n"
             "  app.py           routes only (@app.route), no SQL\n"
@@ -129,11 +165,19 @@ def _flask() -> Stack:
     )
 
 
-def _fastapi() -> Stack:
+def _fastapi(runnable: bool = True) -> Stack:
     return Stack(
         language="python",
         backend="fastapi",
-        runnable=True,
+        runnable=runnable,
+        install_hint=(
+            ""
+            if runnable
+            else (
+                "FastAPI is not installed in this environment — run "
+                "`pip install fastapi uvicorn` before running the generated app."
+            )
+        ),
         note=(
             "FastAPI is installed — use it for the server with an ASGI app and a "
             "uvicorn run line. Use stdlib sqlite3 for storage. Add a "
@@ -149,7 +193,7 @@ def _node_dep_present(_has_module) -> bool:
     return False
 
 
-def _node(allow_network: bool, _has_module) -> Stack:
+def _node(allow_network: bool, runnable: bool = True) -> Stack:
     install = (
         "Run `npm install express` (network is permitted)."
         if allow_network
@@ -159,6 +203,12 @@ def _node(allow_network: bool, _has_module) -> Stack:
     return Stack(
         language="node",
         backend="express" if allow_network else "stdlib",
-        runnable=True,
-        note="Node.js is available. " + install,
+        runnable=runnable,
+        install_hint=(
+            ""
+            if runnable
+            else "Node.js was not found on PATH — install it to run the generated app."
+        ),
+        note=("Node.js is available. " if runnable else "Target runtime is Node.js. ")
+        + install,
     )

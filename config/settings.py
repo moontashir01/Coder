@@ -159,6 +159,15 @@ class Settings(BaseSettings):
     # "create an index.html" fixture matches should_blueprint(), and the stage
     # would reach a real Ollama. Tests that want it opt back in explicitly.
     expand_requirements: bool = True
+    # Which backend stack a build targets (docs/always-fullstack-plan.md Phase A).
+    # "flask" | "fastapi" | "stdlib" | "none" force that stack; "auto" restores
+    # the old probe-and-pick behaviour. Default "flask" because the whole
+    # full-stack direction promises Flask + Jinja2 + sqlite3 — leaving it on
+    # "auto" made the promise depend on Flask happening to be importable, which
+    # it is here only because Coder's own environment installs it.
+    # A forced stack that ISN'T installed is reported (Stack.runnable=False +
+    # install_hint), never swapped for another one — see runtime_probe.py.
+    web_stack: str = "flask"
     # Build the 'optional' tier too (OAuth, 2FA, email delivery, …). Default off:
     # optional features are reported, not silently built.
     blueprint_optional_tier: bool = False

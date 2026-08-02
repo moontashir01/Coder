@@ -202,7 +202,9 @@ def _blueprint_from_spec(spec: ProjectSpec) -> Blueprint:
             ),
             data_schema=tuple(e.summary() for e in spec.entities),
         ),
-        stack=detect_stack(allow_network=settings.allow_network),
+        stack=detect_stack(
+            allow_network=settings.allow_network, prefer=settings.web_stack
+        ),
     )
 
 
@@ -2429,12 +2431,14 @@ class AgentCore:
         own `_extract_build_spec` still owns it; this stage owns the features,
         the file list, and the API contract. See docs/requirements-blueprint.md.
         """
-        stack = detect_stack(allow_network=settings.allow_network)
+        stack = detect_stack(
+            allow_network=settings.allow_network, prefer=settings.web_stack
+        )
         messages = [
             SystemMessage(content=_load_blueprint_prompt()),
             HumanMessage(
                 content=(
-                    "Stack available on this machine: "
+                    "Stack to build on: "
                     f"{stack.note or '(frontend only — no backend runtime detected)'}\n\n"
                     f"Request: {user_message}\n\nOutput the JSON now:"
                 )
@@ -2933,6 +2937,14 @@ class AgentCore:
                 + " (parameterised SQL; the column lists and the tables are "
                 "printed from the same definition, so they cannot drift).\n\n" + answer
             )
+        # Phase A (docs/always-fullstack-plan.md): the stack is forced, so it can
+        # be one that isn't installed here. Say so FIRST — the files are correct
+        # and the project's requirements.txt declares the dependency, but the app
+        # will not start until it's installed, and a build that reports success
+        # while nothing runs is the failure this whole direction exists to fix.
+        hint = getattr(blueprint.stack, "install_hint", "")
+        if hint:
+            answer = f"**{hint}**\n\n" + answer
         if over_budget:
             # Never hide a truncation: the cap used to silently drop these AND
             # the coverage check applied the same slice, so nothing could
@@ -3908,7 +3920,15 @@ class AgentCore:
         # On by default since docs/fullstack-web-plan.md Phase 0 (it executes
         # generated code, so `blueprint_smoke_test` stays the kill switch) and
         # inert unless a blueprint ran.
-        if self._blueprint is not None and settings.blueprint_smoke_test:
+        # Skipped when the forced stack isn't installed (Phase A): the app would
+        # die on `import flask` and the repair loop would be sent to rewrite code
+        # that is fine. `_run_blueprint` already led the answer with the install
+        # line, so the miss is reported, not hidden.
+        if (
+            self._blueprint is not None
+            and settings.blueprint_smoke_test
+            and getattr(self._blueprint.stack, "runnable", True)
+        ):
             try:
                 smoke_note, smoke_trace = await self._smoke_test_backend(
                     self._blueprint

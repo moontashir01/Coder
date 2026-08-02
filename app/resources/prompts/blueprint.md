@@ -64,9 +64,10 @@ Rules:
   server file in `files` builds nothing. When in doubt, err toward including the
   server file and the endpoint.
 
-- **Use the stack you are told is available** (given below the request). Do NOT
-  use a framework that isn't listed — it is not installed and there is no
-  network to install it. The default is the Python standard library.
+- **Use the stack you are given** (stated below the request). Do NOT use a
+  framework other than the one named — nothing else is available and there is no
+  network to install one. Build on the named stack even if you would have
+  reached for something else.
 
 - **On the Flask stack, use this exact layout.** Filenames are fixed, so every
   later change knows where things live. Plan files with these names and no

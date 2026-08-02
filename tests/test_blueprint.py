@@ -11,14 +11,14 @@ from types import SimpleNamespace
 import pytest
 
 from app.agent.blueprint import (
+    TIER_CORE,
+    TIER_OPTIONAL,
+    TIER_REQUESTED,
     ApiContract,
     Blueprint,
     Endpoint,
     Feature,
     PlannedFile,
-    TIER_CORE,
-    TIER_OPTIONAL,
-    TIER_REQUESTED,
     blueprint_from_data,
     should_blueprint,
 )
@@ -85,15 +85,73 @@ def test_should_blueprint_skips_non_greenfield(msg):
 
 
 def test_detect_stack_defaults_to_stdlib_when_nothing_present():
-    stack = detect_stack(_has_module=lambda n: False, _which=lambda n: None)
+    stack = detect_stack(
+        prefer="auto", _has_module=lambda n: False, _which=lambda n: None
+    )
     assert stack.backend == "stdlib"
     assert stack.language == "python"
     assert stack.runnable is True
 
 
 def test_detect_stack_prefers_flask_when_installed():
-    stack = detect_stack(_has_module=lambda n: n == "flask", _which=lambda n: None)
+    stack = detect_stack(
+        prefer="auto", _has_module=lambda n: n == "flask", _which=lambda n: None
+    )
     assert stack.backend == "flask"
+
+
+# Phase A (docs/always-fullstack-plan.md): a FORCED stack is honoured whether or
+# not it's installed. Silently returning stdlib instead is the bug — downstream
+# cannot tell that apart from a build that was always meant to be stdlib.
+
+
+def test_forced_flask_is_runnable_when_present():
+    stack = detect_stack(prefer="flask", _has_module=lambda n: n == "flask")
+    assert (stack.backend, stack.runnable) == ("flask", True)
+    assert stack.install_hint == ""
+
+
+def test_forced_flask_is_reported_not_downgraded_when_absent():
+    stack = detect_stack(
+        prefer="flask", _has_module=lambda n: False, _which=lambda n: None
+    )
+    assert stack.backend == "flask"  # NOT "stdlib"
+    assert stack.runnable is False
+    assert "pip install flask" in stack.install_hint
+    # The generation instruction must still describe Flask: the model writes the
+    # app, the *user* installs the package. Folding the warning into `note` would
+    # make prompts/blueprint.md's "don't use what isn't installed" rule fire and
+    # quietly produce a stdlib app — the downgrade this test exists to prevent.
+    assert "flask" in stack.note.lower()
+    assert "not installed" not in stack.note.lower()
+
+
+def test_forced_fastapi_absent_is_reported_not_downgraded():
+    stack = detect_stack(
+        prefer="fastapi", _has_module=lambda n: False, _which=lambda n: None
+    )
+    assert (stack.backend, stack.runnable) == ("fastapi", False)
+    assert "pip install fastapi" in stack.install_hint
+
+
+def test_forced_node_absent_is_reported_not_downgraded():
+    stack = detect_stack(
+        prefer="node", _has_module=lambda n: False, _which=lambda n: None
+    )
+    assert (stack.language, stack.runnable) == ("node", False)
+    assert stack.install_hint
+
+
+def test_forced_stdlib_ignores_an_installed_flask():
+    stack = detect_stack(prefer="stdlib", _has_module=lambda n: n == "flask")
+    assert (stack.backend, stack.runnable) == ("stdlib", True)
+
+
+def test_unknown_prefer_falls_through_to_auto():
+    stack = detect_stack(
+        prefer="flsak", _has_module=lambda n: n == "flask", _which=lambda n: None
+    )
+    assert (stack.backend, stack.runnable) == ("flask", True)
 
 
 def test_detect_stack_uses_fastapi_when_only_fastapi_present():
@@ -130,7 +188,11 @@ def _login_data():
     return {
         "summary": "A login page with email/password auth and password reset",
         "features": [
-            {"name": "Login form", "tier": "requested", "files": ["login.html", "login.js"]},
+            {
+                "name": "Login form",
+                "tier": "requested",
+                "files": ["login.html", "login.js"],
+            },
             {"name": "Auth backend", "tier": "core", "files": ["server.py"]},
             {"name": "OAuth sign-in", "tier": "optional", "files": ["oauth.py"]},
             {"name": "Phantom", "tier": "core", "files": ["does-not-exist.py"]},
@@ -153,7 +215,9 @@ def _login_data():
                 },
                 {"method": "GET", "path": "no-leading-slash"},  # rejected
             ],
-            "form_bindings": ["#login-form submits POST /api/login with email, password"],
+            "form_bindings": [
+                "#login-form submits POST /api/login with email, password"
+            ],
             "data_schema": ["users(email TEXT PRIMARY KEY, password_hash TEXT)"],
         },
     }
@@ -272,7 +336,9 @@ def test_ensure_backend_not_added_when_no_signal():
     """A genuinely static build (no endpoints, no backend feature) is left alone."""
     data = {
         "files": [{"filename": "index.html"}, {"filename": "styles.css"}],
-        "features": [{"name": "Landing hero", "tier": "requested", "files": ["index.html"]}],
+        "features": [
+            {"name": "Landing hero", "tier": "requested", "files": ["index.html"]}
+        ],
     }
     bp = blueprint_from_data(data, "build a landing page", STDLIB_STACK)
     assert "server.py" not in [f.filename for f in bp.files]
@@ -471,9 +537,7 @@ async def test_coverage_creates_missing_planned_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     a = AgentCore(session_id="pytest_cov_create")
     (tmp_path / "login.html").write_text("<html></html>", encoding="utf-8")
-    a._llm_direct = ScriptedLLM(
-        ["FILENAME: server.py\nprint('serving /api/login')\n"]
-    )
+    a._llm_direct = ScriptedLLM(["FILENAME: server.py\nprint('serving /api/login')\n"])
     bp = _bp_with(
         ["login.html", "server.py"],  # login.html exists, server.py is missing
         endpoints=[Endpoint("POST", "/api/login")],

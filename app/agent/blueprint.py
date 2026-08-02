@@ -298,9 +298,14 @@ class Blueprint:
             parts.append(self.summary)
 
         if self.stack and self.stack.backend != "none":
+            # "what runs on this machine" was accurate while the stack was purely
+            # probed; it is forced now (settings.web_stack), so a stack that
+            # isn't installed here still reaches this block. The instruction to
+            # the model is unchanged either way — the missing package is the
+            # user's to install, and `Stack.install_hint` is what tells them.
             parts.append(
-                "### Backend stack — use EXACTLY this, it is what runs on this "
-                "machine\n" + self.stack.to_prompt_line()
+                "### Backend stack — use EXACTLY this, no other framework\n"
+                + self.stack.to_prompt_line()
             )
 
         c = self.contract

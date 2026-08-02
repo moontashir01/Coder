@@ -7,6 +7,16 @@ All notable changes to Coder are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Forced backend stack (`WEB_STACK`, default `flask`)** — builds now target
+  Flask + Jinja2 + sqlite3 by decision rather than by probe. Previously
+  `detect_stack()` picked the richest importable framework, so "Coder builds
+  full-stack web apps" quietly depended on Flask happening to be installed.
+  `WEB_STACK=auto` restores the old probing; `stdlib`/`fastapi`/`none` force
+  those instead. **A forced stack that isn't installed is reported, never
+  swapped** — the build still produces a Flask project, the answer leads with
+  `pip install flask`, and the smoke test is skipped rather than blaming the
+  generated code for a missing package. Flask is now an explicit dependency in
+  `pyproject.toml` (it is the generated apps' runtime, not a Coder import).
 - **Screenshot-to-code** — `@`-reference an image (`build a website like this
   @mockup.png`) and a local vision model (`qwen2.5vl:7b`) describes it into
   structured text that feeds the normal code generation. No new command or
