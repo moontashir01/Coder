@@ -228,6 +228,16 @@ from `load_project()` and from `chat()` when `ProjectSpec.load` returns None. Hi
 value-per-line in the plan: it turns "memory only for projects built in this session" into
 "memory for any Flask project on disk".
 
+**D2–D4 — DONE (2026-08-02).** All three landed as planned. Notes: `ProjectSpec.__post_init__`
+normalises a legacy `path -> role` dict built in code (not just on disk) — without it a spec
+constructed the old way crashed inside best-effort `save()`, which swallows the error, so the
+failure would have been invisible. `reconcile_with_disk` is strictly additive and refuses to
+re-derive entities it already has, because `impact.vanished_routes` needs the vanished route
+to still be recorded and `migrations(since=…)` needs the `added_in` stamps SQL cannot
+reconstruct. `_resolve_target_from_spec` needed its word-boundary lookbehind relaxed from
+`(?<![\w/])` to `(?<!\w)`: excluding a leading slash rejected "change /products", the
+commonest way people name a route. Full suite: **993 passed**.
+
 **D2 — A real file index.** Widen `files: dict[str, str]` to a `FileRecord` carrying `role`,
 `purpose`, `defines` (routes, view functions, template blocks), `reads` (entities), and
 `revision`. The on-disk format already tolerates this — `_load_files` reads

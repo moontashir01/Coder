@@ -1091,3 +1091,221 @@ def test_from_blueprint_without_entities_behaves_as_before(tmp_path):
     spec = ProjectSpec.from_blueprint(bp, tmp_path, "shop")
 
     assert [e.table for e in spec.entities] == ["products"]
+
+
+# ---------------------------------------------------------------------------
+# D2 — the file index records what a file IS, not just its role
+# ---------------------------------------------------------------------------
+
+
+def test_file_records_say_what_a_file_defines(tmp_path):
+    from app.agent.projectspec import FileRecord
+
+    spec = ProjectSpec.from_disk(_write_adopted_project(tmp_path))
+
+    app_py = spec.files["app.py"]
+    assert isinstance(app_py, FileRecord)
+    assert app_py.role == "backend"
+    assert "GET /products" in app_py.defines
+    assert "POST /products/new" in app_py.defines
+    # A page records the entities its markup really mentions.
+    assert spec.files["templates/products.html"].reads == ("product",)
+
+
+def test_a_pre_d2_project_json_still_loads(tmp_path):
+    """`files` was `path -> role`. An old spec must not fail to load — it simply
+    knows less, which is exactly what it knew."""
+    legacy = {
+        "spec_version": 1,
+        "revision": 3,
+        "name": "old",
+        "files": {"app.py": "backend", "templates/index.html": "page"},
+    }
+    (tmp_path / ".coder").mkdir()
+    (tmp_path / ".coder" / "project.json").write_text(
+        json.dumps(legacy), encoding="utf-8"
+    )
+
+    spec = ProjectSpec.load(tmp_path)
+
+    assert spec is not None and spec.revision == 3
+    assert spec.files["app.py"].role == "backend"
+    assert spec.files["app.py"].defines == ()
+
+
+def test_files_given_as_plain_roles_are_normalised(tmp_path):
+    """Callers (and older tests) still build a spec with the bare role; that must
+    not explode inside best-effort save(), which would swallow it."""
+    spec = ProjectSpec(name="x", files={"app.py": "backend"})
+    assert spec.files["app.py"].role == "backend"
+    assert spec.save(tmp_path) is True
+    assert ProjectSpec.load(tmp_path).files["app.py"].role == "backend"
+
+
+# ---------------------------------------------------------------------------
+# D3 — the spec keeps up with files written outside the amendment flow
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_records_a_route_added_outside_an_amendment(tmp_path):
+    """The drift D3 closes: only _run_blueprint and _amend_project ever wrote the
+    spec, so an ordinary edit that added a route left memory describing a project
+    that no longer existed."""
+    _write_adopted_project(tmp_path)
+    spec = ProjectSpec.from_disk(tmp_path)
+    spec.revision = 4
+    before = {(e.method, e.path) for e in spec.endpoints}
+
+    # Someone edits app.py the ordinary way and adds a route + its page.
+    app = tmp_path / "app.py"
+    app.write_text(
+        app.read_text(encoding="utf-8")
+        + '\n\n@app.route("/about")\ndef about():\n    return render_template("about.html")\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "templates" / "about.html").write_text(
+        '{% extends "base.html" %}{% block content %}Hi{% endblock %}', encoding="utf-8"
+    )
+
+    added = spec.reconcile_with_disk(tmp_path)
+
+    assert "GET /about" in added
+    assert ("GET", "/about") in {(e.method, e.path) for e in spec.endpoints}
+    assert "templates/about.html" in {p.template for p in spec.pages}
+    assert before <= {(e.method, e.path) for e in spec.endpoints}  # nothing lost
+    # Stamped with the revision it appeared in, so migrations stay meaningful.
+    assert next(e for e in spec.endpoints if e.path == "/about").added_in == 4
+
+
+def test_reconcile_never_removes_a_vanished_route(tmp_path):
+    """`impact.vanished_routes` treats a missing route as a REGRESSION to
+    restore; deleting it here would destroy the evidence that check runs on."""
+    _write_adopted_project(tmp_path)
+    spec = ProjectSpec.from_disk(tmp_path)
+
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask, render_template\n"
+        "app = Flask(__name__)\n"
+        '@app.route("/")\n'
+        "def index():\n"
+        '    return render_template("index.html")\n',
+        encoding="utf-8",
+    )
+    spec.reconcile_with_disk(tmp_path)
+
+    assert ("GET", "/products") in {(e.method, e.path) for e in spec.endpoints}
+
+
+def test_reconcile_keeps_declared_entities_over_rediscovered_ones(tmp_path):
+    """Re-deriving entities from SQL would flatten every `added_in` stamp to 1,
+    and those stamps are what `migrations(since=…)` diffs on."""
+    _write_adopted_project(tmp_path)
+    spec = ProjectSpec.from_disk(tmp_path)
+    spec.entities = (
+        Entity(
+            "product",
+            "products",
+            (Field("id", "INTEGER", pk=True), Field("title", "TEXT", added_in=3)),
+        ),
+    )
+
+    spec.reconcile_with_disk(tmp_path)
+
+    assert spec.entities[0].field("title").added_in == 3
+
+
+def test_reconcile_reports_nothing_when_nothing_changed(tmp_path):
+    _write_adopted_project(tmp_path)
+    spec = ProjectSpec.from_disk(tmp_path)
+    assert spec.reconcile_with_disk(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# D4 — the spec picks the edit target, and reaches every prompt
+# ---------------------------------------------------------------------------
+
+
+def _agent_on(tmp_path, monkeypatch, session):
+    from app.agent.core import AgentCore
+
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id=session)
+    a._project_path = str(tmp_path)
+    a._spec = ProjectSpec.from_disk(tmp_path)
+    return a
+
+
+def test_a_page_named_by_its_label_resolves_to_its_template(tmp_path, monkeypatch):
+    """ "update the products page" → templates/products.html. `_extract_filename`
+    is a filename regex and cannot know that; without this the request fell
+    through to "whatever I wrote last"."""
+    _write_adopted_project(tmp_path)
+    a = _agent_on(tmp_path, monkeypatch, "pytest_d4_label")
+
+    assert a._resolve_target_from_spec("update the products page") == (
+        "templates/products.html"
+    )
+    assert a._resolve_target_from_spec("change /products a bit") == (
+        "templates/products.html"
+    )
+
+
+def test_target_resolution_declines_when_two_pages_match(tmp_path, monkeypatch):
+    """Guessing between candidates is worse than falling through to the existing
+    chain, which has its own answer."""
+    _write_adopted_project(tmp_path)
+    a = _agent_on(tmp_path, monkeypatch, "pytest_d4_ambig")
+
+    # Two pages are named; picking either would be a coin flip.
+    assert (
+        a._resolve_target_from_spec("tidy up the products page and the index page")
+        is None
+    )
+
+
+def test_target_resolution_declines_when_nothing_matches(tmp_path, monkeypatch):
+    _write_adopted_project(tmp_path)
+    a = _agent_on(tmp_path, monkeypatch, "pytest_d4_none")
+
+    assert a._resolve_target_from_spec("make the styling nicer") is None
+    assert a._resolve_target_from_spec("") is None
+
+
+def test_target_resolution_never_returns_a_missing_file(tmp_path, monkeypatch):
+    """The caller treats a missing path as "create this", which would turn a
+    remembered page into a new empty one."""
+    _write_adopted_project(tmp_path)
+    a = _agent_on(tmp_path, monkeypatch, "pytest_d4_gone")
+    (tmp_path / "templates" / "products.html").unlink()
+
+    assert a._resolve_target_from_spec("update the products page") is None
+
+
+def test_target_resolution_finds_a_backend_file_by_name(tmp_path, monkeypatch):
+    _write_adopted_project(tmp_path)
+    a = _agent_on(tmp_path, monkeypatch, "pytest_d4_file")
+
+    # No page matches "style", so the file index answers instead.
+    assert a._resolve_target_from_spec("fix the style") == "static/css/style.css"
+
+
+def test_the_spec_reaches_prompts_outside_the_amendment_path(tmp_path, monkeypatch):
+    """A request that misses _AMEND_VERB_RE was answered with no idea what the
+    project contains."""
+    _write_adopted_project(tmp_path)
+    a = _agent_on(tmp_path, monkeypatch, "pytest_d4_ctx")
+
+    block = a._spec_context()
+
+    assert "products" in block
+    assert "/products" in block
+
+
+def test_the_spec_block_is_not_repeated_when_the_caller_has_one(tmp_path, monkeypatch):
+    """_run_blueprint and _amend_project build richer blocks of their own;
+    stating the same routes twice spends llm_num_ctx to contradict nothing."""
+    _write_adopted_project(tmp_path)
+    a = _agent_on(tmp_path, monkeypatch, "pytest_d4_dupe")
+
+    assert a._spec_context("## This project already exists — revision 2") == ""
+    assert a._spec_context("## Build blueprint — applies to EVERY file") == ""

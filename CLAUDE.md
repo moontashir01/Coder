@@ -692,6 +692,33 @@ Rules the rest of the code depends on:
     user's work to document our own. Don't remove the marker from the scaffold README — without it
     a scaffolded project's generic README survives every amendment, which is the file Phase 6
     exists to replace.
+- **`files` is a `FileRecord`, not a role string** (D2): `role`, `purpose`, `defines` (the
+  routes/handlers a file really declares), `reads` (entities), `revision`. Four role words
+  could say "this is a page" but never "which file do I edit for *that*". Both shapes still
+  load — `_load_files` accepts a pre-D2 `project.json`, and `ProjectSpec.__post_init__`
+  normalises a `path -> role` dict built in code, so the one point of construction guarantees
+  the type instead of every reader re-checking it (the first `isinstance` anybody forgets
+  crashes inside best-effort `save()`, which would swallow it).
+- **`reconcile_with_disk` keeps memory current** (D3), called from `_sync_spec_after_writes`
+  at the `chat()` seam after every repair pass — so it covers the single-file, multi-file,
+  subtask and tool-loop paths alike, not just blueprint/amend turns. Before it, an ordinary
+  `_file_op_flow` edit that added a route left the spec describing a project that no longer
+  existed, and the *next* amendment planned against that. Two rules: it is **additive** — a
+  route that vanished is not deleted, because `impact.vanished_routes` treats a missing route
+  as a regression to restore and removing it here destroys that evidence; and it **only
+  updates an already-saved spec**, never persisting an adopted one, which is D1's rule.
+  Entities are only taken when the spec has none: re-deriving them from SQL would flatten
+  every `added_in` stamp to 1, and those stamps are what `migrations(since=…)` diffs on.
+- **The spec reaches every prompt, and can pick the edit target** (D4).
+  `_build_messages` and `_file_op_flow` both get `to_context_block()` via `_spec_context()`,
+  which returns "" when the caller already threaded a contract (`_run_blueprint` /
+  `_amend_project` build richer ones — stating the same routes twice spends `llm_num_ctx` to
+  contradict nothing). `_resolve_target_from_spec` turns "the products page" into
+  `templates/products.html` by matching a page's nav label, route or template stem as a whole
+  word; it is deliberately strict — **exactly one** match, ≥3 characters, and the file must
+  exist (the caller reads a missing path as "create this", which would turn a remembered page
+  into a new empty one). Two matches means the message was ambiguous, and falling through to
+  `_last_write_fallback` beats a coin flip.
 - **The spec records what was BUILT, not merely what was planned.** `from_blueprint` takes `root`
   and reads it: page routes come from the real `@app.route` → `render_template` pairs in `app.py`,
   pages the blueprint never listed (the scaffold's own `index.html`) are picked up from real routes,

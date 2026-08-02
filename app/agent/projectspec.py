@@ -239,6 +239,36 @@ class SpecFeature:
 
 
 @dataclass(frozen=True)
+class FileRecord:
+    """What one file in the project IS (D2).
+
+    `files` used to be `path -> role`, four words deep — enough to say "this is a
+    page", never enough to answer "which file do I edit for *that*". Routing an
+    edit needs to know what a file DEFINES (its routes and view functions) and
+    which entities it shows, which is exactly what `_resolve_target_from_spec`
+    and `impact.py` have to reconstruct otherwise.
+
+    The on-disk format was already forward-compatible — `_load_files` has always
+    read `value.get("role")` when the value is a dict — so an old
+    `project.json` still loads, its files simply arriving with only a role.
+    """
+
+    role: str = ""  # page | asset | backend | config
+    purpose: str = ""  # one line, what it is for
+    defines: tuple[str, ...] = ()  # "GET /products", view/function names
+    reads: tuple[str, ...] = ()  # entity names this file displays or writes
+    revision: int = 1  # the revision it first appeared in
+
+    def to_line(self) -> str:
+        bits = [self.role or "file"]
+        if self.defines:
+            bits.append("defines " + ", ".join(self.defines[:4]))
+        if self.reads:
+            bits.append("reads " + ", ".join(self.reads))
+        return " — ".join(bits)
+
+
+@dataclass(frozen=True)
 class HistoryEntry:
     revision: int
     request: str = ""
@@ -755,8 +785,26 @@ class ProjectSpec:
     endpoints: tuple[SpecEndpoint, ...] = ()
     pages: tuple[Page, ...] = ()
     features: tuple[SpecFeature, ...] = ()
-    files: dict[str, str] = field(default_factory=dict)  # path -> role
+    files: dict[str, FileRecord] = field(default_factory=dict)  # path -> record
     history: tuple[HistoryEntry, ...] = ()
+
+    def __post_init__(self) -> None:
+        # `files` was `path -> role` before D2, and both shapes still arrive:
+        # `_load_files` accepts a pre-D2 `project.json`, and plenty of callers
+        # (and tests) build a spec in code with the bare role. Normalising at the
+        # one point of construction means every reader can rely on the record
+        # type without each one having to re-check — the alternative is an
+        # `isinstance` at every use site, and the first one anybody forgets is a
+        # crash inside `save()`, which is best-effort and would swallow it.
+        if any(not isinstance(v, FileRecord) for v in self.files.values()):
+            self.files = {
+                name: (
+                    value
+                    if isinstance(value, FileRecord)
+                    else FileRecord(role=str(value or _role_for(name))[:20])
+                )
+                for name, value in self.files.items()
+            }
 
     # -- lookup ----------------------------------------------------------
 
@@ -945,6 +993,101 @@ class ProjectSpec:
             )
         return sorted(impacted)
 
+    def reconcile_with_disk(self, root: Path | str) -> list[str]:
+        """Fold what is really on disk back into the spec (D3). Additive.
+
+        Only `_run_blueprint` and `_amend_project` ever wrote the spec, so an
+        ordinary `_file_op_flow` edit that added a route left memory describing a
+        project that no longer existed — and the *next* amendment then planned
+        against the stale contract. This closes that: after any turn that wrote
+        files, whatever the files now say is folded back in.
+
+        **Additive on purpose.** New routes, pages and files are recorded;
+        nothing is removed. A route that has disappeared is not necessarily gone
+        — `impact.vanished_routes` treats a missing route as a REGRESSION to
+        restore, and deleting it from the spec here would destroy the very
+        evidence that check runs on. Removal stays a deliberate act of the
+        amendment flow.
+
+        Returns the human-readable additions, empty when nothing changed.
+        """
+        try:
+            fresh = ProjectSpec.from_disk(root)
+        except Exception:
+            logger.warning("could not reconcile the spec with %s", root, exc_info=True)
+            return []
+        if fresh is None:
+            return []
+
+        added: list[str] = []
+        known = {(e.method, e.path) for e in self.endpoints}
+        for endpoint in fresh.endpoints:
+            if (endpoint.method, endpoint.path) in known:
+                continue
+            if len(self.endpoints) >= MAX_ENDPOINTS:
+                break
+            known.add((endpoint.method, endpoint.path))
+            self.endpoints += (
+                SpecEndpoint(
+                    method=endpoint.method,
+                    path=endpoint.path,
+                    handler=endpoint.handler,
+                    template=endpoint.template,
+                    entity=endpoint.entity,
+                    added_in=self.revision,
+                ),
+            )
+            added.append(f"{endpoint.method} {endpoint.path}")
+
+        seen_pages = {p.template for p in self.pages if p.template}
+        for page in fresh.pages:
+            if not page.template or page.template in seen_pages:
+                continue
+            if len(self.pages) >= MAX_PAGES:
+                break
+            seen_pages.add(page.template)
+            self.pages += (
+                Page(
+                    route=page.route,
+                    template=page.template,
+                    nav_label=page.nav_label,
+                    reads=page.reads,
+                    added_in=self.revision,
+                ),
+            )
+            added.append(page.template)
+
+        # Entities only when we had none: a real `CREATE TABLE` is good evidence,
+        # but the declared schema carries `added_in` stamps that drive migrations
+        # and re-deriving it from SQL would flatten them all to revision 1.
+        if not self.entities and fresh.entities:
+            self.entities = fresh.entities
+            added.extend(e.table for e in fresh.entities)
+
+        for name, record in fresh.files.items():
+            current = self.files.get(name)
+            if current is None:
+                if len(self.files) >= MAX_FILES:
+                    break
+                self.files[name] = FileRecord(
+                    role=record.role,
+                    defines=record.defines,
+                    reads=record.reads,
+                    revision=self.revision,
+                )
+                added.append(name)
+            elif record.defines and record.defines != current.defines:
+                # The file is known but now defines something else — that is the
+                # drift this method exists for, so refresh it in place.
+                self.files[name] = FileRecord(
+                    role=current.role or record.role,
+                    purpose=current.purpose,
+                    defines=record.defines,
+                    reads=record.reads or current.reads,
+                    revision=current.revision,
+                )
+        return added
+
     def to_readme(self) -> str:
         """The project's README, rendered from what it actually contains.
 
@@ -1065,7 +1208,7 @@ class ProjectSpec:
             "endpoints": [asdict(e) for e in self.endpoints],
             "pages": [asdict(p) for p in self.pages],
             "features": [asdict(f) for f in self.features],
-            "files": dict(self.files),
+            "files": {name: asdict(rec) for name, rec in self.files.items()},
             "history": [asdict(h) for h in self.history],
         }
 
@@ -1234,12 +1377,16 @@ class ProjectSpec:
 
         pages: list[Page] = []
         seen_templates: set[str] = set()
-        files: dict[str, str] = {}
+        files: dict[str, FileRecord] = {}
         for pf in bp.files[:MAX_FILES]:
             fname = _norm_filename(pf.filename)
             if not fname:
                 continue
-            files[fname] = pf.role or _role_for(fname)
+            files[fname] = FileRecord(
+                role=pf.role or _role_for(fname),
+                purpose=" ".join((pf.instruction or "").split())[:120],
+                reads=tuple(pf.reads)[:5],
+            )
             if not fname.lower().endswith((".html", ".htm")):
                 continue
             if is_layout_template(root / fname, fname):
@@ -1294,7 +1441,7 @@ class ProjectSpec:
             )
 
         for rel in sorted(scaffolded_files(root)):
-            files.setdefault(rel, _role_for(rel))
+            files.setdefault(rel, FileRecord(role=_role_for(rel)))
 
         return cls(
             name=name or root.name,
@@ -1392,7 +1539,21 @@ class ProjectSpec:
                 )
             )
 
-        files: dict[str, str] = {rel: _role_for(rel) for rel in _disk_files(root)}
+        # D2: record what each file DEFINES, so an edit can be routed to it —
+        # handlers get the routes read out of them, pages the entities their
+        # markup really mentions.
+        defines_by_file: dict[str, list[str]] = {}
+        for (method, path), handler in handlers.items():
+            defines_by_file.setdefault(handler, []).append(f"{method} {path}")
+        page_reads = {p.template: p.reads for p in pages}
+        files: dict[str, FileRecord] = {
+            rel: FileRecord(
+                role=_role_for(rel),
+                defines=tuple(sorted(defines_by_file.get(rel, [])))[:12],
+                reads=tuple(page_reads.get(rel, ()))[:5],
+            )
+            for rel in _disk_files(root)
+        }
         flask = any(uses_flask(text) for text in py_sources.values())
         return cls(
             name=root.name,
@@ -1680,16 +1841,34 @@ def _load_features(raw) -> tuple[SpecFeature, ...]:
     return tuple(out)
 
 
-def _load_files(raw) -> dict[str, str]:
-    out: dict[str, str] = {}
+def _load_files(raw) -> dict[str, FileRecord]:
+    """Read `files` back, accepting BOTH shapes.
+
+    A pre-D2 `project.json` stored `"app.py": "backend"`; the current one stores
+    a record. Both load — an old spec simply arrives with role-only records,
+    which is exactly what it knew.
+    """
+    out: dict[str, FileRecord] = {}
     if not isinstance(raw, dict):
         return out
     for key, value in raw.items():
         name = _norm_filename(key)
         if not name:
             continue
-        role = value.get("role") if isinstance(value, dict) else value
-        out[name] = str(role or _role_for(name))[:20]
+        if isinstance(value, dict):
+            out[name] = FileRecord(
+                role=str(value.get("role") or _role_for(name))[:20],
+                purpose=" ".join(str(value.get("purpose") or "").split())[:120],
+                defines=tuple(
+                    " ".join(str(d).split())[:60] for d in (value.get("defines") or [])
+                )[:12],
+                reads=tuple(_ident(r) for r in (value.get("reads") or []) if _ident(r))[
+                    :5
+                ],
+                revision=max(1, int(value.get("revision") or 1)),
+            )
+        else:
+            out[name] = FileRecord(role=str(value or _role_for(name))[:20])
         if len(out) >= MAX_FILES:
             break
     return out

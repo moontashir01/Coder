@@ -7,6 +7,15 @@ All notable changes to Coder are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Project memory that can route an edit** — the spec now records what each
+  file *defines* (its routes and handlers) and which data it shows, not just
+  "this is a page". So "update the products page" finds `templates/products.html`
+  by name instead of falling back to whatever file was written last, and the
+  project's tables and routes are now in front of the model on ordinary turns
+  too, not only when a request happens to look like an amendment. Memory also
+  keeps up with edits made outside the amendment flow: a route added by a plain
+  file edit is recorded, so the next change plans against what is really there.
+  Existing `project.json` files keep working unchanged.
 - **Any website request now gets a full-stack build** — the build gate was a
   keyword regex, so "build me a recipe organizer" or "I need somewhere to track
   my expenses" fell through to a static HTML page with no server and no

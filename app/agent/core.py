@@ -194,8 +194,10 @@ def _blueprint_from_spec(spec: ProjectSpec) -> Blueprint:
     understands is cheaper than widening both gates.
     """
     files = tuple(
-        PlannedFile(filename=name, action="edit", role=role)
-        for name, role in sorted(spec.files.items())
+        PlannedFile(
+            filename=name, action="edit", role=record.role, reads=tuple(record.reads)
+        )
+        for name, record in sorted(spec.files.items())
     )
     return Blueprint(
         summary=spec.summary,
@@ -1187,6 +1189,16 @@ class AgentCore:
             if proj_block:
                 parts.append(f"\n{proj_block}")
 
+        # D4: the project's own contract — its tables, routes and pages. This
+        # used to reach the model only on the amendment path, so a request that
+        # missed `_AMEND_VERB_RE` ("the nav should have a contact link") was
+        # answered with no idea what the project actually contains. It is
+        # budgeted to CONTEXT_BUDGET_CHARS by `to_context_block` itself, and it
+        # is OUR OWN structured record, not file text — so unlike RAG results it
+        # is deliberately not wrapped as untrusted data.
+        if self._spec is not None and not self._spec.is_empty():
+            parts.append("\n" + self._spec.to_context_block())
+
         # RAG context
         if self._project_path and user_message.strip():
             try:
@@ -1632,6 +1644,77 @@ class AgentCore:
         except Exception as e:
             return f"LLM error: {e}"
 
+    def _spec_context(self, extra_context: str = "") -> str:
+        """The project's contract, for prompts that don't already carry one (D4).
+
+        Returns "" when there is no spec, when it says nothing, or when the
+        caller already threaded a contract in — `_run_blueprint` and
+        `_amend_project` build their own richer blocks, and stating the same
+        routes twice in one prompt spends `llm_num_ctx` to contradict nothing.
+        """
+        spec = self._spec
+        if spec is None or spec.is_empty():
+            return ""
+        if "already exists" in extra_context or "Build blueprint" in extra_context:
+            return ""
+        return spec.to_context_block()
+
+    def _resolve_target_from_spec(self, user_message: str) -> str | None:
+        """ "the products page" → `templates/products.html` (D4).
+
+        The spec already records every page's route, template and nav label;
+        nothing consulted them when picking an edit target, so a request naming a
+        page the way a person does — by its label — reached
+        `_last_write_fallback` and edited whatever happened to be written last.
+
+        Deliberately strict. It matches a page's nav label, its route or its
+        template stem as a WHOLE word, and only commits when exactly one page
+        matches: two candidates mean the message was ambiguous, and guessing
+        between them is worse than falling through to the existing chain. Files
+        are checked the same way, so "the seed script" finds `seed.py`.
+
+        Returns None whenever there is no spec, no match, or more than one.
+        """
+        spec = self._spec
+        if spec is None or not (spec.pages or spec.files):
+            return None
+        low = f" {(user_message or '').lower()} "
+        if not low.strip():
+            return None
+
+        def _named(text: str) -> bool:
+            token = (text or "").strip().strip("/").lower()
+            # Two chars would match half the language; a page called "Up" is not
+            # worth the false positives.
+            if len(token) < 3:
+                return False
+            # `(?<!\w)` rather than `(?<![\w/])`: a leading slash is how people
+            # name a route ("change /products"), so excluding it rejected the
+            # commonest phrasing. Matching inside `templates/products.html` is
+            # harmless — that names the same file, and `_extract_filename` has
+            # already claimed it by then anyway.
+            return re.search(rf"(?<!\w){re.escape(token)}(?!\w)", low) is not None
+
+        hits: set[str] = set()
+        for page in spec.pages:
+            if not page.template:
+                continue
+            stem = Path(page.template).stem
+            if _named(page.nav_label) or _named(page.route) or _named(stem):
+                hits.add(page.template)
+        if not hits:
+            for name in spec.files:
+                if _named(Path(name).stem):
+                    hits.add(name)
+        if len(hits) != 1:
+            return None
+        found = hits.pop()
+        # Never hand back a path that isn't there: the caller would treat a
+        # missing file as "create this", turning a remembered page into a new
+        # empty one.
+        workdir = Path(self._project_path or Path.cwd())
+        return found if (workdir / found).is_file() else None
+
     async def _file_op_flow(
         self,
         user_message: str,
@@ -1649,6 +1732,13 @@ class AgentCore:
         """
         workdir = Path(self._project_path or Path.cwd())
         filename = target or _extract_filename(user_message)
+        if filename is None:
+            # D4: the project's own page table knows "the products page" is
+            # `templates/products.html`. `_extract_filename` is a filename regex
+            # and cannot — it only sees a name that looks like a path — so a
+            # request naming a page by its LABEL fell through to "the file I
+            # wrote last", which is right only by coincidence.
+            filename = self._resolve_target_from_spec(user_message)
         if filename is None:
             # Follow-up that names no file ("now add a footer to the page") →
             # edit the file written last turn instead of guessing a new name.
@@ -1704,6 +1794,13 @@ class AgentCore:
             ctx += f"\n\nIMPORTANT: {guard}"
         if extra_context:
             ctx += f"\n\n{extra_context}"
+        # D4: a file written into an existing project must agree with it — the
+        # same table names, the same routes. `_run_blueprint` and `_amend_project`
+        # pass their own contract block as `extra_context`; this covers every
+        # other caller, which previously generated against no contract at all.
+        spec_block = self._spec_context(extra_context)
+        if spec_block:
+            ctx += f"\n\n{spec_block}"
         if full_existing:
             ctx += (
                 f"\n\nThe file '{filename}' already exists. Apply the requested change "
@@ -3650,6 +3747,44 @@ class AgentCore:
                 missing.pop(resolved, None)
         return redirected, extra_trace
 
+    def _sync_spec_after_writes(self, trace: list[dict]) -> str:
+        """Fold this turn's writes back into the project's memory (D3).
+
+        Only `_run_blueprint` and `_amend_project` ever updated the spec, so an
+        ordinary edit that added a route left memory describing a project that no
+        longer existed — and the next amendment planned against that stale
+        contract, which is the failure mode the spec exists to prevent.
+
+        Runs at the `chat()` seam, so it covers every path that writes files.
+        Best-effort and additive (see `reconcile_with_disk`); a reconcile that
+        fails must never cost a turn whose files were written.
+
+        **Only ever updates a spec that is already saved.** An adopted spec
+        (D1) is recomputed from disk each turn and is therefore never stale;
+        persisting one here would write `.coder/project.json` into a repo the
+        user only asked a question about, which D1 deliberately does not do.
+        """
+        workdir = Path(self._project_path or Path.cwd())
+        if not self._written_paths(trace, workdir):
+            return ""
+        spec = ProjectSpec.load(workdir)
+        if spec is None:
+            return ""
+        try:
+            added = spec.reconcile_with_disk(workdir)
+            if not added or not spec.save(workdir):
+                return ""
+        except Exception:
+            logger.warning("could not sync the project spec", exc_info=True)
+            return ""
+        self._spec = spec
+        return (
+            "\n\nProject memory updated — now also records "
+            + ", ".join(f"`{a}`" for a in added[:6])
+            + ("…" if len(added) > 6 else "")
+            + "."
+        )
+
     async def _repair_dead_references(
         self, trace: list[dict]
     ) -> tuple[str, list[dict]]:
@@ -4099,6 +4234,12 @@ class AgentCore:
                 answer += link_note
             if link_trace:
                 trace.extend(link_trace)
+
+        # D3: fold this turn's writes back into the project's memory. Runs after
+        # every repair pass, so what it records is the final state of the files
+        # rather than an intermediate one — and at this seam, so it covers the
+        # single-file, multi-file, subtask AND tool-loop paths uniformly.
+        answer += self._sync_spec_after_writes(trace)
 
         # Phase 3: the only check that runs the backend instead of reading it —
         # start the generated server, probe it, kill it (weaknesses.md #2). Runs
