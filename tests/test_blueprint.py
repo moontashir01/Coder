@@ -919,3 +919,186 @@ def test_completion_does_not_re_route_pages_the_model_planned():
     paths = {e.path for e in bp.contract.endpoints}
     assert paths == {"/catalogue", "/catalogue/add"}
     assert not any(f.filename.startswith("templates/books") for f in bp.files)
+
+
+# ---------------------------------------------------------------------------
+# Phase B — every website request reaches the full-stack path
+# ---------------------------------------------------------------------------
+
+
+async def _fake_route_one(*args, **kwargs):
+    """Stand-in for ordinary routing, so a turn that must NOT blueprint still
+    finishes without reaching a real Ollama."""
+    return "routed the ordinary way", []
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        # Unanchored, "add ... to" matched the trailing clause of an ordinary
+        # greenfield request and vetoed it.
+        "build a shop and add reviews to it",
+        "create a blog with comments added to each post",
+        # The single-file veto swallowed builds that merely mentioned a file.
+        "build me a website with a css file for the styling",
+        "make a portfolio site and put the js file in static",
+    ],
+)
+def test_should_blueprint_no_longer_vetoes_these_greenfield_builds(msg):
+    assert should_blueprint(msg) is True
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "add a login form to index.html",  # opens with the edit verb
+        "put a button into the page",
+        "please add a footer to the header file",
+        "create a css file",  # genuinely one file, no application named
+        "make a new html file",
+        "make a new html file for the about page",  # "page" is not an app noun
+    ],
+)
+def test_should_blueprint_still_skips_these(msg):
+    assert should_blueprint(msg) is False
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "build me a recipe organizer",  # verb, but no noun in the list
+        "I need somewhere to track my expenses",  # no build verb at all
+        "help me make a place where my club can post events",
+        "i want an inventory thing for my workshop",
+    ],
+)
+def test_tier_two_candidates_are_the_ones_the_regex_misses(msg):
+    from app.agent.blueprint import may_be_web_build
+
+    assert should_blueprint(msg) is False  # tier 1 misses it
+    assert may_be_web_build(msg) is True  # tier 2 gets to ask
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "build me a login page",  # tier 1 already said yes — don't ask twice
+        "what does a login page need?",  # question
+        "show me how routing works",  # question tier 1's regex misses
+        "split styles.css into two files",  # split
+        "add a footer to index.html",  # opening edit
+        "create a css file",  # single file, no application
+        "the tests are failing",  # no sign anything should be built
+        "run the build",
+        "",
+    ],
+)
+def test_tier_two_is_not_even_asked_about_these(msg):
+    from app.agent.blueprint import may_be_web_build
+
+    assert may_be_web_build(msg) is False
+
+
+@pytest.mark.parametrize(
+    "msg,expected",
+    [
+        ("build me a portfolio site, just html", True),
+        ("make a landing page with no backend", True),
+        ("build a static-only brochure site", True),
+        ("build me a shop", False),
+        ("build a site with a backend", False),
+    ],
+)
+def test_static_only_opt_out_is_recognised(msg, expected):
+    from app.agent.blueprint import wants_static_only
+
+    assert wants_static_only(msg) is expected
+
+
+async def test_tier_two_routes_an_unusual_request_to_the_blueprint(
+    tmp_path, monkeypatch
+):
+    """The headline: "a recipe organizer" is not in any noun list, and must
+    still get a full-stack build instead of a static page."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "expand_requirements", True)
+    monkeypatch.setattr(settings, "web_intent_fallback", True)
+    a = AgentCore(session_id="pytest_tier2_yes")
+    a._llm_blueprint = ScriptedLLM(["YES"])
+
+    ran = {}
+
+    async def _fake_expand(msg, entities=()):
+        return _actionable_blueprint()
+
+    async def _fake_run(msg, blueprint, refs):
+        ran["built"] = True
+        return "built", []
+
+    monkeypatch.setattr(a, "_expand_requirements", _fake_expand)
+    monkeypatch.setattr(a, "_run_blueprint", _fake_run)
+
+    await a.chat("build me a recipe organizer")
+
+    assert ran.get("built") is True
+    assert a._llm_blueprint.calls == 1
+
+
+async def test_tier_two_no_leaves_routing_alone(tmp_path, monkeypatch):
+    """A false positive costs a multi-file build in place of a one-line answer,
+    so anything but a clear YES must not blueprint."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "expand_requirements", True)
+    monkeypatch.setattr(settings, "web_intent_fallback", True)
+    a = AgentCore(session_id="pytest_tier2_no")
+    a._llm_blueprint = ScriptedLLM(["NO"])
+
+    async def _boom(*args, **kwargs):
+        raise AssertionError("_run_blueprint must not run on a NO verdict")
+
+    monkeypatch.setattr(a, "_run_blueprint", _boom)
+    monkeypatch.setattr(a, "_route_one", _fake_route_one)
+
+    await a.chat("i want to understand my expenses better")
+
+
+async def test_tier_two_failure_is_a_no(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "expand_requirements", True)
+    monkeypatch.setattr(settings, "web_intent_fallback", True)
+    a = AgentCore(session_id="pytest_tier2_boom")
+
+    class _Boom:
+        def invoke(self, messages):
+            raise RuntimeError("ollama is down")
+
+    a._llm_blueprint = _Boom()
+
+    async def _boom(*args, **kwargs):
+        raise AssertionError("_run_blueprint must not run when the call failed")
+
+    monkeypatch.setattr(a, "_run_blueprint", _boom)
+    monkeypatch.setattr(a, "_route_one", _fake_route_one)
+
+    await a.chat("i want a recipe organizer")
+
+
+async def test_tier_two_is_never_asked_when_tier_one_fires(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "expand_requirements", True)
+    monkeypatch.setattr(settings, "web_intent_fallback", True)
+    a = AgentCore(session_id="pytest_tier2_skip")
+    a._llm_blueprint = ScriptedLLM(["YES"])
+
+    async def _fake_expand(msg, entities=()):
+        return _actionable_blueprint()
+
+    async def _fake_run(msg, blueprint, refs):
+        return "built", []
+
+    monkeypatch.setattr(a, "_expand_requirements", _fake_expand)
+    monkeypatch.setattr(a, "_run_blueprint", _fake_run)
+
+    await a.chat("build me a login page")  # tier 1 matches
+
+    assert a._llm_blueprint.calls == 0  # no classifier call was made

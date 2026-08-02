@@ -507,6 +507,38 @@ from cwd or the repo layout — always via `settings.prompts_dir` / `skills_dir`
 dotfiles, which is why `scaffolds/flask/` stores `.gitignore`/`.gitkeep` as `gitignore`/`gitkeep`
 and `scaffold.py` restores the dot on the way out.
 
+### The two-tier build gate (Phase B, `settings.web_intent_fallback`)
+
+`should_blueprint()` is a verb×noun regex, and no noun list enumerates what people build —
+"a recipe organizer", "somewhere to track my expenses", "a place my club can post events" all
+missed it and silently shipped static HTML with no server and no database. Phase B keeps the
+regex as **tier 1** (free, and right when it fires) and adds **tier 2**: one temperature-0,
+one-word `YES/NO` call (`_classify_web_build`), reached only when `may_be_web_build()` — a
+pure pre-filter — says the message is a genuine candidate. An ordinary turn costs zero extra
+calls.
+
+- **`may_be_web_build` is the leash.** It rejects what tier 1 already accepted (no point
+  asking twice), questions, splits, *opening* edits, single-file requests, and messages
+  opening with a dev command (`_COMMAND_RE` — "run the build" and "deploy the site" both
+  carry words the build regexes like). What survives must then show some sign the user wants
+  something made: a build verb, or "I need…"/"help me…" phrasing.
+- **Anything but a clear YES is NO.** A false positive costs a multi-file build in place of a
+  one-line answer, so an LLM error, an empty answer or a hedge all leave routing alone — the
+  same rule `intent.parse_verdict` follows.
+- **Two vetoes in `should_blueprint` were wrong and are fixed.** `_EDIT_INTO_RE` is now
+  ANCHORED: unanchored it matched the trailing clause of ordinary greenfield requests, so
+  "build a shop and add reviews to it" was read as an edit and never blueprinted. And the
+  single-file veto now yields to `_APP_NOUN_RE`, so "build me a website with a css file for
+  the styling" builds while "create a css file" still doesn't. `page`/`form` are deliberately
+  NOT app nouns — "a login page" must blueprint, "an html file for the about page" must not.
+- **Escape hatch:** `wants_static_only()` ("just html", "no backend", "static only") makes
+  `_expand_requirements` use `prefer="none"`, so the build is still planned but proposes no
+  backend, no scaffold and no data layer. Refusing to plan it at all would be the wrong shape
+  — a static multi-page site is a real request.
+
+**Precedence is load-bearing and unchanged:** `should_amend` still runs first in `chat()`, so
+widening the build gate cannot make turn 2 rebuild turn 1's project.
+
 ### Schema first, layout derived from it (Phase C, `settings.schema_first`)
 
 Phase C of `docs/always-fullstack-plan.md`. The schema used to arrive as free text inside the

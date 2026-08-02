@@ -79,7 +79,22 @@ prefer-flask-absent, and assert the absent case is `runnable=False` rather than 
 
 ---
 
-## Phase B — Every website request gets the full-stack path
+## Phase B — Every website request gets the full-stack path — **DONE (2026-08-02)**
+
+Shipped as designed. `may_be_web_build()` is the pure pre-filter, `_classify_web_build()` the
+one-word call, `settings.web_intent_fallback` the switch. Three notes from implementing it:
+
+- **A leading dev-command veto was needed** (`_COMMAND_RE`). "run the build" matches the build
+  verb regex and "deploy the site" carries an app noun, so both reached the classifier for no
+  reason. Leading-only, and `start` is deliberately excluded — "start a blog for me" is a
+  build.
+- **`_APP_NOUN_RE` deliberately excludes `page` and `form`.** The single-file veto had to yield
+  to *something*, but yielding to the full noun list would have let "make a new html file for
+  the about page" blueprint a whole application.
+- **Anything but a clear YES is NO**, including an LLM error — the expensive direction is the
+  false positive. Pinned by `test_tier_two_failure_is_a_no`.
+
+Full suite: **979 passed**.
 
 `should_blueprint()` is narrow *by design* — the module docstring calls the narrow gate one
 of three leashes. Widening it is a deliberate reversal for web requests only, so it needs

@@ -175,6 +175,13 @@ class Settings(BaseSettings):
     # deterministically (blueprint.derive_pages_from_entities). Off = the schema
     # arrives as free text inside the blueprint's own answer, exactly as before.
     schema_first: bool = True
+    # Phase B: when should_blueprint()'s verb×noun regex MISSES, ask the model
+    # the one thing a noun list cannot know — "is this a request to build a web
+    # app?" — so "a recipe organizer" or "somewhere to track my expenses" stops
+    # shipping static HTML with no server. One temperature-0, one-word call, and
+    # only for messages `may_be_web_build` already judged genuine candidates, so
+    # an ordinary turn costs nothing. Off = the regex is the whole gate.
+    web_intent_fallback: bool = True
     # Build the 'optional' tier too (OAuth, 2FA, email delivery, …). Default off:
     # optional features are reported, not silently built.
     blueprint_optional_tier: bool = False

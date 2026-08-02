@@ -61,3 +61,7 @@ def _no_blueprint(monkeypatch):
     monkeypatch.setattr(settings, "expand_requirements", False)
     monkeypatch.setattr(settings, "blueprint_smoke_test", False)
     monkeypatch.setattr(settings, "schema_first", False)
+    # Same trap again for Phase B's tier-2 classifier: it fires when the regex
+    # gate MISSES, which is most test prompts, and it runs before any method a
+    # blueprint test would think to patch.
+    monkeypatch.setattr(settings, "web_intent_fallback", False)

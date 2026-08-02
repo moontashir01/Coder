@@ -89,10 +89,45 @@ _SINGLE_FILE_ONLY_RE = re.compile(
 
 # Incremental edit to an existing thing ("add a footer to the page", "put a
 # button into index.html") — not a fresh build.
+#
+# ANCHORED to the start of the message (Phase B). Unanchored it also matched the
+# trailing clause of a perfectly ordinary greenfield request — "build a shop and
+# add reviews to it" was read as an edit and never blueprinted. What makes a
+# message an edit is that it OPENS by asking for one; an edit verb halfway
+# through is just a description of what the new thing should contain.
 _EDIT_INTO_RE = re.compile(
-    r"\b(add|append|insert|put|move|include)\b[^.]*?\b(to|into|in)\b",
+    r"^\s*(?:(?:can|could|would)\s+you\s+|please\s+|now\s+|also\s+|then\s+)*"
+    r"(add|append|insert|put|move|include)\b[^.]*?\b(to|into|in)\b",
     re.IGNORECASE,
 )
+
+# The subset of build nouns that name a whole APPLICATION rather than a single
+# surface. "page" and "form" are deliberately absent: "a login page" must
+# blueprint, but "an html file for the about page" is genuinely one file.
+_APP_NOUN_RE = re.compile(
+    r"\b(app|application|web\s?app|web\s?site|website|site|dashboard|portal|"
+    r"platform|system|service|blog|store|shop|e-?commerce|marketplace|todo|"
+    r"to-?do|crud|full\s?stack|backend|back\s?end|admin|api)\b",
+    re.IGNORECASE,
+)
+
+# An explicit opt-out of the backend. A full build is many LLM calls and minutes
+# on a 7B, and someone who asks for one static page must still get one — so this
+# is honoured as `prefer="none"` (no backend proposed, no scaffold, no data
+# layer) rather than by refusing to plan the build at all.
+_STATIC_ONLY_RE = re.compile(
+    r"\b(just|only|plain|pure)\s+(html|css|static|frontend|front\s?end)\b|"
+    r"\b(static|frontend|front\s?end|html)[- ]only\b|"
+    r"\bno\s+(backend|back\s?end|server|database|db)\b|"
+    r"\bwithout\s+(a\s+)?(backend|back\s?end|server|database)\b",
+    re.IGNORECASE,
+)
+
+
+def wants_static_only(message: str) -> bool:
+    """Did the user explicitly ask for no backend? (Phase B escape hatch.)"""
+    return bool(_STATIC_ONLY_RE.search(message or ""))
+
 
 # Explicit split/reorganize wording is already owned by wants_multifile /
 # _multi_file_flow — never divert it here.
@@ -157,13 +192,70 @@ def should_blueprint(message: str) -> bool:
     m = message or ""
     if _QUESTION_RE.match(m):
         return False
-    if _SINGLE_FILE_ONLY_RE.search(m):
+    # "create a css file" is one file; "build me a website with a css file for
+    # the styling" is not. The single-file veto now yields to an application
+    # noun, which is the difference between naming the scope and naming a part
+    # of it (Phase B).
+    if _SINGLE_FILE_ONLY_RE.search(m) and not _APP_NOUN_RE.search(m):
         return False
     if _SPLIT_RE.search(m):
         return False
     if _EDIT_INTO_RE.search(m):
         return False
     return bool(_BLUEPRINT_VERB_RE.search(m) and _BLUEPRINT_NOUN_RE.search(m))
+
+
+# Phrasing that asks for something to be made without naming a build verb —
+# "I need somewhere to track my expenses". Together with the build verbs this
+# bounds what the tier-2 classifier is allowed to look at.
+_WANT_RE = re.compile(
+    r"\b(?:i|we)\s+(?:want|need|would like|'d like)\b|"
+    r"\b(?:help me|make me|set (?:me )?up|put together|working on|building)\b",
+    re.IGNORECASE,
+)
+
+# A message that OPENS with a dev command is an instruction about the workspace,
+# not a request for an application — "run the build" and "deploy the site" both
+# carry words the build regexes like ("build", "site"). Leading-only on purpose:
+# "start a blog for me" is a build, so `start` is deliberately absent too.
+_COMMAND_RE = re.compile(
+    r"^\s*(?:please\s+|now\s+)?"
+    r"(run|execute|install|uninstall|deploy|commit|push|pull|merge|rebase|"
+    r"test|lint|format|restart|stop|kill|undo|index|clone|checkout)\b",
+    re.IGNORECASE,
+)
+
+
+def may_be_web_build(message: str) -> bool:
+    """Is this worth ASKING a model whether it's a web build? (Phase B tier 2.)
+
+    `should_blueprint` is a verb×noun regex, and a noun list cannot enumerate
+    what people build: "a recipe organizer", "somewhere to track my expenses",
+    "a place my club can post events" all miss it and silently ship static HTML
+    with no server and no database. A model can answer that question; a regex
+    cannot. But a model call per turn is not free, so this decides — cheaply and
+    deterministically — which turns are even candidates.
+
+    It rejects everything `should_blueprint` rejects for its own reasons
+    (questions, splits, single-file requests, opening edits), rejects requests
+    tier 1 has *already* accepted (no point asking twice), and then requires
+    some sign the user wants something made at all. What survives is a short
+    list of genuine maybes, which is exactly what a one-token classifier is for.
+    """
+    m = message or ""
+    if not m.strip() or should_blueprint(m):
+        return False
+    if _QUESTION_RE.match(m) or _SPLIT_RE.search(m) or _EDIT_INTO_RE.search(m):
+        return False
+    if _COMMAND_RE.match(m):
+        return False
+    if _SINGLE_FILE_ONLY_RE.search(m) and not _APP_NOUN_RE.search(m):
+        return False
+    # Catches the interrogative openings `_QUESTION_RE` misses — "show me how a
+    # login page works" is a question about building, not a request to build.
+    if _AMEND_QUESTION_RE.match(m):
+        return False
+    return bool(_BLUEPRINT_VERB_RE.search(m) or _WANT_RE.search(m))
 
 
 # ---------------------------------------------------------------------------

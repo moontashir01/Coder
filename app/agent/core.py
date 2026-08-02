@@ -16,8 +16,10 @@ from app.agent.blueprint import (
     Endpoint,
     PlannedFile,
     blueprint_from_data,
+    may_be_web_build,
     should_amend,
     should_blueprint,
+    wants_static_only,
 )
 from app.agent.buildspec import (
     SPEC_INSTRUCTIONS,
@@ -2472,6 +2474,48 @@ class AgentCore:
         answer = f"Handled {len(ops)} file(s):\n" + "\n".join(summaries)
         return answer, trace
 
+    async def _classify_web_build(self, user_message: str) -> bool:
+        """Is this a request to build a web application? (Phase B, tier 2.)
+
+        `should_blueprint` is a verb×noun regex, and no noun list enumerates what
+        people actually build — "a recipe organizer", "somewhere to track my
+        expenses" miss it and ship static HTML with no server and no database.
+        This is the fallback for what the regex cannot know, reached only when
+        `may_be_web_build` says the message is a genuine candidate, so it costs
+        nothing on ordinary turns.
+
+        One temperature-0 call answering one word. Anything other than a clear
+        YES is NO: the expensive direction is a false positive (a full multi-file
+        build in place of a one-line answer), so ambiguity resolves toward
+        leaving routing alone — the same rule `intent.parse_verdict` follows.
+        """
+        messages = [
+            SystemMessage(
+                content=(
+                    "You answer with exactly one word: YES or NO.\n\n"
+                    "YES if the message asks you to BUILD a web application or "
+                    "website — something with pages a person visits, and data it "
+                    "stores. An unusual subject does not matter: a recipe "
+                    "organizer, an expense tracker and a club events board are "
+                    "all YES.\n"
+                    "NO for anything else: a question about how something works, "
+                    "a request to explain or review code, a single script or "
+                    "function, a command to run, a change to something that "
+                    "already exists, or ordinary conversation."
+                )
+            ),
+            HumanMessage(content=f"Message: {user_message}\n\nYES or NO:"),
+        ]
+        try:
+            raw = str(self._llm_blueprint.invoke(messages).content or "")
+        except Exception as e:
+            logger.debug("web-intent classification failed: %s", e)
+            return False
+        # `json_mode=True` on this LLM means the answer may arrive wrapped as
+        # JSON; the word is what matters, wherever it sits.
+        verdict = raw.strip().strip("\"'{}[] \t\n").upper()
+        return verdict.startswith("YES") or verdict.endswith("YES")
+
     async def _extract_schema(self, user_message: str) -> tuple[Entity, ...]:
         """What this app STORES — one temperature-0 call, before any layout.
 
@@ -2518,8 +2562,13 @@ class AgentCore:
         planning. Empty means the schema call failed or the app stores nothing,
         and this behaves exactly as it did before Phase C.
         """
+        # Phase B's escape hatch: "just html", "no backend", "static only" is an
+        # explicit opt-out, honoured as "no backend proposed" rather than by
+        # refusing to plan the build. A full build is many calls and minutes on a
+        # 7B, and someone who wants one static page must still be able to get it.
         stack = detect_stack(
-            allow_network=settings.allow_network, prefer=settings.web_stack
+            allow_network=settings.allow_network,
+            prefer="none" if wants_static_only(user_message) else settings.web_stack,
         )
         schema_block = ""
         if entities:
@@ -3923,7 +3972,18 @@ class AgentCore:
         if (
             answer is None
             and settings.expand_requirements
-            and should_blueprint(clean_message)
+            # Tier 1 is the free verb×noun regex. Tier 2 (Phase B) asks a model
+            # the one thing a noun list cannot know — "is this a web app?" — and
+            # only for messages `may_be_web_build` has already judged genuine
+            # candidates, so an ordinary turn still costs zero extra calls.
+            and (
+                should_blueprint(clean_message)
+                or (
+                    settings.web_intent_fallback
+                    and may_be_web_build(clean_message)
+                    and await self._classify_web_build(clean_message)
+                )
+            )
         ):
             # Phase C: decide what the app STORES before deciding what it looks
             # like, so the layout call derives pages from a schema instead of

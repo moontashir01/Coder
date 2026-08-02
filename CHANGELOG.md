@@ -7,6 +7,17 @@ All notable changes to Coder are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Any website request now gets a full-stack build** — the build gate was a
+  keyword regex, so "build me a recipe organizer" or "I need somewhere to track
+  my expenses" fell through to a static HTML page with no server and no
+  database. When the keywords miss, Coder now asks the model one yes/no question
+  instead of guessing from a word list. Ordinary turns are unaffected (the
+  question is only asked for plausible candidates, and anything but a clear yes
+  leaves routing alone). Two long-standing misfires are fixed with it: "build a
+  shop and add reviews to it" was read as an edit rather than a build, and
+  "build me a website with a css file for the styling" was read as a
+  single-file request. Say "just html", "no backend" or "static only" to get a
+  frontend-only build; `WEB_INTENT_FALLBACK=false` restores the regex-only gate.
 - **Schema-first builds** — a build request now decides what the app *stores*
   before it decides what it looks like, in its own short call, and the pages are
   planned around that schema instead of invented alongside it. Every table then
