@@ -53,6 +53,7 @@ from app.agent.intent import (
 )
 from app.agent.planner import Planner, _extract_json
 from app.agent.projectspec import (
+    README_MARKER,
     ProjectSpec,
     SpecDelta,
     delta_from_data,
@@ -1028,7 +1029,39 @@ class AgentCore:
         reach into `_spec`, and `/spec` should show what is on disk right now
         rather than whatever the last turn happened to leave in memory.
         """
-        return ProjectSpec.load(Path(self._project_path or Path.cwd()))
+        return self._load_or_adopt_spec(Path(self._project_path or Path.cwd()))
+
+    @staticmethod
+    def _load_or_adopt_spec(root: Path) -> ProjectSpec | None:
+        """The saved spec, else one read off the files (D1).
+
+        A project Coder did not build has no `.coder/project.json`, and until
+        now that meant no memory at all: no amendment routing, no impact
+        analysis, no migrations. `ProjectSpec.from_disk` recovers the contract
+        from what is actually there, so an existing Flask project can be amended
+        on its first turn.
+
+        **Recomputed every turn rather than cached.** The scan is a handful of
+        top-level modules and two globs — nothing against an LLM turn — and a
+        cache would go stale the moment a turn wrote a route without amending,
+        which is precisely the drift D3 exists to close. Fresh is simpler than
+        invalidated.
+
+        **The adopted spec is deliberately NOT saved here.** Writing
+        `.coder/project.json` into someone's repo because they asked a question
+        about it is a side effect they did not request; the first amendment
+        persists it via `merge_delta` + `save`, at which point `load()` wins and
+        this branch stops running. Best-effort: adoption failing must leave the
+        turn exactly as it was before adoption existed.
+        """
+        spec = ProjectSpec.load(root)
+        if spec is not None:
+            return spec
+        try:
+            return ProjectSpec.from_disk(root)
+        except Exception:
+            logger.warning("could not adopt a spec from %s", root, exc_info=True)
+            return None
 
     async def load_project(self, project_path: str) -> dict[str, Any]:
         self._project_path = project_path
@@ -2716,18 +2749,31 @@ class AgentCore:
                 logger.warning("could not write %s", rel, exc_info=True)
         return owned, api_context(spec)
 
-    def _write_readme(self, workdir: Path, spec: ProjectSpec) -> None:
+    @staticmethod
+    def _write_readme(workdir: Path, spec: ProjectSpec) -> None:
         """Regenerate README.md from the spec (Phase 6). Best-effort.
 
         The scaffold ships a generic README; this replaces it with the real
         entity and route list, so the file describes THIS project. Rewritten on
         every spec change, which is the only way it stays true after an
         amendment — a README that documents turn 1 is worse than none by turn 3.
+
+        **Only ever overwrites a README Coder itself wrote** (`README_MARKER`,
+        emitted by `to_readme` and shipped in the scaffold's copy). Until D1 that
+        distinction did not exist to make: every project with a spec had been
+        built here, so the file was always ours. Adoption changes that — an
+        existing repo can now reach the amendment path on turn 1, and silently
+        replacing a hand-written README with a generated one would be
+        destroying the user's work to document our own.
         """
+        target = workdir / "README.md"
         try:
-            (workdir / "README.md").write_text(
-                spec.to_readme(), encoding="utf-8", newline="\n"
-            )
+            if target.exists():
+                existing = target.read_text(encoding="utf-8", errors="replace")
+                if README_MARKER not in existing:
+                    logger.debug("leaving hand-written README.md alone")
+                    return
+            target.write_text(spec.to_readme(), encoding="utf-8", newline="\n")
         except Exception:
             logger.debug("could not write README.md", exc_info=True)
 
@@ -2743,7 +2789,7 @@ class AgentCore:
         the delta is empty — the caller then shows the ordinary plan.
         """
         workdir = Path(self._project_path or Path.cwd())
-        spec = self._spec or ProjectSpec.load(workdir)
+        spec = self._spec or self._load_or_adopt_spec(workdir)
         if spec is None or not should_amend(message, True):
             return {}
         try:
@@ -3215,7 +3261,7 @@ class AgentCore:
         # Phase 5: hand the spec over so the server is EXERCISED, not just
         # pinged. Without it a build whose every POST returned 500 still reported
         # a passing smoke test, because any HTTP status counted as alive.
-        spec = self._spec or ProjectSpec.load(workdir)
+        spec = self._spec or self._load_or_adopt_spec(workdir)
 
         result = await asyncio.to_thread(
             run_smoke_test,
@@ -3773,7 +3819,9 @@ class AgentCore:
         # the project's living state, reloaded from disk so an edit made outside
         # this session is picked up. Absent or corrupt → None, and the turn
         # behaves exactly as it did before the spec existed.
-        self._spec = ProjectSpec.load(Path(self._project_path or Path.cwd()))
+        # D1: falls back to reading the contract off the files, so a project
+        # Coder did not build still gets memory on its very first turn.
+        self._spec = self._load_or_adopt_spec(Path(self._project_path or Path.cwd()))
         self._update_skills_context(clean_message)
         await self.memory.add_human(user_message)
 

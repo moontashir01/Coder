@@ -759,3 +759,244 @@ def test_new_page_marks_base_html_impacted():
     )
     assert "templates/base.html" in impacted
     assert "templates/cart.html" in impacted
+
+
+# ---------------------------------------------------------------------------
+# from_disk — adopting a project Coder did not build (D1)
+# ---------------------------------------------------------------------------
+
+
+_ADOPT_APP = """
+from flask import Flask, render_template, request, redirect
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/products")
+def products():
+    return render_template("products.html", products=get_all())
+
+
+@app.route("/products/new", methods=["GET", "POST"])
+def new_product():
+    if request.method == "POST":
+        add(request.form["title"])
+        return redirect("/products")
+    return render_template("new_product.html")
+"""
+
+_ADOPT_DB = '''
+import sqlite3
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    price REAL
+)
+"""
+'''
+
+
+def _write_adopted_project(root):
+    """A hand-written Flask project: no .coder/, no blueprint, nothing of ours."""
+    (root / "app.py").write_text(_ADOPT_APP, encoding="utf-8")
+    (root / "db.py").write_text(_ADOPT_DB, encoding="utf-8")
+    (root / "templates").mkdir()
+    (root / "templates" / "base.html").write_text(
+        "<html><body>{% block content %}{% endblock %}</body></html>", encoding="utf-8"
+    )
+    (root / "templates" / "index.html").write_text(
+        '{% extends "base.html" %}{% block content %}Home{% endblock %}',
+        encoding="utf-8",
+    )
+    (root / "templates" / "products.html").write_text(
+        '{% extends "base.html" %}{% block content %}'
+        "{% for product in products %}{{ product.title }}{% endfor %}{% endblock %}",
+        encoding="utf-8",
+    )
+    (root / "templates" / "new_product.html").write_text(
+        '{% extends "base.html" %}{% block content %}<form method="post">'
+        '<input name="title"></form>{% endblock %}',
+        encoding="utf-8",
+    )
+    (root / "static").mkdir()
+    (root / "static" / "css").mkdir()
+    (root / "static" / "css" / "style.css").write_text("body{}", encoding="utf-8")
+    return root
+
+
+def test_from_disk_recovers_the_contract_of_a_project_we_did_not_build(tmp_path):
+    """The D1 promise: memory for any Flask project, not only fresh builds."""
+    spec = ProjectSpec.from_disk(_write_adopted_project(tmp_path))
+
+    assert spec is not None
+    assert (spec.language, spec.backend) == ("python", "flask")
+    # Tables come from the real CREATE TABLE, not from a declared schema.
+    assert [e.table for e in spec.entities] == ["products"]
+    assert [f.name for f in spec.entities[0].fields] == ["id", "title", "price"]
+    # Routes come from real @app.route decorators, with their handler file.
+    assert ("GET", "/products") in {(e.method, e.path) for e in spec.endpoints}
+    assert ("POST", "/products/new") in {(e.method, e.path) for e in spec.endpoints}
+    assert {e.handler for e in spec.endpoints} == {"app.py"}
+    # Pages come from GET routes that really render a template on disk.
+    assert {p.template for p in spec.pages} == {
+        "templates/index.html",
+        "templates/products.html",
+        "templates/new_product.html",
+    }
+    assert "app.py" in spec.files and "static/css/style.css" in spec.files
+
+
+def test_from_disk_excludes_the_layout_template_from_pages(tmp_path):
+    """base.html is the shell every page extends, not a page with a route."""
+    spec = ProjectSpec.from_disk(_write_adopted_project(tmp_path))
+    assert "templates/base.html" not in {p.template for p in spec.pages}
+
+
+def test_from_disk_reads_which_entities_a_page_uses(tmp_path):
+    """`reads` is inferred from prose in from_blueprint and routinely empty; a
+    template on disk simply says `{% for product in products %}`."""
+    spec = ProjectSpec.from_disk(_write_adopted_project(tmp_path))
+    products = next(p for p in spec.pages if p.template == "templates/products.html")
+    assert "product" in products.reads
+    home = next(p for p in spec.pages if p.template == "templates/index.html")
+    assert home.reads == ()
+
+
+def test_from_disk_declines_a_project_with_no_routes(tmp_path):
+    """An ordinary Python folder must not acquire an invented contract."""
+    (tmp_path / "utils.py").write_text("def add(a, b):\n    return a + b\n")
+    (tmp_path / "db.py").write_text(_ADOPT_DB, encoding="utf-8")  # tables, no web
+    assert ProjectSpec.from_disk(tmp_path) is None
+
+
+def test_from_disk_declines_an_empty_directory(tmp_path):
+    assert ProjectSpec.from_disk(tmp_path) is None
+
+
+def test_from_disk_does_not_record_a_page_whose_template_is_missing(tmp_path):
+    """The context block says "these already exist — do not redefine them", so a
+    page listed here that isn't there reads as an instruction not to build it."""
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask, render_template\n"
+        "app = Flask(__name__)\n"
+        '@app.route("/ghost")\n'
+        "def ghost():\n"
+        '    return render_template("ghost.html")\n',
+        encoding="utf-8",
+    )
+    spec = ProjectSpec.from_disk(tmp_path)
+
+    assert spec is not None
+    assert [e.path for e in spec.endpoints] == ["/ghost"]  # the route is real
+    assert spec.pages == ()  # the page is not
+
+
+def test_from_disk_skips_dot_directories(tmp_path):
+    """`.coder/` must never be listed as project source — the RAG indexer and
+    project_memory skip it for the same reason."""
+    _write_adopted_project(tmp_path)
+    (tmp_path / ".coder").mkdir()
+    (tmp_path / ".coder" / "notes.py").write_text("x = 1", encoding="utf-8")
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "junk.py").write_text("y = 2", encoding="utf-8")
+
+    spec = ProjectSpec.from_disk(tmp_path)
+    assert not [f for f in spec.files if f.startswith(".")]
+
+
+def test_from_disk_writes_nothing(tmp_path):
+    """Adoption is a read. Writing .coder/project.json into someone's repo
+    because they asked a question about it is a side effect they didn't ask for;
+    the first amendment persists it instead."""
+    _write_adopted_project(tmp_path)
+    before = sorted(p.name for p in tmp_path.iterdir())
+
+    ProjectSpec.from_disk(tmp_path)
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+    assert not (tmp_path / ".coder").exists()
+
+
+# ---------------------------------------------------------------------------
+# The seam in AgentCore: a saved spec wins, adoption fills the gap (D1)
+# ---------------------------------------------------------------------------
+
+
+def test_load_or_adopt_prefers_the_saved_spec(tmp_path):
+    """A real .coder/project.json carries revisions and history that a disk scan
+    cannot reconstruct, so it must never be shadowed by adoption."""
+    from app.agent.core import AgentCore
+
+    _write_adopted_project(tmp_path)
+    saved = _spec_with_product()
+    saved.summary = "the saved one"
+    assert saved.save(tmp_path)
+
+    spec = AgentCore._load_or_adopt_spec(tmp_path)
+    assert spec.summary == "the saved one"
+
+
+def test_load_or_adopt_falls_back_to_disk(tmp_path):
+    from app.agent.core import AgentCore
+
+    _write_adopted_project(tmp_path)
+    spec = AgentCore._load_or_adopt_spec(tmp_path)
+
+    assert spec is not None
+    assert [e.table for e in spec.entities] == ["products"]
+
+
+def test_load_or_adopt_returns_none_for_an_ordinary_folder(tmp_path):
+    from app.agent.core import AgentCore
+
+    (tmp_path / "notes.txt").write_text("hello")
+    assert AgentCore._load_or_adopt_spec(tmp_path) is None
+
+
+def test_readme_is_not_clobbered_when_a_human_wrote_it(tmp_path):
+    """D1 lets an existing repo reach the amendment path on turn 1, which is the
+    first time _write_readme can meet a README that isn't ours."""
+    from app.agent.core import AgentCore
+
+    handwritten = "# My Project\n\nYears of notes live here.\n"
+    (tmp_path / "README.md").write_text(handwritten, encoding="utf-8")
+
+    AgentCore._write_readme(tmp_path, _spec_with_product())
+
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == handwritten
+
+
+def test_readme_is_regenerated_when_coder_wrote_it(tmp_path):
+    from app.agent.core import AgentCore
+
+    spec = _spec_with_product()
+    (tmp_path / "README.md").write_text(spec.to_readme(), encoding="utf-8")
+
+    spec.summary = "now with carts"
+    AgentCore._write_readme(tmp_path, spec)
+
+    assert "now with carts" in (tmp_path / "README.md").read_text(encoding="utf-8")
+
+
+def test_readme_is_written_when_there_is_none(tmp_path):
+    from app.agent.core import AgentCore
+
+    AgentCore._write_readme(tmp_path, _spec_with_product())
+    assert (tmp_path / "README.md").is_file()
+
+
+def test_the_scaffolds_readme_is_recognised_as_ours(tmp_path):
+    """Otherwise a scaffolded project's generic README would survive every
+    amendment — the exact file Phase 6 exists to replace."""
+    from app.agent.projectspec import README_MARKER
+    from app.agent.scaffold import flask_scaffold_dir
+
+    shipped = (flask_scaffold_dir() / "README.md").read_text(encoding="utf-8")
+    assert README_MARKER in shipped

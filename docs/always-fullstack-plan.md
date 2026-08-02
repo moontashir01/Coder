@@ -166,7 +166,21 @@ removes the free-text→structured conversion that entities have to survive toda
 
 Four gaps, in value order.
 
-**D1 — Adopt projects Coder did not build** (`ProjectSpec.from_disk(root)`). Pure reuse of
+**D1 — Adopt projects Coder did not build** — **DONE (2026-08-02)**. Landed as planned, plus
+three decisions the plan didn't anticipate. (a) It **declines** unless a real route is
+defined, so an ordinary Python folder never acquires an invented contract; routes registered
+on a Blueprint (`@bp.route`) aren't recognised by `_ROUTE_RE`, and such a project declines
+rather than being adopted wrongly. (b) It **saves nothing** — writing `.coder/project.json`
+into someone's repo because they asked a question about it is an unrequested side effect, and
+the first amendment persists it anyway; it is recomputed per turn rather than cached, since a
+cache goes stale exactly when a turn writes a route without amending (the drift D3 closes).
+(c) **`_write_readme` now only overwrites a README Coder wrote** (`README_MARKER`, also added
+to the scaffold's copy) — adoption is what made an existing repo able to reach the amendment
+path on turn 1, where regenerating a hand-written README would have destroyed the user's work.
+A pre-existing test asserted the scaffold-README replacement against an invented stand-in
+rather than the shipped file; it now uses the real one. Full suite: **929 passed**.
+
+Original plan text: pure reuse of
 machinery that already exists and is never called for this: `entities_from_sql()` reads real
 `CREATE TABLE`s, `routes_from_source()` reads real `@app.route` → `render_template` pairs,
 `is_layout_template()` excludes `base.html`, `scaffolded_files()` finds the rest. Call it

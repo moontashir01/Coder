@@ -302,20 +302,27 @@ def test_readme_for_an_empty_spec_is_still_useful():
 def test_the_build_replaces_the_scaffold_readme(tmp_path, monkeypatch):
     """The scaffold ships a generic README; leaving it means the file describes
     the template rather than the project. Rewritten on every spec change,
-    because a README documenting turn 1 is worse than none by turn 3."""
+    because a README documenting turn 1 is worse than none by turn 3.
+
+    Uses the REAL scaffold README, not a stand-in for it: `_write_readme` only
+    overwrites a README carrying `README_MARKER` (so D1's adopted projects keep
+    their hand-written ones), which an approximation of the shipped file cannot
+    prove anything about.
+    """
     from app.agent.core import AgentCore
+    from app.agent.projectspec import README_MARKER
+    from app.agent.scaffold import scaffold_flask
 
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "README.md").write_text(
-        "# {{PROJECT_NAME}}\nthe generic scaffold readme\n", encoding="utf-8"
-    )
+    scaffold_flask(tmp_path, "Bookshop")
+    assert "Run it" in (tmp_path / "README.md").read_text(encoding="utf-8")
     agent = AgentCore(session_id="pytest_readme")
 
     agent._write_readme(tmp_path, _shop_spec())
 
     text = (tmp_path / "README.md").read_text(encoding="utf-8")
-    assert "generic scaffold readme" not in text
     assert "# bookshop" in text and "`products`" in text
+    assert README_MARKER in text  # generated from the spec, not the template
 
 
 def test_writing_the_readme_never_raises(tmp_path, monkeypatch):

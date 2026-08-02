@@ -594,6 +594,27 @@ Rules the rest of the code depends on:
   and push a backup into `.coder_backups/`, evicting the user's real undo history.
 - **`.coder/` is a dot-directory**, so the RAG indexer and `project_memory._scan_project` already
   skip it. Deliberate — the spec must not be embedded and retrieved back as if it were source.
+- **A project Coder did not build still gets memory** (`ProjectSpec.from_disk`, D1 of
+  `docs/always-fullstack-plan.md`). `from_blueprint` was the only way a spec came into existence,
+  so a repo cloned from git, one built before the spec existed, or one whose `project.json` was
+  deleted had no amendment path, no impact analysis and no migrations. `from_disk` reads the
+  contract off the files instead — `entities_from_sql` for tables, `routes_from_source` for routes,
+  `is_layout_template` to keep `base.html` out of `pages` — and `AgentCore._load_or_adopt_spec`
+  (used by `chat()`, `get_spec()`, `preview_amendment` and the smoke test) prefers a saved spec and
+  falls back to adoption. Three rules: it **declines** (returns None) unless a real route is
+  defined, so an ordinary Python folder never acquires an invented contract; it records only what
+  it can SEE (a route whose template is missing yields an endpoint but no page — the context block
+  says "these already exist", so listing an absent page instructs the model not to build it); and
+  it **saves nothing** — writing `.coder/project.json` into someone's repo because they asked a
+  question about it is an unrequested side effect, and the first amendment persists it anyway. It
+  is recomputed per turn rather than cached: the scan is trivial next to an LLM call, and a cache
+  would go stale exactly when a turn wrote a route without amending.
+  - **`_write_readme` only overwrites a README carrying `README_MARKER`** (emitted by `to_readme`,
+    shipped in the scaffold's copy). Adoption is what made this necessary: an existing repo can now
+    reach the amendment path on turn 1, and regenerating a hand-written README would destroy the
+    user's work to document our own. Don't remove the marker from the scaffold README — without it
+    a scaffolded project's generic README survives every amendment, which is the file Phase 6
+    exists to replace.
 - **The spec records what was BUILT, not merely what was planned.** `from_blueprint` takes `root`
   and reads it: page routes come from the real `@app.route` → `render_template` pairs in `app.py`,
   pages the blueprint never listed (the scaffold's own `index.html`) are picked up from real routes,

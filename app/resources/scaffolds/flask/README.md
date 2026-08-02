@@ -63,3 +63,5 @@ healthy and is still unreachable from the internet.
 Set `SECRET_KEY` from the host's environment rather than shipping the generated
 one, and note that SQLite lives on the instance's disk: hosts with an ephemeral
 filesystem will reset it on redeploy.
+
+<sub>Written by Coder from the project spec — scaffold.</sub>

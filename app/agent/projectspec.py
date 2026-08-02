@@ -59,7 +59,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from app.agent.blueprint import Blueprint
-from app.agent.pyimports import sql_strings
+from app.agent.pyimports import sql_strings, uses_flask
 from app.agent.runtime_probe import Stack
 
 logger = logging.getLogger(__name__)
@@ -67,6 +67,12 @@ logger = logging.getLogger(__name__)
 SPEC_VERSION = 1
 SPEC_DIRNAME = ".coder"
 SPEC_FILENAME = "project.json"
+
+# Marks a README as ours. `to_readme` emits it and the Flask scaffold ships it,
+# so `core._write_readme` can tell a README it may regenerate from one a human
+# wrote — a distinction that only became necessary with `from_disk`, which lets
+# an existing repo reach the amendment path.
+README_MARKER = "Written by Coder from the project spec"
 
 # Caps — this whole structure rides in a prompt, and it is parsed from model
 # output upstream, so every list is bounded.
@@ -966,7 +972,7 @@ class ProjectSpec:
             "one, and note that SQLite lives on the instance disk: a host with an",
             "ephemeral filesystem resets it on redeploy.",
             "",
-            f"<sub>Written by Coder from the project spec — revision {self.revision}.</sub>",
+            f"<sub>{README_MARKER} — revision {self.revision}.</sub>",
             "",
         ]
         return "\n".join(out)
@@ -1220,6 +1226,103 @@ class ProjectSpec:
             files=files,
         )
 
+    @classmethod
+    def from_disk(cls, root: Path | str) -> "ProjectSpec | None":
+        """Recover the contract of a project Coder did NOT build.
+
+        `from_blueprint` has been the only way a spec comes into existence, so
+        memory was a privilege of projects built in this session. A repo cloned
+        from git, one built before `ProjectSpec` existed, or one whose
+        `.coder/project.json` was deleted all route as though the project were
+        unknown — no amendment path, no impact analysis, no migrations — even
+        though everything needed to read the contract off the files is already
+        here: `entities_from_sql` recovers tables from real `CREATE TABLE`s,
+        `routes_from_source` reads real `@app.route` → `render_template` pairs,
+        and `is_layout_template` knows the shell from a page. This wires them to
+        the filesystem instead of to a blueprint.
+
+        **Only what can be SEEN is recorded** — routes really defined, tables
+        really created, pages a route really renders — for the same reason
+        `from_blueprint` reads `root` rather than trusting the plan: the context
+        block says *"these already exist — do not redefine them"*, so a page
+        listed here that does not exist reads as an instruction not to build it.
+
+        Returns None unless the project defines at least one route, so an
+        ordinary Python folder never acquires an invented contract. Routes
+        registered on a Blueprint (`@bp.route`) are not recognised by
+        `_ROUTE_RE`, and such a project simply declines to be adopted rather
+        than being adopted wrongly.
+        """
+        root = Path(root)
+        py_sources = _read_python(root)
+        if not py_sources:
+            return None
+
+        # (method, path) -> handler file, keeping the first definition seen.
+        handlers: dict[tuple[str, str], str] = {}
+        routes: list[tuple[str, str, str, str]] = []
+        for stem in sorted(py_sources):
+            for method, path, view, template in routes_from_source(py_sources[stem]):
+                key = (method, path)
+                if key in handlers:
+                    continue
+                handlers[key] = f"{stem}.py"
+                routes.append((method, path, view, template))
+        if not routes:
+            return None
+
+        entities = entities_from_sql(py_sources)
+
+        endpoints: list[SpecEndpoint] = []
+        pages: list[Page] = []
+        seen_templates: set[str] = set()
+        for method, path, _view, template in routes:
+            resolved = _resolve_template(root, template) if template else ""
+            if len(endpoints) < MAX_ENDPOINTS:
+                endpoints.append(
+                    SpecEndpoint(
+                        method=method,
+                        path=path[:120],
+                        handler=handlers[(method, path)],
+                        template=resolved,
+                        entity=_guess_entity(path, entities),
+                    )
+                )
+            # A page is a GET whose template is really on disk and is not the
+            # shell every other page extends.
+            if method != "GET" or not resolved or len(pages) >= MAX_PAGES:
+                continue
+            if resolved in seen_templates or not (root / resolved).is_file():
+                continue
+            if is_layout_template(root / resolved, resolved):
+                continue
+            seen_templates.add(resolved)
+            pages.append(
+                Page(
+                    route=path[:120],
+                    template=resolved,
+                    nav_label=_nav_label(Path(resolved).stem),
+                    reads=_template_reads(root / resolved, entities),
+                )
+            )
+
+        files: dict[str, str] = {rel: _role_for(rel) for rel in _disk_files(root)}
+        flask = any(uses_flask(text) for text in py_sources.values())
+        return cls(
+            name=root.name,
+            summary=(
+                f"Existing project read from disk: {len(entities)} table(s), "
+                f"{len(endpoints)} route(s), {len(pages)} page(s)."
+            ),
+            language="python",
+            backend="flask" if flask else "",
+            revision=1,
+            entities=tuple(entities),
+            endpoints=tuple(endpoints),
+            pages=tuple(pages),
+            files=files,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1299,6 +1402,64 @@ def _read_python(root: Path) -> dict[str, str]:
     except Exception:
         logger.debug("could not list python files in %s", root)
     return out
+
+
+def _template_reads(path: Path, entities: list[Entity]) -> tuple[str, ...]:
+    """Which entities a template actually mentions.
+
+    `from_blueprint` infers `reads` from the blueprint's prose, which is why it
+    is "routinely empty on the very listing page that matters" (see `smoke.py`).
+    A template on disk can simply be read: `{% for product in products %}` names
+    both the entity and its table. Best-effort — unreadable file means no claim.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").lower()
+    except Exception:
+        return ()
+    return tuple(e.name for e in entities if e.name in text or e.table.lower() in text)[
+        :3
+    ]
+
+
+# Where a web project's real files live. Deliberately shallow: top-level modules
+# plus the two trees the fixed layout defines, so a vendored dependency or a
+# virtualenv inside the project cannot flood `files` (which is capped anyway,
+# and rides in a prompt).
+_DISK_GLOBS = (
+    "*.py",
+    "templates/**/*.html",
+    "templates/**/*.htm",
+    "static/**/*.css",
+    "static/**/*.js",
+)
+
+
+def _disk_files(root: Path) -> list[str]:
+    """Project files worth recording, as sorted posix-relative paths."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for pattern in _DISK_GLOBS:
+        try:
+            matches = sorted(root.glob(pattern))
+        except Exception:
+            continue
+        for path in matches:
+            if not path.is_file():
+                continue
+            try:
+                rel = path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            # Dot-directories are skipped everywhere else (the RAG indexer,
+            # project_memory) and `.coder/` in particular must never be listed
+            # as project source.
+            if rel in seen or any(part.startswith(".") for part in Path(rel).parts):
+                continue
+            seen.add(rel)
+            out.append(rel)
+            if len(out) >= MAX_FILES:
+                return sorted(out)
+    return sorted(out)
 
 
 def scaffolded_files(root: Path) -> list[str]:

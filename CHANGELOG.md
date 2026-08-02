@@ -7,6 +7,16 @@ All notable changes to Coder are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Project memory for projects Coder didn't build** — an existing Flask project
+  (cloned from git, built before project memory existed, or with its
+  `.coder/project.json` deleted) now has its contract read off the files on the
+  first turn: tables from real `CREATE TABLE`s, routes from real `@app.route`
+  decorators, pages from the templates those routes render. So "add a reviews
+  column to products" works on a repo Coder has never seen, instead of being
+  treated as an unknown folder. It declines rather than guessing when the
+  project defines no routes, records only what is actually there, and writes
+  nothing — the first amendment is what persists the spec.
+  `README.md` is no longer overwritten unless Coder wrote it.
 - **Forced backend stack (`WEB_STACK`, default `flask`)** — builds now target
   Flask + Jinja2 + sqlite3 by decision rather than by probe. Previously
   `detect_stack()` picked the richest importable framework, so "Coder builds
