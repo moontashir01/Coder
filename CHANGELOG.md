@@ -8,7 +8,7 @@ All notable changes to Coder are documented here. The format follows
 
 ### Added
 - **A second stack: Node + Express + EJS + PostgreSQL** (`docs/node-stack-plan.md`,
-  phases N0–N2). `/stack` shows which stack a build targets and switches it;
+  phases N0–N4). `/stack` shows which stack a build targets and switches it;
   `/stack node` scaffolds a runnable Express app — routes, a connection pool,
   the same component stylesheet and theme file the Flask stack ships, and a
   layout every view is wrapped by — before a single line is generated. The
@@ -20,11 +20,20 @@ All notable changes to Coder are documented here. The format follows
   schema, with `$1` parameters and `RETURNING id`, and every entity gets a list
   page and a create form. Both stacks emit from the same schema, so one project
   description cannot produce two different databases.
+  Node builds are now checked as well as generated. An `.ejs` view is validated
+  structurally — an unterminated `<%` takes the whole page down at render time
+  and no other check could see it — links are validated against the routes
+  `server.js` really defines, with a near miss repointed and anything else
+  reported, and the views are read into the same dependency graph the Flask
+  stack has, so an amendment knows which page shows which data. A Node project
+  Coder did **not** build is now adopted too: its routes and tables are read off
+  disk, so turn 2 can amend a repo that arrived from git.
   `/stack` prints each stack's gaps as well as its guarantees, because they are
-  still not equals: Flask keeps `url_for` validation, import repair and
-  block-scoped template editing that Node does not have yet. Flask stays the
-  default. When Node, `npm install` or PostgreSQL is missing the smoke test is
-  **skipped and reported**, never quietly passed.
+  still not equals: Flask keeps import repair and block-scoped template editing
+  that Node does not have yet, its dependency graph resolves imports where
+  Node's stops at the templates, and Node's routes are read with a regex rather
+  than a parser. Flask stays the default. When Node, `npm install` or PostgreSQL
+  is missing the smoke test is **skipped and reported**, never quietly passed.
 - **Generated sites now come with a design system, and Coder can look at them**
   (`docs/web-quality-plan.md`). Every build ships a real component stylesheet and
   a Jinja macro library, and the style you ask for is *written* into

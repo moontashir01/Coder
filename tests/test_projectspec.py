@@ -925,6 +925,159 @@ def test_from_disk_writes_nothing(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# from_disk on a Node repo Coder did not build (Phase N4)
+# ---------------------------------------------------------------------------
+#
+# Same promise, second stack: without it a Node project that Coder did not build
+# has no amendment path, no impact analysis and no migrations. Python/Flask is
+# still tried FIRST and is completely unchanged, so an existing Flask repo
+# adopts exactly as it did before.
+
+_ADOPT_SERVER_JS = """
+const express = require("express");
+const app = express();
+
+app.get("/", (req, res) => {
+  res.render("index", { title: "Home" });
+});
+
+app.get("/products", async (req, res) => {
+  res.render("products", { products: await models.listProducts() });
+});
+
+app.post("/products/new", async (req, res) => {
+  await models.createProduct(req.body.title);
+  res.redirect("/products");
+});
+
+app.listen(5000);
+"""
+
+_ADOPT_DB_JS = """
+// Example — this is a COMMENT, not a table:
+//   CREATE TABLE IF NOT EXISTS widgets (id SERIAL PRIMARY KEY, name TEXT)
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS products (
+  id SERIAL PRIMARY KEY,
+  title TEXT NOT NULL,
+  price NUMERIC
+)`;
+"""
+
+
+def _write_adopted_node_project(root):
+    """A hand-written Express project: no .coder/, no blueprint, nothing of ours."""
+    (root / "server.js").write_text(_ADOPT_SERVER_JS, encoding="utf-8")
+    (root / "db.js").write_text(_ADOPT_DB_JS, encoding="utf-8")
+    (root / "views").mkdir()
+    (root / "views" / "layout.ejs").write_text(
+        "<html><body><nav><a href='/'>Home</a></nav><%- body %></body></html>",
+        encoding="utf-8",
+    )
+    (root / "views" / "index.ejs").write_text("<h1>Home</h1>", encoding="utf-8")
+    (root / "views" / "products.ejs").write_text(
+        "<% products.forEach(function (product) { %>" "<%= product.title %><% }); %>",
+        encoding="utf-8",
+    )
+    (root / "public").mkdir()
+    (root / "public" / "css").mkdir()
+    (root / "public" / "css" / "style.css").write_text("body{}", encoding="utf-8")
+    return root
+
+
+def test_from_disk_adopts_an_express_project(tmp_path):
+    """The gap N4 closes: before this, a Node repo Coder did not build got no
+    memory at all, because adoption read Python only."""
+    spec = ProjectSpec.from_disk(_write_adopted_node_project(tmp_path))
+
+    assert spec is not None
+    assert (spec.language, spec.backend) == ("node", "express")
+    assert {(e.method, e.path) for e in spec.endpoints} == {
+        ("GET", "/"),
+        ("GET", "/products"),
+        ("POST", "/products/new"),
+    }
+    assert {e.handler for e in spec.endpoints} == {"server.js"}
+
+
+def test_from_disk_recovers_postgres_tables_from_db_js(tmp_path):
+    """`entities_from_sql` reads the same SQL either way; what differs is how the
+    string literals are found, which on JS is `crud_node.js_strings`."""
+    spec = ProjectSpec.from_disk(_write_adopted_node_project(tmp_path))
+    assert [e.table for e in spec.entities] == ["products"]
+    assert [f.name for f in spec.entities[0].fields] == ["id", "title", "price"]
+
+
+def test_a_commented_create_table_is_not_a_table_on_the_node_side_either(tmp_path):
+    """The `_creates_table` trap, one stack over. `db.js` ships a *commented*
+    `CREATE TABLE ... widgets` example exactly as `db.py` does, and counting one
+    as real already cost the Flask side a live build."""
+    spec = ProjectSpec.from_disk(_write_adopted_node_project(tmp_path))
+    assert "widgets" not in {e.table for e in spec.entities}
+
+
+def test_from_disk_maps_an_express_route_to_the_view_it_renders(tmp_path):
+    """`res.render("products")` names the view without its extension, so the
+    `views/` + `.ejs` layout is what turns it back into a file on disk."""
+    spec = ProjectSpec.from_disk(_write_adopted_node_project(tmp_path))
+    products = next(p for p in spec.pages if p.route == "/products")
+    assert products.template == "views/products.ejs"
+    assert products.reads == ("product",)
+
+
+def test_from_disk_excludes_the_ejs_layout_from_pages(tmp_path):
+    """layout.ejs is the shell every view is wrapped in, not a page with a route
+    — and no route renders it, so it must not appear as one."""
+    spec = ProjectSpec.from_disk(_write_adopted_node_project(tmp_path))
+    assert "views/layout.ejs" not in {p.template for p in spec.pages}
+
+
+def test_from_disk_declines_a_plain_javascript_folder(tmp_path):
+    """The rule that keeps adoption honest, restated: no route means no web
+    project, so an ordinary JS folder never acquires an invented contract."""
+    (tmp_path / "utils.js").write_text(
+        "function add(a, b) { return a + b; }\nmodule.exports = { add };\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "db.js").write_text(_ADOPT_DB_JS, encoding="utf-8")  # tables, no web
+    assert ProjectSpec.from_disk(tmp_path) is None
+
+
+def test_node_modules_is_never_recorded_as_project_source(tmp_path):
+    """The `.coder/` rule with a different name: a few thousand vendored files
+    would drown the file record that exists to route an edit."""
+    _write_adopted_node_project(tmp_path)
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "junk.js").write_text("x", encoding="utf-8")
+
+    spec = ProjectSpec.from_disk(tmp_path)
+    assert not [f for f in spec.files if f.startswith("node_modules")]
+    assert "server.js" in spec.files and "views/products.ejs" in spec.files
+
+
+def test_python_is_tried_before_node(tmp_path):
+    """A Flask repo that happens to ship a stray .js file must still adopt as
+    Flask — the Python path is unchanged, and only reached-past when it finds no
+    routes at all."""
+    _write_adopted_project(tmp_path)
+    (tmp_path / "server.js").write_text(_ADOPT_SERVER_JS, encoding="utf-8")
+
+    spec = ProjectSpec.from_disk(tmp_path)
+    assert (spec.language, spec.backend) == ("python", "flask")
+    assert {e.handler for e in spec.endpoints} == {"app.py"}
+
+
+def test_an_adopted_node_spec_routes_its_amendment_to_the_node_adapter(tmp_path):
+    """The point of recording the stack at all. `resolve_key` reads it back, so
+    an amendment cannot be handed Python `ensure_column` calls for a `db.py`
+    that does not exist."""
+    from app.agent.stacks import resolve_key
+
+    spec = ProjectSpec.from_disk(_write_adopted_node_project(tmp_path))
+    assert resolve_key(spec, "flask") == "node"
+
+
+# ---------------------------------------------------------------------------
 # The seam in AgentCore: a saved spec wins, adoption fills the gap (D1)
 # ---------------------------------------------------------------------------
 

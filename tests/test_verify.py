@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from app.agent.core import AgentCore
-from app.agent.verify import check_file, is_verifiable
+from app.agent.scaffold import scaffold_dir
+from app.agent.verify import check_file, is_verifiable, strip_ejs
 
 
 class ScriptedLLM:
@@ -22,6 +23,17 @@ class ScriptedLLM:
         out = self._outputs[min(self.calls, len(self._outputs) - 1)]
         self.calls += 1
         return SimpleNamespace(content=out)
+
+
+@pytest.fixture
+def scaffold_views():
+    """The Node scaffold's real views, straight out of the package.
+
+    Read from `scaffold_dir`, never from a cwd-relative path — the packaging
+    rule in CLAUDE.md — so this passes in a wheel install too.
+    """
+    views = scaffold_dir("node") / "views"
+    return sorted(views.glob("*.ejs")) if views.is_dir() else []
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +149,9 @@ def test_check_css_rejects_html_content(tmp_path):
 
 def test_check_css_rejects_prose(tmp_path):
     p = tmp_path / "notes.css"
-    p.write_text("Sure! Here is the CSS you asked for. It styles the page.", encoding="utf-8")
+    p.write_text(
+        "Sure! Here is the CSS you asked for. It styles the page.", encoding="utf-8"
+    )
     ok, err = check_file(p)
     assert ok is False
     assert "prose" in err.lower()
@@ -224,6 +238,107 @@ def test_check_html_allows_trailing_whitespace_and_comment(tmp_path):
         encoding="utf-8",
     )
     assert check_file(p) == (True, "")
+
+
+# ---------------------------------------------------------------------------
+# .ejs — delimiters first, then the HTML underneath (Phase N4)
+# ---------------------------------------------------------------------------
+#
+# Nothing else in the pipeline can see an EJS syntax error: the file is
+# valid-ish HTML, `node --check` does not read it, and the page dies at render
+# time with "Could not find matching close tag". Measured while building the
+# Node scaffold, where `<%# … #%>` (there is no `#%>`) killed the home page.
+
+
+def test_ejs_is_verifiable():
+    assert is_verifiable("views/products.ejs") is True
+
+
+def test_strip_ejs_takes_the_javascript_out_and_leaves_the_markup():
+    """`<% if (a) { %>` is not an element, so it must come OUT before the tags
+    can be balanced — otherwise every scriptlet reads as unclosed markup."""
+    html, error = strip_ejs("<% if (a) { %><p>hi</p><% } %>")
+    assert error == ""
+    assert "<p>hi</p>" in html
+    assert "if" not in html and "{" not in html
+
+
+def test_an_unterminated_ejs_tag_is_caught(tmp_path):
+    """The characteristic EJS syntax error, and the one that broke the scaffold's
+    home page."""
+    p = tmp_path / "broken.ejs"
+    p.write_text(
+        "<h1>Products</h1>\n<% rows.forEach(function (r) {\n", encoding="utf-8"
+    )
+    ok, err = check_file(p)
+    assert ok is False
+    assert "unterminated" in err and "broken.ejs" in err
+
+
+def test_a_stray_close_delimiter_is_caught(tmp_path):
+    p = tmp_path / "stray.ejs"
+    p.write_text("<p>total</p> %>\n", encoding="utf-8")
+    ok, err = check_file(p)
+    assert ok is False
+    assert "stray" in err
+
+
+def test_the_escape_for_a_literal_open_delimiter_is_not_an_unterminated_tag():
+    """`<%%` is EJS's escape for a literal `<%`. Reading it as an opening tag
+    would fail a view whose only crime is documenting the syntax."""
+    html, error = strip_ejs("<p>write <%% to print a tag</p>")
+    assert error == ""
+    assert "<%" in html
+
+
+def test_unbalanced_html_under_the_javascript_is_still_caught(tmp_path):
+    """The delimiters being right does not make the markup right."""
+    p = tmp_path / "unclosed.ejs"
+    p.write_text(
+        "<% if (rows.length) { %>\n<div class='grid'>\n<p>x</p>\n<% } %>\n",
+        encoding="utf-8",
+    )
+    ok, err = check_file(p)
+    assert ok is False
+    assert "unclosed <div>" in err
+
+
+def test_a_fragment_is_valid_ejs(tmp_path):
+    """Every view except layout.ejs is a fragment, so requiring a full document
+    — as the `.html` check does — would fail all of them."""
+    p = tmp_path / "fragment.ejs"
+    p.write_text(
+        "<section class='hero'>\n  <h1><%= projectName %></h1>\n</section>\n",
+        encoding="utf-8",
+    )
+    assert check_file(p) == (True, "")
+
+
+def test_a_view_that_is_mostly_prose_is_valid(tmp_path):
+    """No "this looks like prose" guard here, unlike `.js`: a hero paragraph is
+    a legitimate view, and failing it would send the repair loop at good code."""
+    p = tmp_path / "about.ejs"
+    p.write_text("<p>We have sold beans since 1994.</p>\n", encoding="utf-8")
+    assert check_file(p) == (True, "")
+
+
+def test_a_full_document_is_valid_ejs_too(tmp_path):
+    """layout.ejs IS a document. Both shapes pass, for the right reason."""
+    p = tmp_path / "layout.ejs"
+    p.write_text(
+        "<!doctype html>\n<html><head><title><%= title %></title></head>"
+        "<body><%- body %></body></html>\n",
+        encoding="utf-8",
+    )
+    assert check_file(p) == (True, "")
+
+
+def test_the_real_scaffold_views_pass(scaffold_views):
+    """The check is only worth having if the views this project ships clear it —
+    and index.ejs is the file whose `<%# … #%>` comment failed at render time."""
+    assert scaffold_views, "the Node scaffold shipped no views"
+    for path in scaffold_views:
+        assert check_file(path) == (True, ""), path.name
 
 
 # ---------------------------------------------------------------------------

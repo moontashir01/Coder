@@ -2219,15 +2219,25 @@ class AgentCore:
         return note, trace
 
     async def _check_endpoints(self, target_path: Path, filename: str) -> str:
-        """Validate a template's `url_for` targets against app.py (Phase W2).
+        """Validate a template's links against the entry file's routes (W2/N4).
 
         A misnamed endpoint is a Jinja BuildError — a 500 on that page, from a
         file that parses, renders in isolation and passes every other check.
-        Deterministic: a near-miss of a real view is a naming slip and is
+        Deterministic: a near-miss of a real route is a naming slip and is
         repointed; anything else is reported, because inventing the route would
         be generation.
+
+        The stack's own template extension is accepted as well as `.html`, or
+        the pass would return "" for every `.ejs` view before reaching
+        `check_links` — the Node half of this check would be written, tested and
+        never run, which reads exactly like a passing one. `template_ext` is
+        `.html` on Flask, so that stack's behaviour is unchanged.
         """
-        if target_path.suffix.lower() not in (".html", ".htm"):
+        if target_path.suffix.lower() not in (
+            ".html",
+            ".htm",
+            self._adapter.template_ext,
+        ):
             return ""
         entry = Path(self._project_path or Path.cwd()) / self._adapter.entry_file
         try:

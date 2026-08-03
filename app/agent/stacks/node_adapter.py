@@ -4,30 +4,28 @@ Phases N1/N2 of `docs/node-stack-plan.md`. This adapter is deliberately
 **shallower than the Flask one**, and says so out loud rather than pretending
 otherwise — see `gaps`, which `/stack` prints verbatim.
 
-What works here today:
+What works here today (N1-N4):
 
   * a scaffold that runs before the model has written a line (`scaffolds/node/`),
     carrying the same component sheet and the same theme file as Flask, so all
     of Phase W1's design-system work transfers unchanged;
-  * routes read back off `server.js`, so the spec records what was really built;
+  * the deterministic data layer — `db.js`'s tables, `models.js`, `seed.js` and
+    `passwords.js` written from the SAME `Entity` objects `crud.py` uses, with
+    the dialect differences confined to `projectspec.POSTGRES`;
+  * migrations derived from the spec rather than from the model, and *reported*
+    when they cannot be placed — a migration the caller believes ran when it did
+    not is worse than one that never claimed to;
+  * routes read back off `server.js`, so the spec records what was really built,
+    and read off a Node repo Coder did NOT build (`ProjectSpec.from_disk`);
+  * `.ejs` structural checking and path-based link validation, with the same
+    exactly-one-candidate near-miss rule W2 uses on `url_for`;
   * the layout invariant — a view that ships its own `<html>`/`<nav>` renders
     two navbars, and that is detected and repaired exactly as on Flask.
 
-What does NOT work yet, and is Phase N3+'s job:
-
-  * **the deterministic data layer.** `crud.py` emits sqlite3 with `?`
-    placeholders and `cursor.lastrowid`; PostgreSQL needs `$1` and
-    `RETURNING id`. `write_data_layer` therefore writes nothing and returns no
-    api_context — the model writes `models.js` itself, which is the pre-Phase-4a
-    Flask behaviour and has the failure modes Phase 4a exists to fix.
-  * **derived migrations.** `migration_note` reports that the schema change was
-    not applied rather than editing `db.js` on a guess. A half-edited schema
-    file is worse than none, and a migration the caller believes ran when it did
-    not is worse still.
-
-Both return honest, empty answers instead of Flask-shaped ones. That is the
-whole point of routing them through the seam: a Node project can no longer be
-handed Python `ensure_column` calls by an amendment that never checked.
+What is still Flask-only is in `gaps` below, which `/stack` prints verbatim. The
+list is not decoration: an adapter that returned a Flask-shaped answer for a
+Node project would be worse than no Node stack at all, because the failure would
+be silent and on turn 2.
 """
 
 from __future__ import annotations
@@ -176,15 +174,28 @@ class NodeAdapter:
         "routes read back off server.js, so the spec records what was built",
         "views that ship their own <html>/<nav> are detected and rewritten",
         "the browser layer (W4-W7) — it speaks HTTP and DOM, not Python",
+        ".ejs structural checking: an unterminated <% takes the page down at "
+        "render time, and nothing else in the pipeline can see it",
+        "link validation against the routes really defined in server.js — a "
+        "near miss is repointed, anything else is reported",
+        "a Node repo Coder did not build is adopted: routes off server.js, "
+        "tables off db.js, so turn 2 can amend it",
+        "an EJS template graph off disk, so an amendment knows which view "
+        "displays an entity without being told (W8's shape)",
     )
     gaps = (
-        "no route validation and no missing-import repair: Flask repairs a "
-        "misnamed url_for and adds an import a module uses but never binds, and "
-        "there is no equivalent here yet (plan phase N4)",
-        "no .ejs syntax check and no template-scoped editing, so an edit to a "
-        "view is a whole-file edit (plan phase N4)",
-        "a Node repo Coder did not build gets no memory: spec adoption reads "
-        "Python only, so it declines rather than adopting (plan phase N4)",
+        "no missing-import repair: Flask adds an import a module uses but never "
+        "binds, which is its only AUTO-REPAIRING correctness check. It is built "
+        "on stdlib `ast`; a JS equivalent is its own piece of work and would be "
+        "weaker, so an undefined name here surfaces at runtime",
+        "the IMPORT dependency graph stays Python-only: `symbols.py` extracts JS "
+        "symbols but does not resolve JS imports, so a change's blast radius "
+        "comes from the template graph and the spec's own `reads`, not from "
+        "which module imports which",
+        "routes are read with a regex, not a parser: a route written in a shape "
+        "it does not recognise is left unvalidated rather than reported wrongly",
+        "no template-scoped editing — an edit to a view rewrites the whole file, "
+        "where Flask confines it to the `{% block %}` it belongs in (W3)",
         "readiness is checked (node / node_modules / a socket to Postgres) but not "
         "proven: nothing runs `SELECT 1`, so a wrong database or bad credentials "
         "still surfaces as a failed start (plan phase N5)",

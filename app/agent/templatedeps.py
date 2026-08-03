@@ -289,8 +289,8 @@ _JS_WORDS = frozenset("""
     case break continue in of delete void yield class extends super import
     export default from require module exports length forEach map filter reduce
     join push slice split trim toUpperCase toLowerCase includes indexOf keys
-    values entries Object Array String Number Boolean Math JSON Date Promise
-    console log locals it item items row rows index idx key val value
+    values entries stringify parse Object Array String Number Boolean Math JSON
+    Date Promise console log locals it item items row rows index idx key val value
     ui esc humanize body title messages projectName notFound render
     """.split())
 
@@ -424,7 +424,22 @@ class TemplateGraph:
             return candidate
         tail = wanted.rsplit("/", 1)[-1]
         hits = [p for p in self.templates if p.rsplit("/", 1)[-1] == tail]
-        return hits[0] if len(hits) == 1 else ""
+        if len(hits) == 1:
+            return hits[0]
+        if not hits and "." not in tail:
+            # Express names a view WITHOUT its extension — `res.render("products")`,
+            # `include("_filters")` — where Jinja always writes the full filename.
+            # Guarded on there being no dot at all, so no Jinja name can reach it,
+            # and only tried once every match above has come back empty: it can
+            # turn a "" into a hit, never one answer into a different one.
+            stems = [
+                p
+                for p in self.templates
+                if p.rsplit("/", 1)[-1].rsplit(".", 1)[0] == tail
+            ]
+            if len(stems) == 1:
+                return stems[0]
+        return ""
 
     # -- routes ---------------------------------------------------------
 

@@ -153,10 +153,12 @@ def test_every_adapter_answers_the_whole_protocol(adapter):
         "seed_command",
         "write_source_if_valid",
         "routes_from_source",
+        "check_links",
         "source_is_valid",
         "restore_entry_route",
         "orphan_templates",
         "convert_template",
+        "build_template_graph",
         "template_edit_region",
         "ui_context",
         "scaffold_context",
@@ -316,10 +318,10 @@ def test_flask_readiness_never_gates_a_check_that_always_ran():
 # ---------------------------------------------------------------------------
 
 
-def test_node_writes_no_data_layer_and_claims_none():
-    """`crud.py` is sqlite3 to its core. Emitting it into a .js file would give
-    a data layer that is confidently wrong, and `api_context` would then name
-    helpers that do not exist — api_context's own failure mode, inverted."""
+def test_node_writes_no_data_layer_for_a_spec_with_no_schema():
+    """A spec with no entities describes no tables, so there is nothing to
+    generate — and `api_context` must stay empty with it. Naming helpers that
+    were never written is `api_context`'s own failure mode, inverted."""
     from app.agent.projectspec import ProjectSpec
 
     owned, api = NODE.write_data_layer(Path("."), ProjectSpec(name="x"))
@@ -520,6 +522,197 @@ def test_node_readiness_names_each_missing_piece(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Link validation (Phase N4) — one defect class, two vocabularies
+# ---------------------------------------------------------------------------
+#
+# W2's rule, restated for a stack whose views name a route by its PATH rather
+# than by a view name. The rules are identical either way: repoint only an
+# unambiguous near miss, report everything else. Sending a link to the WRONG
+# page is worse than the 404 it replaces.
+
+# `GET /products/new` is deliberately absent: `/products/:id` also matches that
+# path, which is the shape that produced a real false 405 (see the union test).
+NODE_ROUTES = [
+    ("GET", "/", "index", "index"),
+    ("GET", "/products", "products", "products"),
+    ("GET", "/products/:id", "products_id", "product"),
+    ("POST", "/products/new", "products_new", ""),
+]
+FLASK_ROUTES = [
+    ("GET", "/products", "products", "templates/products.html"),
+    ("POST", "/products/new", "add_product", ""),
+]
+
+
+def test_node_repoints_a_near_miss_of_a_real_route():
+    """`references._name_key`'s rule, inherited whole: punctuation dropped and
+    one trailing plural collapsed, so `/product` -> `/products` is a slip."""
+    text, fixes, problems = NODE.check_links('<a href="/product">Shop</a>', NODE_ROUTES)
+    assert '<a href="/products">Shop</a>' == text
+    assert fixes == [("/product", "/products")]
+    assert problems == []
+
+
+def test_node_leaves_a_link_to_a_different_page_alone():
+    """`/edit_product` and `/add_product` are two handlers, not one misspelling.
+    Reported, never repointed — the repair would be a wrong destination."""
+    routes = [("GET", "/add_product", "add_product", "")]
+    text, fixes, problems = NODE.check_links('<a href="/edit_product">e</a>', routes)
+    assert fixes == [] and text == '<a href="/edit_product">e</a>'
+    assert problems == ["link to /edit_product — no route serves it"]
+
+
+def test_node_resolves_a_link_through_a_parameterised_segment():
+    """`/products/5` is served by `/products/:id`. Without this every link to a
+    detail page reads as broken — a false-failure flood, not a finding."""
+    assert NODE.check_links('<a href="/products/5">One</a>', NODE_ROUTES) == (
+        '<a href="/products/5">One</a>',
+        [],
+        [],
+    )
+
+
+def test_a_form_is_judged_against_every_route_that_matches_it():
+    """THE union rule, and a real bug found and fixed while building this.
+
+    `/products/:id` also matches `/products/new`, so taking the FIRST matching
+    route reported a genuine `POST /products/new` handler as a 405 — a false
+    failure on correct code. The server tries each route in turn, so the request
+    405s only when NONE of them accepts the method.
+    """
+    assert NODE.check_links(
+        '<form method="post" action="/products/new"></form>', NODE_ROUTES
+    ) == ('<form method="post" action="/products/new"></form>', [], [])
+
+
+def test_a_genuine_405_is_still_reported():
+    """The union rule must not swallow the defect it is guarding around."""
+    _text, _fixes, problems = NODE.check_links(
+        '<form method="post" action="/products"></form>', NODE_ROUTES
+    )
+    assert problems == [
+        "may not meet: the form posting POST to /products will 405 — "
+        "that route only accepts GET"
+    ]
+
+
+def test_a_form_with_no_action_is_never_judged():
+    """Which route it posts to cannot be known from the view, and a false
+    failure here sends the repair loop at working code."""
+    assert NODE.check_links('<form method="post"></form>', NODE_ROUTES)[2] == []
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        '<link rel="stylesheet" href="/css/style.css">',  # the static mount
+        '<a href="https://example.com/products">out</a>',  # external
+        '<a href="//cdn.example.com/x">cdn</a>',  # protocol-relative
+        '<a href="#top">top</a>',  # an anchor
+        '<a href="mailto:x@y.z">mail</a>',
+        '<a href="products">relative</a>',  # not a route reference
+        '<a href="/products/<%= p.id %>">built at render time</a>',
+    ],
+)
+def test_what_is_not_a_route_reference_is_never_reported(markup):
+    """Everything that is not a link to one of this app's own pages is dropped
+    rather than guessed at — an off-disk false alarm is `references.py`'s
+    lesson, and it applies to routes too."""
+    text, fixes, problems = NODE.check_links(markup, NODE_ROUTES)
+    assert (text, fixes, problems) == (markup, [], [])
+
+
+def test_no_routes_at_all_reports_nothing():
+    """An empty route list means the parser could not read the server file.
+    Reporting every link on the page as broken would be the flood, not a find."""
+    assert NODE.check_links('<a href="/anything">x</a>', []) == (
+        '<a href="/anything">x</a>',
+        [],
+        [],
+    )
+
+
+def test_flask_still_checks_url_for_names_and_only_those():
+    """N4 changed the dispatch, not Flask's behaviour: a Jinja page names a
+    route by its VIEW, and W2's checks are untouched."""
+    text, fixes, problems = FLASK.check_links(
+        "<a href=\"{{ url_for('product') }}\">x</a>", FLASK_ROUTES
+    )
+    assert fixes == [("product", "products")] and "url_for('products')" in text
+    assert problems == []
+
+    _t, _f, problems = FLASK.check_links(
+        "<a href=\"{{ url_for('basket') }}\">x</a>", FLASK_ROUTES
+    )
+    assert problems == ["url_for('basket') has no such route"]
+
+
+def test_flask_does_not_judge_a_raw_path():
+    """A Jinja page's routes are reached through `url_for`; a literal path is
+    `_repair_page_links`' business, not this pass's. Pinned so the Node path
+    check cannot leak into the Flask adapter later."""
+    assert FLASK.check_links('<a href="/nope">x</a>', FLASK_ROUTES) == (
+        '<a href="/nope">x</a>',
+        [],
+        [],
+    )
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS, ids=lambda a: a.key)
+def test_check_links_is_part_of_the_contract(adapter):
+    """`core._check_endpoints` dispatches through this on every stack, so an
+    adapter that lacks it takes the whole verify pass down."""
+    assert callable(adapter.check_links)
+    assert adapter.check_links("", []) == ("", [], [])
+
+
+async def test_the_link_check_really_reaches_an_ejs_view(tmp_path, monkeypatch):
+    """A check that never runs reads exactly like a passing one.
+
+    `_check_endpoints` filtered on `.html`/`.htm`, so every `.ejs` view returned
+    "" before `check_links` was ever called — the Node half of W2 was written,
+    tested at the adapter, and dead at the call site.
+    """
+    from app.agent.core import AgentCore
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "server.js").write_text(
+        'app.get("/products", (req, res) => { res.render("products"); });\n',
+        encoding="utf-8",
+    )
+    view = tmp_path / "views" / "products.ejs"
+    view.parent.mkdir()
+    view.write_text('<a href="/product">Shop</a>\n', encoding="utf-8")
+
+    agent = AgentCore(session_id="pytest_n4_reaches_ejs")
+    agent._stack_key = NODE.key  # what `_select_stack` pins from the spec
+
+    note = await agent._check_endpoints(view, "views/products.ejs")
+
+    assert "repointed" in note and "/product -> /products" in note
+    assert '<a href="/products">Shop</a>' in view.read_text(encoding="utf-8")
+
+
+async def test_the_link_check_still_ignores_a_file_that_is_not_a_template(
+    tmp_path, monkeypatch
+):
+    from app.agent.core import AgentCore
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "server.js").write_text(
+        'app.get("/products", (req, res) => {});\n', encoding="utf-8"
+    )
+    script = tmp_path / "app.js"
+    script.write_text('const u = "/product";\n', encoding="utf-8")
+
+    agent = AgentCore(session_id="pytest_n4_ignores_js")
+    agent._stack_key = NODE.key
+
+    assert await agent._check_endpoints(script, "app.js") == ""
+    assert script.read_text(encoding="utf-8") == 'const u = "/product";\n'
+
+
+# ---------------------------------------------------------------------------
 # Amendments on a Node project use Node's own machinery
 # ---------------------------------------------------------------------------
 
@@ -635,11 +828,50 @@ def test_ejs_views_are_scanned_for_dead_references():
 
 
 def test_the_menu_states_each_stack_s_gaps():
-    """Flask has endpoint validation, deterministic migrations and import
-    repair that Node does not. A menu listing two stacks as equals is how a
-    demo gets built on the weaker one by accident."""
+    """Flask has import repair and block-scoped template editing that Node does
+    not. A menu listing two stacks as equals is how a demo gets built on the
+    weaker one by accident."""
     rows = {row["key"]: row for row in describe_stacks()}
     assert rows["flask"]["guarantees"]
     assert rows["node"]["guarantees"]
     assert rows["node"]["gaps"], "the Node stack must state what it cannot do"
     assert not rows["flask"]["gaps"]
+
+
+def test_the_gaps_are_gaps_the_code_really_has(tmp_path):
+    """`/stack` prints these verbatim, so a stale list is worse than no list —
+    it tells someone choosing a stack the opposite of the truth.
+
+    Each capability below is checked against the code, then against the claim.
+    N4 landed three of these and the list went on denying all three, which is
+    what this test exists to stop happening again quietly.
+    """
+    claims = " ".join(NODE.gaps).lower()
+
+    # Landed in N4 — these must NOT read as missing any more.
+    fixed, _f, _p = NODE.check_links(
+        '<a href="/product">x</a>', [("GET", "/products", "products", "")]
+    )
+    assert fixed != '<a href="/product">x</a>', "link validation really repairs"
+    assert "no route validation" not in claims
+    assert "no link validation" not in claims
+
+    from app.agent.verify import is_verifiable
+
+    assert is_verifiable("views/x.ejs"), ".ejs really is checked"
+    assert "no .ejs syntax check" not in claims
+
+    from app.agent.projectspec import ProjectSpec
+
+    (tmp_path / "server.js").write_text(
+        'app.get("/products", (req, res) => { res.render("products"); });\n',
+        encoding="utf-8",
+    )
+    assert ProjectSpec.from_disk(tmp_path) is not None, "a Node repo really adopts"
+    assert "gets no memory" not in claims
+
+    # Still genuinely missing — these must stay stated.
+    assert NODE.template_edit_region("views/x.ejs", "<p>x</p>") is None
+    assert "template-scoped editing" in claims
+    assert not hasattr(NODE, "add_missing_imports")
+    assert "missing-import repair" in claims

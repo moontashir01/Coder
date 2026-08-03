@@ -4,7 +4,8 @@
 Flask/Jinja2/sqlite3 stack or a new Node/Express/PostgreSQL one — with the Flask
 path's *behaviour* provably unchanged.
 
-**Status:** **N0–N3 are implemented.** N4–N6 are still plan only.
+**Status:** **N0–N4 are implemented.** N5 shipped early in cut-down form (see
+deviation 3 below); N6 is still plan only.
 **Predecessor:** `docs/web-quality-plan.md` (W1–W10).
 
 > ### What shipped, and what that leaves
@@ -32,6 +33,49 @@ path's *behaviour* provably unchanged.
 > run for any stack that ships a scaffold, so a Node build gets a list page, a
 > create form and their routes per entity — identical routes to Flask's, verified
 > side by side.
+>
+> **N4 — verification.** Four checks, all of which the Node stack was previously
+> missing and `gaps` previously admitted to:
+>
+> 1. **`.ejs` structural checking** (`verify.strip_ejs` + `_check_ejs_text`,
+>    wired into `check_text`/`is_verifiable`). The JavaScript comes out first —
+>    `<% if (a) { %>` is not an element — then the markup underneath is balanced.
+>    An unterminated `<%` is the characteristic EJS error and it takes the page
+>    down at render time; nothing else could see it, because the file is
+>    valid-ish HTML, `node --check` does not read it and the browser never gets
+>    that far. It catches the exact `<%# … #%>` bug that broke the scaffold's
+>    home page during N2. A view may legitimately be a fragment *or* a whole
+>    document, and both pass for the right reason.
+> 2. **Link validation for a path-routed stack** (`verify.local_links`,
+>    `unresolved_links`, `fix_link_targets`, `form_method_mismatches_by_path`),
+>    exposed as `adapter.check_links(text, routes)` on **both** adapters with
+>    `core._check_endpoints` dispatching through it. Flask keeps its `url_for`
+>    name-checking unchanged; Node checks paths and allows for `:id` segments.
+>    W2's rules transfer whole: an unambiguous near miss is repointed, everything
+>    else is reported. **A form is judged against the UNION of every route that
+>    matches it** — `/products/:id` also matches `/products/new`, and taking the
+>    first match reported a real `POST /products/new` handler as a 405.
+> 3. **An EJS template graph** (`templatedeps.parse_ejs_template`;
+>    `build_graph` gained `template_dir` / `template_ext` / `parser` /
+>    `routes_reader`, all defaulting to the Flask layout, so every existing
+>    caller and test is unchanged). Same graph shape, different parser. The
+>    load-bearing rule survives the port: identifiers come from EJS expressions
+>    with the strings stripped first, so `layout.ejs` — whose nav says "Products"
+>    and whose href is `/products` — does **not** read every entity.
+> 4. **Spec adoption for a Node repo Coder did not build.**
+>    `ProjectSpec.from_disk` tries Python/Flask first (unchanged, so an existing
+>    Flask repo adopts exactly as it did), then Node: routes off `server.js`,
+>    tables off `db.js` via `crud_node.js_strings`, `/products` →
+>    `views/products.ejs` with `reads=('product',)`. It still declines when there
+>    is no route, so a plain JS folder never acquires an invented contract.
+>
+> **What N4 does NOT close** — and `gaps` says so, because `/stack` prints it:
+> there is no `pyimports.add_missing_imports` equivalent (Flask's only
+> *auto-repairing* correctness check, and a JS version is its own piece of work
+> and would be weaker); the **import** dependency graph stays Python-only;
+> routes are read with a regex rather than tree-sitter, which leaves an
+> unrecognised route shape unvalidated rather than reported wrongly; and there is
+> no template-scoped editing, so an edit to a view is a whole-file edit.
 >
 > **Four deliberate deviations from the plan text below**, each because the
 > plan's shape did not survive contact:

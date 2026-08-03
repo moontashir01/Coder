@@ -592,7 +592,7 @@ sharper version of the `check_intent` trap: it runs *before* `_expand_requiremen
 test that opts back into the blueprint stage and patches only that method would still reach a
 real ChatOllama.
 
-### Two stacks behind one seam (`app/agent/stacks/`, Phases N0–N2)
+### Two stacks behind one seam (`app/agent/stacks/`, Phases N0–N4)
 
 `docs/node-stack-plan.md`. There are two named stacks — `flask` (Python / Flask /
 Jinja2 / sqlite3, the default) and `node` (Node / Express / EJS / PostgreSQL) —
@@ -635,10 +635,16 @@ fifth and `[sys.executable, "seed.py"]` at a sixth; those all read
   callables — and the call site is identical either way
   (`{{ ui.table(...) }}` / `<%- ui.table(...) %>`).
 - **The Node adapter states its gaps, and `/stack` prints them.** They are real
-  and they are printed verbatim (no route validation, no import repair, no `.ejs`
-  syntax check, no spec adoption for a repo Coder didn't build). A menu that
-  listed the two stacks as equals is how a demo gets built on the weaker one by
-  accident.
+  and they are printed verbatim: no import repair, no template-scoped editing,
+  the *import* dependency graph stays Python-only, routes are read with a regex
+  rather than a parser, and readiness is checked but not proven (no `SELECT 1`).
+  A menu that listed the two stacks as equals is how a demo gets built on the
+  weaker one by accident. **This list must be maintained as the gaps close** —
+  N4 landed three of the things it denied (route validation, the `.ejs` check,
+  spec adoption) and the list went on saying they were missing, which is worse
+  than having no list: it tells someone choosing a stack the opposite of the
+  truth. `tests/test_stacks.py::test_the_gaps_are_gaps_the_code_really_has`
+  checks each claim against the code so it cannot go stale silently again.
 - **One entity model, two dialects** (`projectspec.Dialect`, `SQLITE` /
   `POSTGRES`, Phase N3). `crud.py` and `crud_node.py` emit from the SAME `Entity`
   objects; the only things allowed to differ are the five in that table
@@ -677,6 +683,64 @@ fifth and `[sys.executable, "seed.py"]` at a sixth; those all read
   prevent.
 - Scaffold dotfiles follow the existing packaging rule: stored as
   `gitignore`/`gitkeep`, dot restored on write.
+
+**Verification for Node (Phase N4).** Four checks the Node stack was missing, all
+of them the Flask equivalent restated rather than reinvented:
+
+- **`.ejs` structural checking** (`verify.strip_ejs` → `_check_ejs_text`, wired
+  into `check_text` and `is_verifiable`). The JavaScript comes **out first** —
+  `<% if (a) { %>` is not an element — and then the markup underneath is
+  balanced by the same parser `.html` uses. An unterminated `<%` is *the* EJS
+  error and it kills the page at render time with "Could not find matching close
+  tag"; nothing else in the pipeline can see it, because the file is valid-ish
+  HTML, `node --check` does not read it and the browser never gets that far.
+  Measured: `<%# … #%>` (there is no `#%>`) broke the scaffold's home page during
+  N2. Two rules keep it from false-failing: a view may be a **fragment or a whole
+  document** (every view except `layout.ejs` is a fragment, so requiring a
+  document would fail all of them), and there is **no prose guard** — a hero
+  paragraph is a legitimate view, unlike in a `.js` file where prose means the
+  model wrote the wrong kind of content entirely.
+- **Link validation dispatches through `adapter.check_links(text, routes)`**, on
+  both adapters, from `core._check_endpoints` — which accepts **the stack's own
+  `template_ext`** as well as `.html`/`.htm`. That gate is load-bearing: filtered
+  on `.html` alone it returned `""` for every `.ejs` view before `check_links`
+  was ever reached, so the Node half of the check was written, tested at the
+  adapter and dead at the call site — which reads exactly like a passing one.
+  `template_ext` is `.html` on Flask, so that stack is unchanged. Jinja names a
+  route by its VIEW
+  (`url_for('products')`), EJS by its PATH (`href="/products"`); the rules are
+  identical either way and are W2's — repoint only an unambiguous near miss
+  (`references._name_key`, **exactly one** candidate), report everything else,
+  because sending a link to the wrong page is worse than the 404 it replaces.
+  The path lookup allows for `:id` segments. **A form is judged against the UNION
+  of every matching route, not the first match** — `/products/:id` also matches
+  `/products/new`, so first-match reported a genuine `POST /products/new` handler
+  as a 405, a false failure on correct code. Empty route list = report nothing:
+  that means the parser could not read the server file, and calling every link
+  broken would be the flood, not a finding.
+- **The template graph generalised** (`templatedeps.parse_ejs_template`;
+  `build_graph` gained `template_dir` / `template_ext` / `parser` /
+  `routes_reader`). **Every keyword defaults to the Flask layout**, so existing
+  callers and tests are untouched — N4 added arguments, it did not change a
+  default. `views` (the Python view bodies) is read **only when `parser is
+  None`**: `view_bodies` is `def name():`-shaped and running it over another
+  language's entry file would produce garbage edges rather than missing ones, so
+  a Node graph simply has none. The load-bearing rule survives the port —
+  identifiers come from EJS expressions with **strings stripped first**, so
+  `layout.ejs`, whose nav says "Products" and whose href is `/products`, is not a
+  reader of every entity. `_resolve` falls back to matching a **stem** when the
+  name carries no extension at all (Express writes `res.render("products")` and
+  `include("_filters")` where Jinja always writes the full filename); it is
+  reached only after every name match has come back empty, so it can turn a `""`
+  into a hit and never one answer into a different one.
+- **`ProjectSpec.from_disk` adopts a Node repo.** Python/Flask is tried first and
+  is unchanged, so an existing Flask repo adopts exactly as it did; Node is
+  reached only when the Python pass finds no routes at all. Routes come off
+  `server.js`, tables off `db.js` (via `crud_node.js_strings`, the JS half of the
+  `_creates_table` trap), and `views/` + `.ejs` turns `res.render("products")`
+  back into `views/products.ejs`. Every D1 rule still holds: it **declines**
+  without a real route, so a plain JS folder never acquires an invented contract;
+  it records only what it can SEE; and it **saves nothing**.
 
 ### Forcing the stack (`app/agent/runtime_probe.py`, `settings.web_stack`)
 
