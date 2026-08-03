@@ -22,7 +22,10 @@ unpushed-and-irreplaceable sitting here now.
 | N3 — data layer + PostgreSQL | **Done.** `app/agent/crud_node.py` |
 | N4 — verification for Node | **Done, tested and documented.** |
 | N5 — readiness gate | **Done.** `SELECT 1` via `NodeAdapter.database_reason` |
-| N6 — tests and evals | Not started |
+| N6 — tests and evals | **Done.** `evals.run --stack node` |
+
+**`docs/node-stack-plan.md` is fully implemented.** What is left below are the
+stated gaps and one piece of unfinished business, not unbuilt phases.
 
 ## What N4 shipped
 
@@ -66,13 +69,31 @@ Three rules to keep if you touch it:
   probe returns nothing, that reads as "cannot tell", and readiness reports a
   clean environment forever. There is a test for exactly this.
 
+## What N6 shipped
+
+`python -m evals.run --webapp --stack node` runs the same tasks against a Node
+build. The Phase E checks generalised for free (they read the project's own
+spec); how they REACHED the app did not, so `CheckContext.adapter` now supplies
+the entry file, the template dir, the route parser and the database reader.
+
+- **The adapter comes from the built project's `.coder/project.json`, never from
+  `settings.web_stack`** — `resolve_key`'s precedence, and a test pins it.
+- `adapter.table_columns(root)` is the new seam: sqlite `PRAGMA` on Flask,
+  `information_schema` over the project's own `pg` on Node. **`None` means "could
+  not read" and is never collapsed into "no tables".**
+- **`npm install` is the honest gap.** A generated Node project cannot run until
+  the network has been used once, so the app-running checks FAIL naming the
+  command rather than skipping (W10's rule). `--npm-install` lets the RUNNER do
+  it. **A `--stack node` score without that flag measures the files, not the
+  running app**, and the run says so up front.
+
 ## What is LEFT
 
-1. **N6 — evals.** Parametrise the existing web evals over both stacks. The
-   Phase E checks (`is_full_stack_app`, `every_entity_has_a_table`,
-   `entities_are_usable`) name no table and no route — they read the project's
-   own spec — so they should generalise for free. That is the highest-value
-   existing asset for this work.
+1. **The Node eval suite has never been run end to end.** Everything is wired and
+   unit-tested offline, but `--stack node --npm-install` needs the network, a
+   live PostgreSQL and Ollama all at once, and that has not happened on this
+   machine. Until it does, treat the Node score as unmeasured — not as zero, and
+   certainly not as passing.
 2. **A real PostgreSQL has still never run the generated SQL.**
    `tests/test_crud_node.py` has that tier, gated on `psycopg` +
    `CODER_TEST_DATABASE_URL`. It **skips loudly** — do not make it pass quietly.

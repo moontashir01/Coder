@@ -595,17 +595,19 @@ needs_node = pytest.mark.skipif(
 
 
 @needs_node
-def test_the_probe_script_is_valid_javascript(tmp_path):
+@pytest.mark.parametrize("name", ["_PROBE_SCRIPT", "_SCHEMA_SCRIPT"])
+def test_the_node_scripts_are_valid_javascript(tmp_path, name):
     """Not ceremony — `pageaudit.py` learned this the expensive way.
 
-    A syntax error in the probe fails in the WORST direction: `_probe_database`
-    swallows it, returns None, `database_reason` reads None as "cannot tell",
-    and every readiness check then reports a clean environment. The check would
-    be gone and nothing would say so.
+    A syntax error in either script fails in the WORST direction: the runner
+    swallows it and returns None, which both callers read as "could not find
+    out". Readiness would then report a clean environment forever, and the
+    schema check would report an unreadable database. The check would be gone
+    and nothing would say so.
     """
-    script = tmp_path / "probe.js"
+    script = tmp_path / f"{name.lower()}.js"
     script.write_text(
-        NODE._PROBE_SCRIPT.replace("TIMEOUT_MS", "5000"), encoding="utf-8"
+        getattr(NODE, name).replace("TIMEOUT_MS", "5000"), encoding="utf-8"
     )
     proc = subprocess.run(
         ["node", "--check", str(script)], capture_output=True, text=True
@@ -773,6 +775,72 @@ def test_flask_never_pays_for_the_database_probe(tmp_path):
     """sqlite has no daemon, so this whole phase must be invisible on Flask."""
     assert FLASK.readiness(tmp_path) == ""
     assert not hasattr(FLASK, "database_reason")
+
+
+# ---------------------------------------------------------------------------
+# Phase N6 — reading the schema, whichever database holds it
+# ---------------------------------------------------------------------------
+#
+# `evals/checks.py` asserts "every table the project DECLARES exists in the
+# database". That question is the same on both stacks; only the answer's source
+# differs, so it goes through the seam rather than through an `if` in the evals.
+
+_PG_SCHEMA = """
+class Client {
+  constructor(cfg) { this.cfg = cfg; }
+  connect() { return Promise.resolve(); }
+  query(sql) {
+    if (!/information_schema/.test(sql)) {
+      return Promise.reject(new Error("unexpected query: " + sql));
+    }
+    return Promise.resolve({ rows: [
+      { table_name: "recipes", column_name: "id" },
+      { table_name: "recipes", column_name: "title" },
+      { table_name: "ingredients", column_name: "id" }
+    ]});
+  }
+  end() { return Promise.resolve(); }
+}
+module.exports = { Client };
+"""
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS, ids=lambda a: a.key)
+def test_reading_the_schema_is_part_of_the_contract(adapter):
+    assert callable(adapter.table_columns)
+
+
+def test_flask_reads_the_sqlite_file(tmp_path):
+    import sqlite3
+
+    conn = sqlite3.connect(tmp_path / "app.db")
+    conn.execute("CREATE TABLE recipes (id INTEGER PRIMARY KEY, title TEXT)")
+    conn.commit()
+    conn.close()
+
+    assert FLASK.table_columns(tmp_path) == {"recipes": {"id", "title"}}
+
+
+def test_no_sqlite_file_is_could_not_read_not_no_tables(tmp_path):
+    """None and {} are different answers. Reporting an unreadable database as an
+    empty schema would turn an environment problem into "the build created no
+    tables" — the misattribution this whole gate exists to prevent."""
+    assert FLASK.table_columns(tmp_path) is None
+
+
+@needs_node
+def test_node_reads_the_schema_out_of_postgres(node_project):
+    root = node_project(_PG_SCHEMA)
+    assert NODE.table_columns(root) == {
+        "recipes": {"id", "title"},
+        "ingredients": {"id"},
+    }
+
+
+@needs_node
+def test_a_database_node_cannot_reach_reads_as_could_not_read(node_project):
+    root = node_project(pg_source=None)
+    assert NODE.table_columns(root) is None
 
 
 # ---------------------------------------------------------------------------

@@ -592,7 +592,7 @@ sharper version of the `check_intent` trap: it runs *before* `_expand_requiremen
 test that opts back into the blueprint stage and patches only that method would still reach a
 real ChatOllama.
 
-### Two stacks behind one seam (`app/agent/stacks/`, Phases N0–N4)
+### Two stacks behind one seam (`app/agent/stacks/`, Phases N0–N6)
 
 `docs/node-stack-plan.md`. There are two named stacks — `flask` (Python / Flask /
 Jinja2 / sqlite3, the default) and `node` (Node / Express / EJS / PostgreSQL) —
@@ -1477,6 +1477,33 @@ fight for port 5000. Expect a lower score than `--blueprint` — it asks harder 
 earlier suites were reporting passes while builds were visibly broken (Phase 0's 4/4 coexisted with
 one of four apps not starting). A suite that scores 100% on a broken app is worse than one that
 scores 50% honestly.
+
+**The same suite, either stack (Phase N6).** `python -m evals.run --webapp --stack node`
+runs the same tasks against a Node build. The plan's bet held for *what* the checks
+assert — they name no table and no route, they read the project's own spec — but not for
+how they REACH the app: `workdir / "app.py"`, `"flask" in source`, `templates/`,
+`AppRunner().start(workdir)` and `sqlite3` were written in directly at eleven sites, so
+against an Express build that works, every one reported a static pile of HTML.
+
+- **`CheckContext.adapter` reads the stack off the built project's own
+  `.coder/project.json`, never off `settings.web_stack`** — `resolve_key`'s precedence,
+  for `resolve_key`'s reason. A check that trusted the session setting would look for
+  `app.py` in a Node project the moment someone left the default on Flask and call a
+  working app static. Resolved once per task and cached, like the `_browser_report` memo.
+- **`is_full_stack_app` asks `adapter.routes_from_source`** instead of matching
+  `@app.route`. Strictly better even on Flask: it is the same parser the agent uses to
+  decide what was built, so the check and the project's own memory cannot disagree.
+- **`adapter.table_columns(root)`** answers "what does the database really have" — sqlite
+  `PRAGMA` on Flask, `information_schema` over the project's own `pg` on Node (N5's probe
+  transport, reused). **`None` means *could not read* and is never collapsed into "no
+  tables"**: reporting an unreachable database as an empty schema turns an environment
+  problem into "the build created no tables".
+- **The environment does not generalise, and the suite says so.** A generated Node project
+  cannot run until `npm install` has fetched Express and `pg`, and that needs the network.
+  So `_start` consults the N5 readiness gate and the app-running checks **fail naming the
+  command** rather than skipping — W10's rule exactly. `--npm-install` lets the *runner*
+  (never Coder) install into each task dir, via `run_task`'s `prepare` hook; without it the
+  run prints up front that it is measuring the files, not the running app.
 
 ### Eval harness (`evals/`)
 

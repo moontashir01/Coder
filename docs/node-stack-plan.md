@@ -4,7 +4,8 @@
 Flask/Jinja2/sqlite3 stack or a new Node/Express/PostgreSQL one — with the Flask
 path's *behaviour* provably unchanged.
 
-**Status:** **N0–N5 are implemented.** N6 is still plan only.
+**Status:** **N0–N6 are implemented.** The plan is complete; what remains are
+the stated gaps, not unbuilt phases.
 **Predecessor:** `docs/web-quality-plan.md` (W1–W10).
 
 > ### What shipped, and what that leaves
@@ -118,6 +119,42 @@ path's *behaviour* provably unchanged.
 > Coder will not run it for you — that stays a reported hint, exactly as
 > Playwright's Chromium does in W4. The build is offline; *running* a Node
 > project is not, and those are different claims.
+>
+> **N6 — the suite measures either stack.** `python -m evals.run --webapp
+> --stack node` runs the same tasks against a Node build.
+>
+> The plan's bet paid off: the Phase E checks name no table and no route — they
+> read the project's own spec — so *what* they assert generalised for free. What
+> did **not** generalise was how they REACH the app. `workdir / "app.py"`,
+> `"flask" in source`, `templates/`, `AppRunner().start(workdir)` and `sqlite3`
+> were written in directly at eleven sites, so against an Express build that
+> works, every one of them reported a static pile of HTML.
+>
+> The fix is the seam, not a branch in the evals: `CheckContext.adapter` reads
+> the stack off the built project's own `.coder/project.json` — **never off
+> `settings.web_stack`**, the same precedence `resolve_key` gives everyone else,
+> because a check that trusted the session setting would look for `app.py` in a
+> Node project the moment someone left the default on Flask. Two improvements
+> came out of it:
+>
+> - **`is_full_stack_app` now asks `adapter.routes_from_source`** instead of
+>   matching the substring `@app.route`. That is a strictly better question even
+>   on Flask: it is the same parser the agent uses to decide what was built, so
+>   the check and the project's own memory can no longer disagree.
+> - **`adapter.table_columns(root)`** answers "what does the database really
+>   have" — sqlite `PRAGMA` on Flask, `information_schema` over the project's own
+>   `pg` on Node. `None` means *could not read* and is never collapsed into "no
+>   tables": reporting an unreachable database as an empty schema would turn an
+>   environment problem into "the build created no tables".
+>
+> **The environment does not generalise, and the suite says so.** A generated
+> Node project cannot run until `npm install` has fetched Express and `pg`, and
+> that needs the network. So the app-running checks **fail naming the command**
+> rather than being skipped — W10's rule exactly, because a suite that scored
+> well without ever starting anything would be worthless. `--npm-install` lets
+> the *runner* (never Coder) install into each task directory, which is how a
+> real Node score is obtained; without it the run prints, up front, that it is
+> measuring the files and not the running app.
 >
 > **Four deliberate deviations from the plan text below**, each because the
 > plan's shape did not survive contact:

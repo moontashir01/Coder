@@ -84,6 +84,52 @@ def _spec(ctx: "CheckContext"):
     return ProjectSpec.load(ctx.workdir)
 
 
+# --- reaching the app, whichever stack built it (Phase N6) ------------------
+#
+# The Phase E checks generalise across stacks for free because they read the
+# project's own spec rather than naming a table or a route. What did NOT
+# generalise was how they REACH the app: `workdir / "app.py"`, `import flask`,
+# `templates/`, `AppRunner().start(workdir)` and sqlite3 were all written in
+# directly. These three helpers are the seam, and they take the adapter off the
+# CheckContext — i.e. off the project that was really built.
+
+
+def _entry(ctx: "CheckContext") -> Path:
+    """The file that starts this project: `app.py` on Flask, `server.js` on Node."""
+    return Path(ctx.workdir) / ctx.adapter.entry_file
+
+
+def _no_entry(ctx: "CheckContext") -> str:
+    """`""` when the entry file is there, else the reason it is not.
+
+    Kept as a message rather than a bool so the failure still NAMES the file it
+    wanted — "no app.py to run" was doing real work in a report.
+    """
+    entry = _entry(ctx)
+    return "" if entry.is_file() else f"no {ctx.adapter.entry_file} to run"
+
+
+def _start(ctx: "CheckContext", runner) -> tuple[bool, str]:
+    """Start the built app through its own adapter's entry file.
+
+    `AppRunner.start` defaults to `app.py`, which on a Node project starts
+    nothing and reports "no app.py" — a build that works, scored as one that
+    does not.
+
+    The N5 readiness gate runs first, so an environment failure NAMES itself
+    (`run npm install`, `createdb shop`) instead of arriving as "nothing
+    answered on 3000 within 15s". This is W10's rule, not a softening of it: a
+    check that could not run still FAILS — a suite that scored well without
+    having started anything would be worthless — but it fails saying which one
+    command fixes it, exactly as a missing browser does. Flask returns `""`
+    always, so nothing that used to run is now gated.
+    """
+    blocked = ctx.adapter.readiness(Path(ctx.workdir))
+    if blocked:
+        return False, blocked
+    return runner.start(ctx.workdir, ctx.adapter.entry_file)
+
+
 def spec_has_entity(name: str) -> Check:
     """The project REMEMBERS this entity — the thing turn 2 will amend."""
 
@@ -123,32 +169,30 @@ def spec_has_endpoint(method: str, path_fragment: str) -> Check:
 
 
 def db_has_column(table: str, column: str) -> Check:
-    """The real SQLite file has this column — the migration actually ran.
+    """The real database has this column — the migration actually ran.
 
     Asks the database, not the source: a `CREATE TABLE` in a file nobody
     executes proves nothing, and this is the check that distinguishes "the
     schema changed" from "the schema was described".
+
+    Phase N6 routes the reading through `adapter.table_columns`, so the same
+    assertion holds against sqlite on Flask and PostgreSQL on Node without the
+    task author choosing.
     """
 
     def check(ctx: "CheckContext") -> tuple[bool, str]:
-        import sqlite3
-
-        dbs = sorted(Path(ctx.workdir).glob("*.db"))
-        if not dbs:
-            return False, f"no .db file, so no {table}.{column}"
-        for path in dbs:
-            conn = sqlite3.connect(path)
-            try:
-                cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-            except Exception:
-                cols = set()
-            finally:
-                conn.close()
-            if column in cols:
-                return True, f"{table}.{column} exists in {path.name}"
-            if cols:
-                return False, f"{table} has: {', '.join(sorted(cols)) or 'no columns'}"
-        return False, f"table {table} not found in {dbs[0].name}"
+        found = ctx.adapter.table_columns(Path(ctx.workdir))
+        if found is None:
+            return False, (
+                f"could not read the database, so {table}.{column} is unproven"
+            )
+        cols = found.get(table)
+        if not cols:
+            known = ", ".join(sorted(found)) or "no tables"
+            return False, f"table {table} not found (database has: {known})"
+        if column in cols:
+            return True, f"{table}.{column} exists"
+        return False, f"{table} has: {', '.join(sorted(cols))}"
 
     return check
 
@@ -165,13 +209,13 @@ def app_serves(routes: list[str], label: str = "") -> Check:
         from app.agent.apprunner import AppRunner
         from app.agent.smoke import _request
 
-        entry = Path(ctx.workdir) / "app.py"
-        if not entry.is_file():
-            return False, "no app.py to run"
+        missing = _no_entry(ctx)
+        if missing:
+            return False, missing
 
         runner = AppRunner()
         try:
-            ok, message = runner.start(ctx.workdir)
+            ok, message = _start(ctx, runner)
             if not ok:
                 return False, f"app did not start: {message}"
             results = []
@@ -217,13 +261,14 @@ def post_persists(path: str, fields: dict, appears_on: str) -> Check:
         from app.agent.apprunner import AppRunner
         from app.agent.smoke import _request, server_error
 
-        if not (Path(ctx.workdir) / "app.py").is_file():
-            return False, "no app.py to run"
+        missing = _no_entry(ctx)
+        if missing:
+            return False, missing
 
         payload = {k: (v if v else f"{marker} {k}") for k, v in fields.items()}
         runner = AppRunner()
         try:
-            ok, message = runner.start(ctx.workdir)
+            ok, message = _start(ctx, runner)
             if not ok:
                 return False, f"app did not start: {message}"
             port = runner._port
@@ -455,38 +500,46 @@ def backend_reads_fields(fields) -> Check:
 
 
 def is_full_stack_app() -> Check:
-    """A Flask app with routes and templates — not a page of static HTML.
+    """A real server with routes and templates — not a page of static HTML.
 
     Phases A and B in one assertion. Before them a request whose wording missed
     the gate's noun list, or a machine where Flask happened not to be importable,
     both produced a plausible-looking pile of HTML with no server and no
     database — and every file-level check still passed.
+
+    Phase N6 made it stack-aware without weakening it. The route assertion now
+    goes through `adapter.routes_from_source`, which is a strictly better
+    question than the `@app.route` substring it replaces on Flask: it is the
+    same parser the agent itself uses to decide what was built, so this check
+    and the project's own memory can no longer disagree.
     """
 
     def check(ctx: "CheckContext") -> tuple[bool, str]:
         workdir = Path(ctx.workdir)
-        entry = workdir / "app.py"
+        adapter = ctx.adapter
+        entry = _entry(ctx)
         if not entry.is_file():
             html = sorted(p.name for p in workdir.rglob("*.html"))[:4]
             return False, (
-                "no app.py — this build is static"
+                f"no {adapter.entry_file} — this build is static"
                 + (f" ({', '.join(html)})" if html else " and empty")
             )
         try:
             source = entry.read_text(encoding="utf-8", errors="replace")
         except Exception as e:  # pragma: no cover - unreadable file
-            return False, f"could not read app.py: {e}"
+            return False, f"could not read {adapter.entry_file}: {e}"
 
+        name = adapter.display_name
         missing = []
-        if "flask" not in source.lower():
-            missing.append("app.py does not import flask")
-        if "@app.route" not in source:
-            missing.append("app.py defines no route")
-        if not (workdir / "templates").is_dir():
-            missing.append("no templates/ directory")
+        if name.lower() not in source.lower():
+            missing.append(f"{adapter.entry_file} does not use {name}")
+        if not adapter.routes_from_source(source):
+            missing.append(f"{adapter.entry_file} defines no route")
+        if not (workdir / adapter.template_dir).is_dir():
+            missing.append(f"no {adapter.template_dir}/ directory")
         if missing:
             return False, "; ".join(missing)
-        return True, "flask app with routes and templates"
+        return True, f"{name.lower()} app with routes and templates"
 
     return check
 
@@ -500,31 +553,15 @@ def every_entity_has_a_table() -> Check:
     """
 
     def check(ctx: "CheckContext") -> tuple[bool, str]:
-        import sqlite3
-
         spec = _spec(ctx)
         if spec is None or not spec.entities:
             return False, "no project spec with entities"
-        dbs = sorted(Path(ctx.workdir).glob("*.db"))
-        if not dbs:
-            return False, f"no .db file for {len(spec.entities)} declared table(s)"
-
-        found: dict[str, set[str]] = {}
-        for path in dbs:
-            conn = sqlite3.connect(path)
-            try:
-                for entity in spec.entities:
-                    try:
-                        cols = {
-                            r[1]
-                            for r in conn.execute(f"PRAGMA table_info({entity.table})")
-                        }
-                    except Exception:
-                        cols = set()
-                    if cols:
-                        found.setdefault(entity.table, set()).update(cols)
-            finally:
-                conn.close()
+        found = ctx.adapter.table_columns(Path(ctx.workdir))
+        if found is None:
+            return False, (
+                f"could not read the database, so {len(spec.entities)} declared "
+                "table(s) are unproven"
+            )
 
         problems = []
         for entity in spec.entities:
@@ -641,12 +678,12 @@ def _browser_report(ctx: "CheckContext") -> _BrowserReport:
     report = _BrowserReport()
     if not browser_layer.available():
         report.error = browser_layer.install_hint()
-    elif not (Path(ctx.workdir) / "app.py").is_file():
-        report.error = "no app.py to run"
+    elif _no_entry(ctx):
+        report.error = _no_entry(ctx)
     else:
         runner = AppRunner()
         try:
-            ok, message = runner.start(ctx.workdir)
+            ok, message = _start(ctx, runner)
             if not ok:
                 report.error = f"app did not start: {message}"
             else:
@@ -886,14 +923,15 @@ def entities_are_usable(check_persistence: bool = True) -> Check:
         spec = _spec(ctx)
         if spec is None or not spec.entities:
             return False, "no project spec with entities"
-        if not (Path(ctx.workdir) / "app.py").is_file():
-            return False, "no app.py to run"
+        missing = _no_entry(ctx)
+        if missing:
+            return False, missing
 
         runner = AppRunner()
         problems: list[str] = []
         passed: list[str] = []
         try:
-            ok, message = runner.start(ctx.workdir)
+            ok, message = _start(ctx, runner)
             if not ok:
                 return False, f"app did not start: {message}"
             port = runner._port

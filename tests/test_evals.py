@@ -327,6 +327,7 @@ import textwrap
 
 from evals.checks import (
     _entity_routes,
+    app_serves,
     entities_are_usable,
     every_entity_has_a_table,
     is_full_stack_app,
@@ -536,3 +537,203 @@ def test_entities_are_usable_needs_a_spec_and_an_app(tmp_path):
     _write_spec(tmp_path, {"recipe": ("recipes", ["title"])})
     ok, detail = entities_are_usable()(_wctx(tmp_path))
     assert ok is False and "no app.py" in detail
+
+
+# ---------------------------------------------------------------------------
+# The same suite, either stack (Phase N6, docs/node-stack-plan.md)
+# ---------------------------------------------------------------------------
+#
+# The Phase E checks generalise for free because they name no table and no
+# route — they read the project's own spec. What did NOT generalise was how they
+# REACH the app: `workdir / "app.py"`, `import flask`, `templates/` and sqlite3
+# were written in directly, so on a Node project every one of them reported that
+# a working build was static.
+
+
+def _write_node_spec(workdir, tables=None):
+    """A `.coder/project.json` that says this project is a Node one.
+
+    The stack lives under the `stack` key, which is where `ProjectSpec.load`
+    reads it from — writing `language`/`backend` at the top level loads as a
+    spec with no stack at all, i.e. silently as Flask.
+    """
+    _write_spec(workdir, tables or {})
+    path = Path(workdir) / ".coder" / "project.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["stack"] = {"language": "node", "backend": "express"}
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_the_context_takes_its_stack_from_the_project_that_was_built(tmp_path):
+    _write_node_spec(tmp_path)
+    assert _wctx(tmp_path).adapter.key == "node"
+
+
+def test_a_project_with_no_spec_is_flask(tmp_path):
+    """Total, like `get_adapter`. Every existing single-stack task depends on
+    this: they have no spec until the build writes one."""
+    assert _wctx(tmp_path).adapter.key == "flask"
+
+
+def test_the_context_ignores_the_session_setting(tmp_path, monkeypatch):
+    """THE rule, and the same one `stacks.resolve_key` enforces everywhere else.
+
+    A check that trusted `settings.web_stack` would look for `app.py` in a Node
+    project the moment someone ran the suite with the default still on Flask,
+    and report "this build is static" about an Express app that works.
+    """
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "web_stack", "node")
+    assert _wctx(tmp_path).adapter.key == "flask"  # no spec: the PROJECT decides
+
+    _write_node_spec(tmp_path)
+    monkeypatch.setattr(settings, "web_stack", "flask")
+    assert _wctx(tmp_path).adapter.key == "node"
+
+
+def test_a_node_build_is_a_full_stack_app(tmp_path):
+    """The check that used to report every Express build as static HTML."""
+    _write_node_spec(tmp_path)
+    (tmp_path / "server.js").write_text(
+        'const express = require("express");\n'
+        "const app = express();\n"
+        'app.get("/", (req, res) => res.render("index"));\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "views").mkdir()
+
+    ok, detail = is_full_stack_app()(_wctx(tmp_path))
+
+    assert ok is True, detail
+    assert "express" in detail
+
+
+def test_a_node_build_with_no_routes_is_not_a_full_stack_app(tmp_path):
+    """Routes come from `adapter.routes_from_source` now — the same parser the
+    agent uses — so this check and the project's own memory cannot disagree."""
+    _write_node_spec(tmp_path)
+    (tmp_path / "server.js").write_text(
+        'const express = require("express");\nconst app = express();\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "views").mkdir()
+
+    ok, detail = is_full_stack_app()(_wctx(tmp_path))
+
+    assert ok is False and "no route" in detail
+
+
+def test_a_static_node_build_names_the_file_it_wanted(tmp_path):
+    _write_node_spec(tmp_path)
+    (tmp_path / "index.html").write_text("<html><body>hi</body></html>")
+
+    ok, detail = is_full_stack_app()(_wctx(tmp_path))
+
+    assert ok is False
+    assert "server.js" in detail and "static" in detail
+
+
+def test_the_schema_check_reads_the_database_through_the_adapter(tmp_path):
+    """Flask still reads the sqlite file — byte-identical behaviour — but now via
+    the seam, so the Node adapter can answer the same question of PostgreSQL."""
+    from app.agent.stacks.flask_adapter import FLASK
+
+    conn = sqlite3.connect(tmp_path / "app.db")
+    conn.execute("CREATE TABLE recipes (id INTEGER PRIMARY KEY, title TEXT)")
+    conn.commit()
+    conn.close()
+
+    found = FLASK.table_columns(tmp_path)
+    assert found is not None
+    assert found["recipes"] == {"id", "title"}
+
+
+def test_no_database_is_not_the_same_answer_as_no_tables(tmp_path):
+    """None means "could not read". Reporting that as an empty schema would turn
+    an environment problem into "the build created no tables"."""
+    from app.agent.stacks.flask_adapter import FLASK
+
+    assert FLASK.table_columns(tmp_path) is None
+
+    ok, detail = every_entity_has_a_table()(_wctx(tmp_path))
+    assert ok is False
+
+    _write_spec(tmp_path, {"recipe": ("recipes", ["title"])})
+    ok, detail = every_entity_has_a_table()(_wctx(tmp_path))
+    assert ok is False and "could not read the database" in detail
+
+
+def test_a_blocked_environment_fails_the_check_and_names_the_fix(tmp_path, monkeypatch):
+    """W10's rule, not a softening of it: a check that could not run still FAILS
+    — a suite scoring well without starting anything is worthless — but it says
+    which one command fixes it, exactly as a missing browser does."""
+    from app.agent.stacks.node_adapter import NODE
+
+    _write_node_spec(tmp_path, {"recipe": ("recipes", ["title"])})
+    (tmp_path / "server.js").write_text("// built\n", encoding="utf-8")
+    monkeypatch.setattr(
+        NODE, "readiness", lambda root: "`node_modules` is missing — run `npm install`"
+    )
+
+    ok, detail = app_serves(["/"])(_wctx(tmp_path))
+
+    assert ok is False
+    assert "npm install" in detail
+
+
+def test_flask_never_pays_for_the_readiness_gate(tmp_path):
+    """Flask returns "" always, so nothing that used to run is now gated."""
+    from app.agent.stacks.flask_adapter import FLASK
+
+    assert FLASK.readiness(tmp_path) == ""
+
+
+# --- the prepare hook -------------------------------------------------------
+
+
+async def test_prepare_runs_before_the_checks_and_is_reported(tmp_path, monkeypatch):
+    """`npm install` is the one thing a generated project may need that Coder
+    deliberately will not do. A run that installed nothing must say so."""
+    seen = []
+
+    async def fake_chat(prompt, **kw):
+        Path("built.txt").write_text("x", encoding="utf-8")
+        return "done", []
+
+    agent = SimpleNamespace(chat=fake_chat)
+    task = EvalTask(id="t", prompt="build", checks=[file_exists("built.txt")])
+
+    result = await run_task(
+        agent,
+        task,
+        workdir=tmp_path / "t",
+        prepare=lambda w: seen.append(w) or "npm install completed",
+    )
+
+    assert result.passed is True
+    assert seen == [tmp_path / "t"]
+    assert any("npm install completed" in d for d in result.details)
+
+
+async def test_a_failing_prepare_never_aborts_the_task(tmp_path):
+    async def fake_chat(prompt, **kw):
+        Path("built.txt").write_text("x", encoding="utf-8")
+        return "done", []
+
+    def explode(workdir):
+        raise RuntimeError("npm exploded")
+
+    agent = SimpleNamespace(chat=fake_chat)
+    task = EvalTask(id="t", prompt="build", checks=[file_exists("built.txt")])
+
+    result = await run_task(agent, task, workdir=tmp_path / "t", prepare=explode)
+
+    assert result.passed is True  # the build was still measured
+    assert any("npm exploded" in d for d in result.details)
+
+
+def test_the_installer_declines_a_project_with_nothing_to_install(tmp_path):
+    from evals.run import _npm_installer
+
+    assert "no package.json" in _npm_installer()(tmp_path)

@@ -179,6 +179,45 @@ class FlaskAdapter:
         """
         return ""
 
+    def table_columns(self, root: Path) -> dict[str, set[str]] | None:
+        """What the database REALLY has: `{table: {column, ...}}`, or None.
+
+        Phase N6. "A `CREATE TABLE` in a file nobody executes proves nothing" is
+        the rule the eval suite's schema checks are built on, and answering it
+        means asking the database — which is a per-stack question, so it lives
+        here rather than in `evals/`.
+
+        None means *could not read*, which is not the same answer as "no tables"
+        and must not be reported as one.
+        """
+        import sqlite3
+
+        files = sorted(Path(root).glob("*.db"))
+        if not files:
+            return None
+        found: dict[str, set[str]] = {}
+        for path in files:
+            try:
+                conn = sqlite3.connect(path)
+            except Exception:
+                continue
+            try:
+                tables = [
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                ]
+                for table in tables:
+                    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+                    if cols:
+                        found.setdefault(table, set()).update(cols)
+            except Exception:
+                logger.debug("could not read %s", path.name, exc_info=True)
+            finally:
+                conn.close()
+        return found
+
     def run_command(self, entry: str | Path) -> list[str]:
         """How to start the generated app.
 

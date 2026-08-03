@@ -187,8 +187,16 @@ def test_db_has_column_asks_the_database_not_the_source(tmp_path):
 
 
 def test_db_has_column_without_a_database(tmp_path):
+    """Still a failure, and it still names the column it could not prove.
+
+    The wording stopped saying "no .db file" in Phase N6: the check reads the
+    database through `adapter.table_columns` now, and a sqlite filename is the
+    wrong thing to name when the same assertion is being made of PostgreSQL.
+    """
     ok, detail = db_has_column("products", "title")(_ctx(tmp_path))
-    assert not ok and "no .db file" in detail
+    assert not ok
+    assert "could not read the database" in detail
+    assert "products.title" in detail
 
 
 _TINY_APP = """

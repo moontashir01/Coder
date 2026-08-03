@@ -46,6 +46,34 @@ class CheckContext:
     # launches and five Chromium starts for one task. Filled in by
     # `evals.checks._browser_report`, which is the only thing that reads it.
     browser: object | None = None
+    _adapter: object | None = field(default=None, repr=False)
+
+    @property
+    def adapter(self):
+        """The stack adapter for the project that was actually BUILT (Phase N6).
+
+        Read off the project's own `.coder/project.json`, not off
+        `settings.web_stack` — the same precedence `stacks.resolve_key` gives
+        every other caller, and for the same reason. A check that trusted the
+        session setting would look for `app.py` in a Node project the moment
+        someone ran the suite with the default still on Flask, and report "this
+        build is static" about an Express app that works.
+
+        Resolved once per task and cached: every check that starts the app asks
+        for it, and re-reading the spec per check would be the `_browser_report`
+        memo problem again. Total, like `get_adapter` — no spec means Flask,
+        which is exactly what every existing single-stack task expects.
+        """
+        if self._adapter is None:
+            from app.agent.projectspec import ProjectSpec
+            from app.agent.stacks import get_adapter, resolve_key
+
+            try:
+                spec = ProjectSpec.load(self.workdir)
+            except Exception:  # noqa: BLE001 — a check must never die on this
+                spec = None
+            self._adapter = get_adapter(resolve_key(spec, ""))
+        return self._adapter
 
 
 @dataclass
@@ -84,7 +112,7 @@ class SuiteReport:
         return "\n".join(lines)
 
 
-async def run_task(agent, task: EvalTask, workdir: Path) -> TaskResult:
+async def run_task(agent, task: EvalTask, workdir: Path, prepare=None) -> TaskResult:
     """Run one task in ``workdir`` (cwd is switched for the call, then restored).
 
     A multi-turn task runs every prompt against **one** workdir with **one**
@@ -95,6 +123,13 @@ async def run_task(agent, task: EvalTask, workdir: Path) -> TaskResult:
     Any exception from the agent is caught and recorded as a failure so one bad
     task never aborts the suite — and a turn that raises stops the conversation,
     since every later turn would be measuring the wrong thing.
+
+    ``prepare(workdir) -> str`` runs after the build and before the checks, for
+    the one thing a generated project may need that Coder deliberately will not
+    do for you: `npm install` (Phase N6). It is a hook rather than a step
+    because it needs the network, so it must stay something the caller opts into
+    — the same shape as Playwright's Chromium. Its note is recorded in the
+    details either way, so a run that installed nothing says so.
     """
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -119,6 +154,13 @@ async def run_task(agent, task: EvalTask, workdir: Path) -> TaskResult:
 
     ctx = CheckContext(answer=answer, trace=trace, workdir=workdir, answers=answers)
     details: list[str] = []
+    if prepare is not None:
+        try:
+            note = prepare(workdir)
+        except Exception as e:  # noqa: BLE001 — preparation never aborts a task
+            note = f"{type(e).__name__}: {e}"
+        if note:
+            details.append(f"prepare: {note}")
     passed = True
     for check in task.checks:
         ok, detail = check(ctx)
@@ -127,10 +169,14 @@ async def run_task(agent, task: EvalTask, workdir: Path) -> TaskResult:
     return TaskResult(task_id=task.id, passed=passed, details=details)
 
 
-async def run_suite(agent, tasks: list[EvalTask], base_dir: Path) -> SuiteReport:
+async def run_suite(
+    agent, tasks: list[EvalTask], base_dir: Path, prepare=None
+) -> SuiteReport:
     """Run every task in its own subdir of ``base_dir`` and score the suite."""
     base_dir = Path(base_dir)
     results: list[TaskResult] = []
     for task in tasks:
-        results.append(await run_task(agent, task, workdir=base_dir / task.id))
+        results.append(
+            await run_task(agent, task, workdir=base_dir / task.id, prepare=prepare)
+        )
     return SuiteReport(results=results)

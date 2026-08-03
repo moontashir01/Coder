@@ -577,6 +577,84 @@ client
         except OSError:
             return False
 
+    # Phase N6, and N5's probe reused wholesale — same transport (`node -e` with
+    # the project's own `pg`), same connection string (the project's own db.js),
+    # same "say nothing rather than guess" failure mode. Reading the schema with
+    # a *different* connection than the one the app uses would be measuring a
+    # different database, which is the trap `database_reason` already avoids.
+    _SCHEMA_SCRIPT = """
+"use strict";
+function say(o) { console.log("CODER_SCHEMA " + JSON.stringify(o)); }
+let url = process.env.DATABASE_URL || "";
+let present = true;
+try { require.resolve("./db"); } catch (e) { present = false; }
+if (present) { try { url = require("./db").DATABASE_URL || url; } catch (e) {} }
+if (!url) { process.exit(2); }
+let pg;
+try { pg = require("pg"); } catch (e) { process.exit(2); }
+const client = new pg.Client({
+  connectionString: url,
+  connectionTimeoutMillis: TIMEOUT_MS,
+});
+client
+  .connect()
+  .then(function () {
+    return client.query(
+      "SELECT table_name, column_name FROM information_schema.columns " +
+      "WHERE table_schema = 'public'"
+    );
+  })
+  .then(function (res) {
+    const out = {};
+    for (const row of res.rows) {
+      (out[row.table_name] = out[row.table_name] || []).push(row.column_name);
+    }
+    say(out);
+    process.exit(0);
+  })
+  .catch(function (e) { process.exit(1); });
+"""
+
+    def table_columns(self, root: Path) -> dict[str, set[str]] | None:
+        """What PostgreSQL REALLY has: `{table: {column, ...}}`, or None.
+
+        The Flask adapter answers this from the sqlite file; there is no file
+        here, so it is a query — run the same way `database_reason` runs its
+        `SELECT 1`, for the same reason.
+
+        None means *could not read* and is never the same answer as "no tables":
+        reporting an unreachable database as an empty schema would turn an
+        environment problem into "the build created no tables", which is the
+        exact misattribution this whole gate exists to prevent.
+        """
+        import json
+        import subprocess
+
+        timeout = max(1.0, float(getattr(settings, "db_probe_timeout", 6.0)))
+        script = self._SCHEMA_SCRIPT.replace("TIMEOUT_MS", str(int(timeout * 1000)))
+        try:
+            proc = subprocess.run(
+                ["node", "-e", script],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=timeout + 3.0,
+            )
+        except Exception:
+            logger.debug("schema read did not run", exc_info=True)
+            return None
+
+        for line in (proc.stdout or "").splitlines():
+            if line.startswith("CODER_SCHEMA "):
+                try:
+                    payload = json.loads(line[len("CODER_SCHEMA ") :])
+                except ValueError:
+                    return None
+                if not isinstance(payload, dict):
+                    return None
+                return {str(t): set(map(str, c or ())) for t, c in payload.items()}
+        return None
+
     def run_command(self, entry: str | Path) -> list[str]:
         return ["node", Path(entry).name]
 

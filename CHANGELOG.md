@@ -8,7 +8,7 @@ All notable changes to Coder are documented here. The format follows
 
 ### Added
 - **A second stack: Node + Express + EJS + PostgreSQL** (`docs/node-stack-plan.md`,
-  phases N0–N5). `/stack` shows which stack a build targets and switches it;
+  phases N0–N6). `/stack` shows which stack a build targets and switches it;
   `/stack node` scaffolds a runnable Express app — routes, a connection pool,
   the same component stylesheet and theme file the Flask stack ships, and a
   layout every view is wrapped by — before a single line is generated. The
@@ -45,6 +45,13 @@ All notable changes to Coder are documented here. The format follows
   `db.js` that will not load, which is a defect in the code rather than the
   environment — leaves the smoke test running, because a check that was skipped
   must never read like one that passed.
+  The eval suite measures either stack: `python -m evals.run --webapp --stack
+  node` runs the same tasks against a Node build, asking the same questions
+  through the project's own spec rather than through anything the task author
+  hard-coded. Where the environment can't answer — a generated Node project has
+  no `node_modules` until someone runs `npm install`, which needs the network —
+  the checks **fail naming that command** instead of quietly skipping, and
+  `--npm-install` lets the eval runner (never Coder) do it.
 - **Generated sites now come with a design system, and Coder can look at them**
   (`docs/web-quality-plan.md`). Every build ships a real component stylesheet and
   a Jinja macro library, and the style you ask for is *written* into
