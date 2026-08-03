@@ -4,8 +4,7 @@
 Flask/Jinja2/sqlite3 stack or a new Node/Express/PostgreSQL one — with the Flask
 path's *behaviour* provably unchanged.
 
-**Status:** **N0–N4 are implemented.** N5 shipped early in cut-down form (see
-deviation 3 below); N6 is still plan only.
+**Status:** **N0–N5 are implemented.** N6 is still plan only.
 **Predecessor:** `docs/web-quality-plan.md` (W1–W10).
 
 > ### What shipped, and what that leaves
@@ -77,6 +76,49 @@ deviation 3 below); N6 is still plan only.
 > unrecognised route shape unvalidated rather than reported wrongly; and there is
 > no template-scoped editing, so an edit to a view is a whole-file edit.
 >
+> **N5 — the readiness gate, now complete.** The cheap two-thirds shipped early
+> with N2 (node on PATH, `node_modules` present, something listening on 5432).
+> N5 adds the half that needed a real connection: **`SELECT 1`**, via
+> `NodeAdapter.database_reason`.
+>
+> A socket to 5432 proves *a* server is listening; it does not prove that this
+> project's database exists or that its credentials work, and both of those fail
+> inside `initDb()`, which the generated app treats as fatal. So the failure that
+> N5 exists to name — "PostgreSQL is running, but the database `demo_shop` does
+> not exist — create it once with `createdb demo_shop`" — used to surface as *the
+> smoke test failed*, sending the repair loop after code that was already correct.
+>
+> The probe runs through **`node` and the project's own `pg`**, not a Python
+> driver: `node_modules` is already established by the time it runs, `pg` is the
+> project's own dependency, and it needs nothing installed on the Python side —
+> the same reasoning that chose `crypto.scrypt` for `passwords.js`. It reads the
+> connection string out of the project's own `db.js`, because a probe that
+> guessed its own URL would be measuring something other than what has to work.
+>
+> Three rules, all inherited:
+>
+> 1. **Every uncertainty resolves to "run the check."** No node, no URL, a crash,
+>    a timeout, unparseable output — all mean "could not find out". Skipping is
+>    only correct when we KNOW the environment is at fault.
+> 2. **A `db.js` that will not load is a CODE defect and never an environment
+>    one**, or the gate would suppress the only check that reports it. An
+>    *absent* `db.js` (an adopted repo may configure the URL elsewhere) is told
+>    apart from a *broken* one rather than collapsed with it — collapsing them
+>    made the rule hold only by accident, and it broke as soon as `DATABASE_URL`
+>    was set in the environment.
+> 3. **`node --check` on the probe script is not ceremony.** A syntax error there
+>    fails silently and in the worst direction: the probe returns nothing, that
+>    reads as "cannot tell", and every readiness check reports a clean
+>    environment forever. `pageaudit.py` learned this the expensive way.
+>
+> `/run` consults the gate too, so a missing database is named *before* launching
+> instead of being relayed as "server.js exited on startup".
+>
+> **What N5 does NOT close:** `npm install` still needs the network once, and
+> Coder will not run it for you — that stays a reported hint, exactly as
+> Playwright's Chromium does in W4. The build is offline; *running* a Node
+> project is not, and those are different claims.
+>
 > **Four deliberate deviations from the plan text below**, each because the
 > plan's shape did not survive contact:
 >
@@ -88,11 +130,12 @@ deviation 3 below); N6 is still plan only.
 > 2. **`restore_invariants` / `write_migrations` are split up.** The
 >    orchestration is async and writes through `executor.execute` (approval
 >    gate, backup, `/undo`), so only the decisions moved behind the protocol.
-> 3. **A cut-down N5 shipped early.** `adapter.readiness(root)` checks node,
->    `node_modules` and a socket to Postgres, and the smoke test is *skipped and
->    reported* rather than failed when one is missing. Without it, `npm install`
->    never having run would send the repair loop to rewrite correct code. The
->    `SELECT 1` half is still N5's.
+> 3. **N5 shipped in two parts rather than one phase.** The cheap two-thirds
+>    (`adapter.readiness(root)`: node, `node_modules`, a socket to Postgres)
+>    landed with N2, because without it `npm install` never having run would send
+>    the repair loop to rewrite correct code. The `SELECT 1` half landed as N5
+>    proper — see the N5 note above. The split was worth it: the early two-thirds
+>    were what made a Node build reportable at all, and they cost nothing.
 > 4. **`passwords.js` is written too.** `crud.py` leans on `werkzeug.security`,
 >    which ships with Flask; Node has no equivalent, and `bcrypt` means a native
 >    build on a machine whose point is that it works offline. Node's own

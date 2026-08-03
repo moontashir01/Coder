@@ -221,6 +221,15 @@ class Settings(BaseSettings):
     blueprint_smoke_test: bool = True
     smoke_test_timeout: float = 8.0
     max_smoke_repairs: int = 1
+    # Phase N5 (docs/node-stack-plan.md): seconds the `SELECT 1` readiness probe
+    # may take on the Node stack. It runs `node -e` against the project's own
+    # `pg` and its own DATABASE_URL, so it costs a subprocess — and it is the
+    # difference between "something is listening on 5432" and "this app can
+    # actually reach its database". Bounded because an unreachable host can hang
+    # far longer than a refused connection; on timeout the probe reports nothing
+    # and the smoke test RUNS, because a check we could not complete must never
+    # gate the real measurement. Flask never reaches this (sqlite has no daemon).
+    db_probe_timeout: float = 6.0
     # Phase W4 (docs/web-quality-plan.md): render generated pages in a real
     # headless browser, so layout, CSS and JS can be observed at all — every
     # check before this one reads bytes (`smoke.py` is urllib), which is why a

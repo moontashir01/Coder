@@ -21,7 +21,7 @@ unpushed-and-irreplaceable sitting here now.
 | N2 — Node scaffold | **Done.** `app/resources/scaffolds/node/` |
 | N3 — data layer + PostgreSQL | **Done.** `app/agent/crud_node.py` |
 | N4 — verification for Node | **Done, tested and documented.** |
-| N5 — readiness gate | Cut-down version shipped; the `SELECT 1` half is open |
+| N5 — readiness gate | **Done.** `SELECT 1` via `NodeAdapter.database_reason` |
 | N6 — tests and evals | Not started |
 
 ## What N4 shipped
@@ -47,25 +47,40 @@ All four are implemented **and pinned by tests** (they were not, before):
 code — the list had gone stale claiming N4's three landed features were missing,
 and `/stack` prints it verbatim.
 
+## What N5 shipped
+
+`NodeAdapter.database_reason` runs a real `SELECT 1` through **`node` and the
+project's own `pg`**, using the connection string out of the project's own
+`db.js`. So "the database does not exist" is now named, with the `createdb`
+command, instead of arriving as a failed smoke test. `/run` consults it too.
+
+Three rules to keep if you touch it:
+
+- **Uncertainty resolves to `""` — run the check.** A probe that could not
+  complete must never replace the smoke test.
+- **A `db.js` that will not load is a CODE defect**, so it reports "cannot tell",
+  not "your environment is broken". The probe tells an *absent* db.js apart from
+  a *broken* one deliberately; collapsing them made the rule hold only by
+  accident, and it broke as soon as `DATABASE_URL` was set.
+- **`node --check` the probe script.** A syntax error there is invisible — the
+  probe returns nothing, that reads as "cannot tell", and readiness reports a
+  clean environment forever. There is a test for exactly this.
+
 ## What is LEFT
 
-1. **N5's remaining half.** `adapter.readiness(root)` checks node,
-   `node_modules` and a *socket* to Postgres. It does not run `SELECT 1`, so a
-   wrong database name or bad credentials still surfaces as a failed start
-   rather than as a named cause. Needs a driver, which is the reason it was cut.
-2. **N6 — evals.** Parametrise the existing web evals over both stacks. The
+1. **N6 — evals.** Parametrise the existing web evals over both stacks. The
    Phase E checks (`is_full_stack_app`, `every_entity_has_a_table`,
    `entities_are_usable`) name no table and no route — they read the project's
    own spec — so they should generalise for free. That is the highest-value
    existing asset for this work.
-3. **A real PostgreSQL has still never run the generated SQL.**
+2. **A real PostgreSQL has still never run the generated SQL.**
    `tests/test_crud_node.py` has that tier, gated on `psycopg` +
    `CODER_TEST_DATABASE_URL`. It **skips loudly** — do not make it pass quietly.
-4. **Node's remaining gaps are real**, listed in `NodeAdapter.gaps` and printed
+3. **Node's remaining gaps are real**, listed in `NodeAdapter.gaps` and printed
    by `/stack`: no import repair, no template-scoped editing, an import
    dependency graph that stays Python-only, and routes read by regex rather than
    by a parser. Flask stays the default because of them.
-5. **Two more stage-0 passes are still `.html`-only, and should probably take
+4. **Two more stage-0 passes are still `.html`-only, and should probably take
    the adapter's `template_ext` the way `_check_endpoints` now does.** Found
    while wiring N4's link check; deliberately NOT changed here, because they are
    separate features and were not part of N4's scope. Both fail silently on a

@@ -670,13 +670,13 @@ fifth and `[sys.executable, "seed.py"]` at a sixth; those all read
     and fastapi still derive nothing, because there the file layout is the
     model's own and a guessed filename is a file nothing serves.
 - **`adapter.readiness(root)` skips the smoke test rather than failing it.**
-  Node + Postgres has three ways to be un-runnable where Flask has one (no node,
-  no `node_modules`, nothing listening on 5432), and none of them is a defect in
+  Node + Postgres has four ways to be un-runnable where Flask has one (no node,
+  no `node_modules`, nothing listening on 5432, and a database that does not
+  exist or will not take the credentials), and none of them is a defect in
   the generated code — without this, `_smoke_repair_instruction` sends the model
   to rewrite correct code because `npm install` was never run. **The skip is
   reported as `may not meet:`, never as a pass.** Flask returns `""` always, so
-  no check that used to run is now gated. The `SELECT 1` half (does the *database*
-  exist, do the credentials work) is still Phase N5's.
+  no check that used to run is now gated.
 - **The generated Express app exits non-zero when `initDb()` fails.** Starting
   anyway would serve `/` with a 200 while every data page 500s — a build that
   reports success and is broken, which is the one failure this codebase exists to
@@ -741,6 +741,53 @@ of them the Flask equivalent restated rather than reinvented:
   back into `views/products.ejs`. Every D1 rule still holds: it **declines**
   without a real route, so a plain JS folder never acquires an invented contract;
   it records only what it can SEE; and it **saves nothing**.
+
+**Proving the database, not just the port (Phase N5, `NodeAdapter.database_reason`).**
+A socket to 5432 proves *a* server is listening. It does not prove that **this
+project's** database exists or that its credentials work — and both fail inside
+`initDb()`, which the generated app treats as fatal. Before N5 that surfaced as
+"the smoke test failed", for a reason that is not in the code at all.
+
+- **The probe runs through `node` and the project's own `pg`, not a Python
+  driver.** `node_modules` has already been established by the time it runs, `pg`
+  is the project's own dependency, and this needs nothing installed on the Python
+  side — the same reasoning that makes `crypto.scrypt` the password helper. It is
+  a `node -e` string, not a file written into the project: readiness is a READ,
+  and dropping a script into someone's repo to answer a question about it is the
+  side effect `from_disk` refuses to have. `require` resolves from cwd under
+  `-e`, which is why the subprocess runs with `cwd=root`.
+- **It reads the connection string out of the project's own `db.js`.** A probe
+  that guessed its own URL could pass while the app fails, or fail while the app
+  works — either way it would be measuring something other than the thing that
+  has to work.
+- **Every uncertainty resolves to `""` — run the check.** No `node`, no URL to
+  try, a crash, a timeout, unparseable output: all of them mean "we could not
+  find out", and skipping is only correct when we KNOW the environment is at
+  fault. The smoke test is the real measurement; a probe that could not complete
+  must never replace it.
+- **A `db.js` that will not load is a CODE defect and must never read as an
+  environment one** — reporting it here would skip the only check that can
+  report it. The probe therefore tells an *absent* `db.js` (fine: an adopted repo
+  may configure the URL elsewhere, so fall through to `DATABASE_URL`) apart from
+  a *broken* one (`CODER_BAD_DBJS` → "cannot tell"), instead of collapsing both
+  into one try/except. Collapsing them made the rule hold only by accident —
+  it broke the moment `DATABASE_URL` was set in the environment.
+- **The SQLSTATEs are the whole point of the phase**: `3D000` (invalid_catalog_name)
+  becomes "the database *X* does not exist — create it once with `createdb X`",
+  `28P01`/`28000` become a credentials message, and an unrecognised code is still
+  *reported* rather than swallowed. `tests/test_crud_node.py` has a live tier
+  asserting PostgreSQL really emits `3D000` for a missing database — the offline
+  tests drive a fake `pg`, so they prove the handling, not that assumption.
+- **`node --check` on `_PROBE_SCRIPT` is not ceremony** (`pageaudit.py`'s lesson):
+  a syntax error there fails silently and in the worst direction — the probe
+  returns None, that reads as "cannot tell", and every readiness check reports a
+  clean environment forever.
+- Ordered cheapest-first, and each step is a precondition of the next: the
+  subprocess runs only once node, `node_modules` and the port have all passed.
+  Bounded by `settings.db_probe_timeout` (6s), because an unreachable host hangs
+  far longer than a refused connection.
+- **`/run` consults it too** (`app/cli/commands.py`), so a missing database is
+  named *before* launching rather than relayed as "server.js exited on startup".
 
 ### Forcing the stack (`app/agent/runtime_probe.py`, `settings.web_stack`)
 

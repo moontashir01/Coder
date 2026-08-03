@@ -8,7 +8,7 @@ All notable changes to Coder are documented here. The format follows
 
 ### Added
 - **A second stack: Node + Express + EJS + PostgreSQL** (`docs/node-stack-plan.md`,
-  phases N0–N4). `/stack` shows which stack a build targets and switches it;
+  phases N0–N5). `/stack` shows which stack a build targets and switches it;
   `/stack node` scaffolds a runnable Express app — routes, a connection pool,
   the same component stylesheet and theme file the Flask stack ships, and a
   layout every view is wrapped by — before a single line is generated. The
@@ -34,6 +34,17 @@ All notable changes to Coder are documented here. The format follows
   Node's stops at the templates, and Node's routes are read with a regex rather
   than a parser. Flask stays the default. When Node, `npm install` or PostgreSQL
   is missing the smoke test is **skipped and reported**, never quietly passed.
+  That last check now goes all the way to the database: Coder runs a real
+  `SELECT 1` over the project's own connection string before it trusts anything,
+  so "PostgreSQL is running, but the database `demo_shop` does not exist —
+  create it once with `createdb demo_shop`" replaces what used to arrive as a
+  failed smoke test and a model sent to rewrite code that was already correct.
+  Rejected credentials and an unreachable server are named the same way, and
+  `/run` says it before launching instead of relaying whatever the driver
+  printed on the way down. Anything the probe cannot determine — including a
+  `db.js` that will not load, which is a defect in the code rather than the
+  environment — leaves the smoke test running, because a check that was skipped
+  must never read like one that passed.
 - **Generated sites now come with a design system, and Coder can look at them**
   (`docs/web-quality-plan.md`). Every build ships a real component stylesheet and
   a Jinja macro library, and the style you ask for is *written* into

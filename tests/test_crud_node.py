@@ -18,6 +18,7 @@ schemas from one spec.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import textwrap
@@ -505,3 +506,34 @@ def test_generated_ddl_executes_on_real_postgres():
         conn.rollback()
     finally:
         conn.close()
+
+
+def test_a_missing_database_really_reports_sqlstate_3d000():
+    """Phase N5 keys its clearest message off this exact code.
+
+    The offline readiness tests drive a FAKE `pg` that raises `3D000`, so they
+    prove how the adapter HANDLES the code — not that PostgreSQL really emits it
+    when the database is absent. That assumption is the one thing only a live
+    server can settle, and getting it wrong would leave the "create it with
+    `createdb x`" message permanently unreachable while every test passed.
+    """
+    psycopg = pytest.importorskip("psycopg", reason="psycopg is not installed")
+    dsn = os.environ.get("CODER_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip(
+            "set CODER_TEST_DATABASE_URL to confirm the SQLSTATE Phase N5 keys "
+            "its 'database does not exist' message off"
+        )
+    # Same server, a database nobody has created.
+    absent = re.sub(
+        r"/[^/?]*(\?|$)", "/coder_definitely_not_a_database\\1", dsn, count=1
+    )
+    try:
+        psycopg.connect(absent, connect_timeout=3).close()
+    except psycopg.OperationalError as exc:
+        assert getattr(exc, "sqlstate", None) == "3D000", (
+            f"expected invalid_catalog_name, got {getattr(exc, 'sqlstate', None)!r}: "
+            f"{exc}"
+        )
+    else:  # pragma: no cover - only if that database really exists
+        pytest.skip("coder_definitely_not_a_database exists on this server")

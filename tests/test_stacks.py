@@ -15,6 +15,8 @@ first kind matters more:
 All offline: a scaffold copy, some string parsing, and `tmp_path`.
 """
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -518,7 +520,259 @@ def test_node_readiness_names_each_missing_piece(tmp_path, monkeypatch):
     assert "PostgreSQL" in NODE.readiness(tmp_path)
 
     monkeypatch.setattr(NODE, "_postgres_listening", lambda: True)
+    monkeypatch.setattr(NODE, "database_reason", lambda root: "")
     assert NODE.readiness(tmp_path) == ""
+
+
+# ---------------------------------------------------------------------------
+# Phase N5 — proving the database, not just the port
+# ---------------------------------------------------------------------------
+#
+# A socket to 5432 proves a server is listening. It does not prove that THIS
+# project's database exists or that its credentials work — and both of those
+# fail inside `initDb()`, which the generated app treats as fatal. Without this
+# half, a build reports "the smoke test failed" for a reason that is not in the
+# code at all, and the repair loop is sent to rewrite something correct.
+
+# A stand-in for the `pg` package. The probe requires the PROJECT's pg, so a
+# fake one is enough to drive every branch without a database anywhere.
+_PG_OK = """
+class Client {
+  constructor(cfg) { this.cfg = cfg; }
+  connect() { return Promise.resolve(); }
+  query() { return Promise.resolve({ rows: [{ "?column?": 1 }] }); }
+  end() { return Promise.resolve(); }
+}
+module.exports = { Client };
+"""
+
+
+def _pg_failing(code, message):
+    return f"""
+class Client {{
+  constructor(cfg) {{ this.cfg = cfg; }}
+  connect() {{
+    const e = new Error({message!r});
+    e.code = {code!r};
+    return Promise.reject(e);
+  }}
+  query() {{ return Promise.resolve(); }}
+  end() {{ return Promise.resolve(); }}
+}}
+module.exports = {{ Client }};
+"""
+
+
+@pytest.fixture
+def node_project(tmp_path):
+    """A project root with `node_modules` and a db.js, ready to take a fake pg."""
+
+    def build(pg_source=_PG_OK, db_source=None, database="demo_shop"):
+        if db_source is None and database:
+            db_source = (
+                "module.exports = { DATABASE_URL: "
+                f'"postgres://postgres:postgres@localhost:5432/{database}" }};\n'
+            )
+        modules = tmp_path / "node_modules"
+        modules.mkdir(exist_ok=True)
+        if pg_source is not None:
+            pg = modules / "pg"
+            pg.mkdir(exist_ok=True)
+            (pg / "package.json").write_text(
+                '{"name":"pg","version":"8.0.0","main":"index.js"}', encoding="utf-8"
+            )
+            (pg / "index.js").write_text(pg_source, encoding="utf-8")
+        if db_source:
+            (tmp_path / "db.js").write_text(db_source, encoding="utf-8")
+        return tmp_path
+
+    return build
+
+
+needs_node = pytest.mark.skipif(
+    shutil.which("node") is None, reason="node is not installed"
+)
+
+
+@needs_node
+def test_the_probe_script_is_valid_javascript(tmp_path):
+    """Not ceremony — `pageaudit.py` learned this the expensive way.
+
+    A syntax error in the probe fails in the WORST direction: `_probe_database`
+    swallows it, returns None, `database_reason` reads None as "cannot tell",
+    and every readiness check then reports a clean environment. The check would
+    be gone and nothing would say so.
+    """
+    script = tmp_path / "probe.js"
+    script.write_text(
+        NODE._PROBE_SCRIPT.replace("TIMEOUT_MS", "5000"), encoding="utf-8"
+    )
+    proc = subprocess.run(
+        ["node", "--check", str(script)], capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+@needs_node
+def test_a_reachable_database_blocks_nothing(node_project):
+    assert NODE.database_reason(node_project()) == ""
+
+
+@needs_node
+def test_a_missing_database_is_named_with_the_command_that_creates_it(node_project):
+    """`3D000` is invalid_catalog_name. This is THE case N5 exists for: the
+    server is up, the port answers, and the app still cannot start."""
+    root = node_project(
+        _pg_failing("3D000", 'database "demo_shop" does not exist'),
+        database="demo_shop",
+    )
+    reason = NODE.database_reason(root)
+    assert "demo_shop" in reason
+    assert "createdb demo_shop" in reason
+
+
+@needs_node
+@pytest.mark.parametrize("code", ["28P01", "28000"])
+def test_rejected_credentials_are_reported_as_credentials(node_project, code):
+    root = node_project(_pg_failing(code, "password authentication failed"))
+    assert "credentials" in NODE.database_reason(root)
+
+
+@needs_node
+def test_an_unreachable_server_names_the_endpoint(node_project):
+    root = node_project(_pg_failing("ECONNREFUSED", "connect ECONNREFUSED"))
+    reason = NODE.database_reason(root)
+    assert "localhost:5432" in reason and "ECONNREFUSED" in reason
+
+
+@needs_node
+def test_a_missing_pg_package_asks_for_npm_install(node_project):
+    """`node_modules` exists but the dependency is not in it — a half-finished
+    install, which is not the same failure as never having run one."""
+    root = node_project(pg_source=None)
+    assert "npm install" in NODE.database_reason(root)
+
+
+@needs_node
+def test_an_unrecognised_failure_is_reported_rather_than_swallowed(node_project):
+    """An unknown SQLSTATE must still reach the user. Silence here would be a
+    skipped check reading as a passing one."""
+    root = node_project(_pg_failing("53300", "too many clients already"))
+    reason = NODE.database_reason(root)
+    assert reason and "too many clients already" in reason
+
+
+# --- the rule that protects the smoke test ---------------------------------
+
+
+@needs_node
+def test_a_db_js_that_will_not_load_is_never_an_environment_problem(
+    node_project, monkeypatch
+):
+    """THE load-bearing rule of this phase.
+
+    A `db.js` that throws is a defect in the generated CODE. Reporting it here
+    would skip the smoke test — the only check that can report it — and the turn
+    would end saying the environment was at fault. It must read as "cannot tell"
+    even when DATABASE_URL is set, which is why the probe tells an absent db.js
+    apart from a broken one instead of collapsing both into one try/except.
+    """
+    monkeypatch.setenv("DATABASE_URL", "postgres://u:p@localhost:5432/fromenv")
+    root = node_project(db_source="this is not ( valid javascript\n")
+    assert NODE._probe_database(root) is None
+    assert NODE.database_reason(root) == ""
+
+
+@needs_node
+def test_an_absent_db_js_still_probes_the_environment_url(node_project, monkeypatch):
+    """Absent is not broken: an adopted repo may configure the URL elsewhere, so
+    the probe falls through to DATABASE_URL rather than giving up."""
+    monkeypatch.setenv("DATABASE_URL", "postgres://u:p@localhost:5432/fromenv")
+    root = node_project(
+        _pg_failing("3D000", "no such database"), db_source="", database=""
+    )
+    assert "fromenv" in NODE.database_reason(root)
+
+
+@needs_node
+def test_no_connection_string_anywhere_reports_nothing(node_project, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    root = node_project(db_source="", database="")
+    assert NODE.database_reason(root) == ""
+
+
+def test_a_probe_that_cannot_run_never_gates_the_smoke_test(tmp_path, monkeypatch):
+    """Every uncertainty resolves to "run the check". Skipping is only correct
+    when we KNOW the environment is at fault; the smoke test is the real
+    measurement and a probe we could not complete must not replace it."""
+    monkeypatch.setattr(NODE, "_probe_database", lambda root: None)
+    assert NODE.database_reason(tmp_path) == ""
+
+
+def test_a_probe_timeout_is_not_a_verdict(tmp_path, monkeypatch):
+    """A hung server must not turn into "your database is fine" OR into a
+    fabricated fault — `_probe_database` returns None and the check runs."""
+
+    def explode(*a, **kw):
+        raise subprocess.TimeoutExpired(cmd="node", timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", explode)
+    assert NODE._probe_database(tmp_path) is None
+
+
+def test_the_probe_runs_in_the_project_and_is_bounded(tmp_path, monkeypatch):
+    """It must run with cwd=root — that is what reaches the project's own
+    node_modules and its own db.js — and it must carry a timeout, or one
+    unreachable host stalls the whole turn."""
+    seen = {}
+
+    class _Done:
+        returncode, stdout, stderr = 0, "", ""
+
+    def record(cmd, **kw):
+        seen.update(kw)
+        seen["cmd"] = cmd
+        return _Done()
+
+    monkeypatch.setattr(subprocess, "run", record)
+    NODE._probe_database(tmp_path)
+
+    assert seen["cmd"][0] == "node" and seen["cmd"][1] == "-e"
+    assert seen["cwd"] == str(tmp_path)
+    assert seen["timeout"] > 0
+    assert "TIMEOUT_MS" not in seen["cmd"][2]  # the placeholder was substituted
+
+
+def test_readiness_reaches_the_database_only_after_the_cheap_checks(
+    tmp_path, monkeypatch
+):
+    """The `SELECT 1` costs a subprocess, so the earlier steps are not merely
+    redundant with it — they are what let its failure mean one specific thing."""
+    calls = []
+    monkeypatch.setattr(NODE, "database_reason", lambda root: calls.append(root) or "")
+
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    NODE.readiness(tmp_path)
+    assert calls == [], "no node, so the probe must not be spawned"
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/node")
+    NODE.readiness(tmp_path)
+    assert calls == [], "no node_modules, so the probe must not be spawned"
+
+    (tmp_path / "node_modules").mkdir()
+    monkeypatch.setattr(NODE, "_postgres_listening", lambda: False)
+    NODE.readiness(tmp_path)
+    assert calls == [], "nothing listening, so the probe must not be spawned"
+
+    monkeypatch.setattr(NODE, "_postgres_listening", lambda: True)
+    NODE.readiness(tmp_path)
+    assert calls == [tmp_path]
+
+
+def test_flask_never_pays_for_the_database_probe(tmp_path):
+    """sqlite has no daemon, so this whole phase must be invisible on Flask."""
+    assert FLASK.readiness(tmp_path) == ""
+    assert not hasattr(FLASK, "database_reason")
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +1123,12 @@ def test_the_gaps_are_gaps_the_code_really_has(tmp_path):
     )
     assert ProjectSpec.from_disk(tmp_path) is not None, "a Node repo really adopts"
     assert "gets no memory" not in claims
+
+    # Landed in N5 — readiness really runs a SELECT 1 now.
+    assert callable(getattr(NODE, "database_reason", None))
+    assert "SELECT 1" in " ".join(NODE.guarantees)
+    assert "nothing runs `select 1`" not in claims
+    assert "not proven" not in claims
 
     # Still genuinely missing — these must stay stated.
     assert NODE.template_edit_region("views/x.ejs", "<p>x</p>") is None

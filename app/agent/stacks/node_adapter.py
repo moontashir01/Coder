@@ -54,6 +54,7 @@ from app.agent.verify import (
     form_method_mismatches_by_path,
     unresolved_links,
 )
+from config.settings import settings
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from app.agent.projectspec import ProjectSpec
@@ -95,6 +96,12 @@ _INIT_DB_RE = re.compile(r"""\bdb\s*\.\s*initDb\s*\(""")
 _TERMINAL_USE_RE = re.compile(
     r"""\bapp\s*\.\s*use\s*\(\s*(?:async\s+)?(?:function\s*)?\(\s*_?(?:err|req)\b"""
 )
+
+# Probe verdicts that mean "we could not find out", never "the environment is at
+# fault". `CODER_BAD_DBJS` is the important one: a `db.js` that will not load is
+# a defect in the generated code, and gating the smoke test on it would suppress
+# the only check that reports it.
+_CANNOT_TELL = frozenset({"CODER_NO_URL", "CODER_BAD_DBJS"})
 
 _INDEX_ROUTE_SNIPPET = """
 app.get("/", (req, res) => {
@@ -182,6 +189,10 @@ class NodeAdapter:
         "tables off db.js, so turn 2 can amend it",
         "an EJS template graph off disk, so an amendment knows which view "
         "displays an entity without being told (W8's shape)",
+        "readiness is PROVEN, not assumed: node, node_modules, the port and a "
+        "real SELECT 1 through the project's own connection string, so a "
+        "database that does not exist is named instead of surfacing as a "
+        "mysterious failed start",
     )
     gaps = (
         "no missing-import repair: Flask adds an import a module uses but never "
@@ -196,9 +207,9 @@ class NodeAdapter:
         "it does not recognise is left unvalidated rather than reported wrongly",
         "no template-scoped editing — an edit to a view rewrites the whole file, "
         "where Flask confines it to the `{% block %}` it belongs in (W3)",
-        "readiness is checked (node / node_modules / a socket to Postgres) but not "
-        "proven: nothing runs `SELECT 1`, so a wrong database or bad credentials "
-        "still surfaces as a failed start (plan phase N5)",
+        "`npm install` needs the network once, which sqlite never does — the "
+        "build itself stays offline, but the project cannot RUN until it has "
+        "been fetched, and Coder will not fetch it for you",
     )
 
     # -- scaffold ---------------------------------------------------------
@@ -348,19 +359,20 @@ class NodeAdapter:
     def readiness(self, root: Path) -> str:
         """Why the generated app cannot start here, or "" when it should.
 
-        The cheap two-thirds of the plan's Phase N5 gate. Node + Postgres has
-        three ways to be un-runnable where Flask has one, and the caller uses
-        this to SKIP the smoke test rather than fail it — otherwise
-        `_smoke_repair_instruction` sends the model to rewrite correct code
-        because a package was never installed or a database was down.
+        Phase N5's gate. Node + Postgres has three ways to be un-runnable where
+        Flask has one, and the caller uses this to SKIP the smoke test rather
+        than fail it — otherwise `_smoke_repair_instruction` sends the model to
+        rewrite correct code because a package was never installed or a database
+        was down.
 
         **A skipped check must never read as a passing one**: the caller reports
         this string, it never silently swallows it.
 
-        Deliberately incomplete, and the gap is stated rather than papered over:
-        the port check proves something is listening, not that the project's
-        database exists or that credentials work. That needs a real `SELECT 1`
-        and therefore a driver, which is Phase N5's job.
+        Ordered cheapest-first, and each step is a precondition of the next: the
+        `SELECT 1` costs a subprocess, so it runs only once `node`,
+        `node_modules` and something on the port have all been established. The
+        earlier checks are not redundant with it — they are what let its failure
+        mean one specific thing.
         """
         import shutil
 
@@ -377,7 +389,168 @@ class NodeAdapter:
                 f"nothing is listening on {host}:{port} — start PostgreSQL and "
                 "create the project's database (see db.js)"
             )
-        return ""
+        return self.database_reason(root)
+
+    def database_reason(self, root: Path) -> str:
+        """The `SELECT 1` half of N5: can the app really reach its database?
+
+        A socket to 5432 proves a server is listening. It does not prove that
+        *this project's* database exists or that its credentials work — and both
+        of those fail at `initDb()`, which the generated app treats as fatal, so
+        without this the whole build reports "the smoke test failed" for a reason
+        that is not in the code at all.
+
+        Run through **`node` and the project's own `pg`**, not a Python driver:
+        `node_modules` has already been established above, `pg` is the project's
+        own dependency, and this needs nothing installed on the Python side — the
+        same reasoning that makes `crypto.scrypt` the password helper. It reads
+        the connection string out of the project's own `db.js` for the load-bearing
+        reason: a probe that guessed its own URL could pass while the app fails,
+        or fail while the app works, and either way it would be measuring
+        something other than the thing that has to work.
+
+        **Uncertainty resolves to "" — run the check.** A probe that cannot say
+        anything (no `node`, no URL to try, a `db.js` that will not load, a
+        crash, a timeout) must not gate the smoke test: skipping is only correct
+        when we KNOW the environment is at fault, and the smoke test is the real
+        measurement. In particular a `db.js` that fails to load is a *code*
+        defect, and reporting it here would skip the very check that exists to
+        catch it.
+        """
+        payload = self._probe_database(root)
+        if payload is None or payload.get("ok"):
+            return ""
+
+        code = str(payload.get("code") or "")
+        database = str(payload.get("database") or "")
+        host = str(payload.get("host") or "localhost")
+        port = payload.get("port") or 5432
+        message = str(payload.get("message") or "").strip()
+
+        if code == "CODER_NO_PG":
+            return (
+                "the `pg` package is not installed in the project — run "
+                "`npm install` (it needs the network once)"
+            )
+        if code == "3D000":  # invalid_catalog_name
+            named = f' "{database}"' if database else ""
+            fix = f"`createdb {database}`" if database else "`createdb <name>`"
+            return (
+                f"PostgreSQL is running, but the database{named} does not exist "
+                f"— create it once with {fix}"
+            )
+        if code in ("28P01", "28000"):  # invalid_password / invalid_authorization
+            return (
+                f"PostgreSQL at {host}:{port} rejected the credentials in "
+                "DATABASE_URL — fix them, or set DATABASE_URL to a role that "
+                "can reach this project's database"
+            )
+        if code in ("ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT"):
+            return (
+                f"cannot reach PostgreSQL at {host}:{port} ({code}) — start it, "
+                "or point DATABASE_URL at a server that is running"
+            )
+        detail = f" ({code})" if code else ""
+        return (
+            f"the project cannot reach its database{detail} — {message}"
+            if message
+            else f"the project cannot reach its database{detail}"
+        )
+
+    # The probe itself. Kept as a `node -e` string rather than a file written
+    # into the project: readiness is a READ, and dropping a script into someone's
+    # repo to answer a question about it is the side effect `ProjectSpec.from_disk`
+    # refuses to have. `require` resolves from cwd under `-e`, which is why the
+    # subprocess runs with `cwd=root` — that is what reaches the project's own
+    # `node_modules` and its own `db.js`.
+    _PROBE_SCRIPT = """
+"use strict";
+function say(o) { console.log("CODER_PROBE " + JSON.stringify(o)); }
+let url = process.env.DATABASE_URL || "";
+// An ABSENT db.js is fine -- an adopted repo may configure the URL another way,
+// so fall through to the environment. A db.js that is PRESENT and throws is a
+// CODE defect, and must not be reported as an environment one: that would skip
+// the smoke test which exists to catch it. The two are told apart rather than
+// collapsed, so the rule holds even when DATABASE_URL is set.
+let present = true;
+try { require.resolve("./db"); } catch (e) { present = false; }
+if (present) {
+  try {
+    url = require("./db").DATABASE_URL || url;
+  } catch (e) {
+    say({ ok: false, code: "CODER_BAD_DBJS", message: String(e.message || "").split("\\n")[0] });
+    process.exit(2);
+  }
+}
+if (!url) { say({ ok: false, code: "CODER_NO_URL" }); process.exit(2); }
+let where = { host: "localhost", port: 5432, database: "" };
+try {
+  const u = new URL(url);
+  where = {
+    host: u.hostname || "localhost",
+    port: Number(u.port || 5432),
+    database: decodeURIComponent((u.pathname || "").replace(/^\\//, "")),
+  };
+} catch (e) {}
+let pg;
+try { pg = require("pg"); }
+catch (e) { say(Object.assign({ ok: false, code: "CODER_NO_PG" }, where)); process.exit(2); }
+const client = new pg.Client({
+  connectionString: url,
+  connectionTimeoutMillis: TIMEOUT_MS,
+});
+client
+  .connect()
+  .then(function () { return client.query("SELECT 1"); })
+  .then(function () { say(Object.assign({ ok: true }, where)); process.exit(0); })
+  .catch(function (e) {
+    say(Object.assign(
+      { ok: false, code: String(e.code || ""), message: String(e.message || "").split("\\n")[0] },
+      where
+    ));
+    process.exit(1);
+  });
+"""
+
+    def _probe_database(self, root: Path) -> dict | None:
+        """Run the probe and return its payload, or None when it said nothing.
+
+        None is "we could not find out", and every caller reads it as such.
+        """
+        import json
+        import subprocess
+
+        timeout = max(1.0, float(getattr(settings, "db_probe_timeout", 6.0)))
+        script = self._PROBE_SCRIPT.replace("TIMEOUT_MS", str(int(timeout * 1000)))
+        try:
+            proc = subprocess.run(
+                ["node", "-e", script],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=timeout + 3.0,
+            )
+        except Exception:
+            # A probe that cannot run tells us nothing about the database.
+            logger.debug("database probe did not run", exc_info=True)
+            return None
+
+        for line in (proc.stdout or "").splitlines():
+            if line.startswith("CODER_PROBE "):
+                try:
+                    payload = json.loads(line[len("CODER_PROBE ") :])
+                except ValueError:
+                    return None
+                if not isinstance(payload, dict):
+                    return None
+                if payload.get("code") in _CANNOT_TELL:
+                    # Either there is no connection string to try, or `db.js`
+                    # itself will not load — and that second one is a CODE
+                    # defect. Reporting either as an environment problem would
+                    # skip the smoke test that exists to catch them.
+                    return None
+                return payload
+        return None
 
     @staticmethod
     def _db_endpoint() -> tuple[str, int]:

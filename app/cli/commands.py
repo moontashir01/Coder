@@ -153,6 +153,22 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
         # that was never written.
         workdir = repl.agent.project_path or str(Path.cwd())
         adapter = get_adapter(resolve_key(repl.agent.get_spec(), settings.web_stack))
+
+        # Phase N5: say WHY before launching something that cannot work. Without
+        # this the Node stack's answer to a missing database is whatever `pg`
+        # printed on the way down, relayed as "server.js exited on startup" —
+        # true, unhelpful, and it reads as a defect in the generated code. The
+        # readiness gate names the cause instead. Flask returns "" always, so
+        # `/run` there is unchanged.
+        blocked = adapter.readiness(Path(workdir))
+        if blocked:
+            console.print(f"[red]Not started — {blocked}[/red]")
+            console.print(
+                "[dim]Nothing was launched, so nothing here says the app is "
+                "broken. Fix the above and run `/run` again.[/dim]"
+            )
+            return True
+
         ok, message = runner.start(workdir, adapter.entry_file)
         if ok:
             console.print(f"[green]App {message}[/green]")

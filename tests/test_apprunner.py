@@ -203,6 +203,53 @@ async def test_run_reports_a_missing_app(tmp_path, captured_console, monkeypatch
     assert "no app.py" in captured_console.getvalue()
 
 
+async def test_run_names_the_reason_instead_of_launching_something_that_cannot_work(
+    tmp_path, captured_console, monkeypatch
+):
+    """Phase N5. Without the gate, a missing database reaches the user as
+    whatever `pg` printed on the way down, relayed as "server.js exited on
+    startup" — true, unhelpful, and it reads as a defect in the generated code.
+
+    Nothing must be launched, so nothing in the output may suggest the app
+    itself is broken.
+    """
+    from app.agent.stacks.node_adapter import NODE
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        NODE,
+        "readiness",
+        lambda root: 'PostgreSQL is running, but the database "shop" does not '
+        "exist — create it once with `createdb shop`",
+    )
+
+    started = []
+    monkeypatch.setattr(
+        get_runner(), "start", lambda *a, **kw: started.append(a) or (True, "running")
+    )
+
+    spec = ProjectSpec(name="shop", language="node", backend="express")
+    handled = await handle_command("/run", _FakeRepl(_FakeAgent(spec=spec)))
+
+    assert handled is True
+    assert started == [], "nothing may be launched once readiness has said no"
+    out = captured_console.getvalue()
+    assert "createdb shop" in out
+    assert "Not started" in out
+
+
+async def test_run_on_flask_is_unchanged_by_the_readiness_gate(
+    tmp_path, captured_console, monkeypatch
+):
+    """Flask returns "" always — sqlite has no daemon — so `/run` there must
+    behave exactly as it did before the gate existed."""
+    monkeypatch.chdir(tmp_path)
+    spec = ProjectSpec(name="x", language="python", backend="flask")
+    handled = await handle_command("/run", _FakeRepl(_FakeAgent(spec=spec)))
+    assert handled is True
+    assert "no app.py" in captured_console.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # /plan — the amendment preview
 # ---------------------------------------------------------------------------
