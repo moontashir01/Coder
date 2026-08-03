@@ -98,17 +98,50 @@ _FILE_INPUT_RE = re.compile(r"<input\b[^>]*\btype\s*=\s*[\"']file[\"']", re.IGNO
 _ENCTYPE_RE = re.compile(r"\benctype\s*=", re.IGNORECASE)
 _METHOD_POST_RE = re.compile(r"\bmethod\s*=\s*[\"']post[\"']", re.IGNORECASE)
 
+# A template expression inside a tag: `<% ... %>` (EJS) or `{% ... %}` / `{{ ... }}`
+# (Jinja). These matter because **they can contain `>`** — `<form action="<%= u %>">`
+# and `{% if a > b %}` both do — and every regex above scans an attribute list
+# with `[^>]*`, which stops dead at that inner `>`. The match is then a truncated
+# half-tag, and a pass that WRITES (`fix_form_enctype`, `strip_external_assets`)
+# writes the truncation back: `<form action="<%= u % enctype="...">`. Masking is
+# the whole fix, and it must preserve LENGTH so a span found in the masked text
+# still addresses the same characters in the real one.
+_TEMPLATE_TAG_RE = re.compile(r"<%.*?%>|\{%.*?%\}|\{\{.*?\}\}", re.DOTALL)
+
+
+def mask_template_tags(text: str) -> str:
+    """``text`` with template expressions blanked to spaces, same length.
+
+    For regexes that assume plain HTML. Spaces are the safe filler: they are
+    already legal between attributes and inside a quoted value, so nothing that
+    was one token becomes two. A file with no template tags is returned
+    unchanged, which is why every caller is a no-op on ordinary HTML.
+    """
+
+    def blank(match: re.Match) -> str:
+        return " " * (match.end() - match.start())
+
+    return _TEMPLATE_TAG_RE.sub(blank, text or "")
+
 
 def forms_missing_enctype(text: str) -> list[str]:
-    """Opening <form> tags that take a file upload but never declare enctype."""
+    """Opening <form> tags that take a file upload but never declare enctype.
+
+    Detection runs on the masked text and the result is sliced out of the REAL
+    one, so what comes back is the true opening tag — template expressions
+    intact — and `fix_form_enctype` can substitute it safely.
+    """
+    source = text or ""
+    scan = mask_template_tags(source)
     out: list[str] = []
-    for form in _FORM_RE.finditer(text or ""):
+    for form in _FORM_RE.finditer(scan):
         block = form.group(0)
         if not _FILE_INPUT_RE.search(block):
             continue
         open_tag = _FORM_OPEN_RE.match(block)
         if open_tag and not _ENCTYPE_RE.search(open_tag.group(0)):
-            out.append(open_tag.group(0))
+            start = form.start() + open_tag.start()
+            out.append(source[start : form.start() + open_tag.end()])
     return out
 
 
@@ -131,20 +164,43 @@ def fix_form_enctype(text: str) -> tuple[str, int]:
     return out, len(broken)
 
 
+# `.ejs` is a markup file for this purpose: a view can carry a CDN <link> exactly
+# as a Jinja page can, and offline that is the same dead DNS lookup per request.
+_MARKUP_EXTS = (".html", ".htm", ".ejs")
+_STYLE_EXTS = (".css", ".scss", ".less")
+
+
+def _external_asset_patterns(suffix: str) -> tuple[re.Pattern, ...]:
+    if suffix in _MARKUP_EXTS:
+        return (_EXTERNAL_LINK_RE, _EXTERNAL_SCRIPT_RE)
+    if suffix in _STYLE_EXTS:
+        return (_EXTERNAL_CSS_IMPORT_RE,)
+    return ()
+
+
+def _external_asset_spans(text: str, suffix: str) -> list[tuple[int, int]]:
+    """Where the off-machine assets are, measured on the MASKED text.
+
+    Masked for `mask_template_tags`' reason: an attribute after the URL can hold
+    a template expression, and `[^>]*>` would then end the match at the `>`
+    inside it — deleting half a tag and leaving the rest behind.
+    """
+    scan = mask_template_tags(text or "")
+    spans = [
+        (m.start(), m.end())
+        for pattern in _external_asset_patterns(suffix)
+        for m in pattern.finditer(scan)
+    ]
+    return sorted(spans)
+
+
 def find_external_assets(text: str, suffix: str) -> list[str]:
     """Render-blocking off-machine assets in a generated file.
 
     Returns the matched tags/at-rules (trimmed), or [] when clean.
     """
-    out: list[str] = []
-    if suffix in (".html", ".htm"):
-        for pattern in (_EXTERNAL_LINK_RE, _EXTERNAL_SCRIPT_RE):
-            out.extend(m.group(0).strip() for m in pattern.finditer(text or ""))
-    elif suffix in (".css", ".scss", ".less"):
-        out.extend(
-            m.group(0).strip() for m in _EXTERNAL_CSS_IMPORT_RE.finditer(text or "")
-        )
-    return out
+    source = text or ""
+    return [source[s:e].strip() for s, e in _external_asset_spans(source, suffix)]
 
 
 def strip_external_assets(text: str, suffix: str) -> tuple[str, list[str]]:
@@ -154,16 +210,19 @@ def strip_external_assets(text: str, suffix: str) -> tuple[str, list[str]]:
     dead <link>/<script> cannot break a page: the resource was never going to
     load. The styling intent survives because the build spec states the font as
     a system stack (see buildspec.to_context_block) rather than a CDN family.
+
+    Cuts by SPAN rather than by `re.sub` on the raw text, so the region deleted
+    is exactly the region that was matched on the masked text — the two can
+    differ around a template expression, and the difference is a corrupted file.
     """
-    removed = find_external_assets(text, suffix)
-    if not removed:
+    source = text or ""
+    spans = _external_asset_spans(source, suffix)
+    if not spans:
         return text, []
-    out = text
-    if suffix in (".html", ".htm"):
-        out = _EXTERNAL_LINK_RE.sub("", out)
-        out = _EXTERNAL_SCRIPT_RE.sub("", out)
-    elif suffix in (".css", ".scss", ".less"):
-        out = _EXTERNAL_CSS_IMPORT_RE.sub("", out)
+    removed = [source[s:e].strip() for s, e in spans]
+    out = source
+    for start, end in reversed(spans):  # right to left: earlier spans stay valid
+        out = out[:start] + out[end:]
     # Collapse the blank lines the removal leaves behind.
     out = re.sub(r"[ \t]+\n", "\n", out)
     out = re.sub(r"\n{3,}", "\n\n", out)

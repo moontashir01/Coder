@@ -1329,7 +1329,9 @@ spec's context block) → **impact** (`impacted_files`, no LLM) → **apply** �
 `enctype="multipart/form-data"` posts only the filename, so `request.files[...]` raises and the
 upload silently never happens — invisible to every other check, because the HTML is valid and the
 page renders. Deterministic and purely additive; runs in `_verify_and_repair` alongside the other
-stage-0 fixes.
+stage-0 fixes, on `.html` **and the stack's own `template_ext`** — nothing about a missing enctype
+is Jinja-specific, and this has exactly one caller, so while that caller filtered on `.html` a
+`.ejs` upload form could not be repaired by anything.
 
 **Runtime defects `compile()` cannot see (`app/agent/pyimports.py`).** `check_file` compiles a
 `.py`, so it catches `SyntaxError` and is blind to `NameError`/`AttributeError` — which only fire
@@ -1362,7 +1364,21 @@ and `_verify_and_repair` runs `verify.strip_external_assets` as a deterministic 
 `<link href="http…">` / `<script src="http…">` / CSS `@import` of a URL and reporting it in the
 answer. `<a href="https://…">` is never touched — a hyperlink is not a render dependency.
 `to_context_block` **defaults to the offline branch** so a caller that forgets the argument cannot
-ship a dead CDN dependency.
+ship a dead CDN dependency. The strip pass covers the stack's own `template_ext` as well as
+`.html`/CSS: until it did, the *first* guard was the only one a Node build had, and a prompt-level
+hint with no deterministic backstop is exactly the arrangement the second guard exists to replace.
+
+**Both stage-0 passes mask template expressions before matching
+(`verify.mask_template_tags`).** `<% … %>` and `{% if a > b %}` can contain a `>`, and every regex
+in `verify.py` scans an attribute list with `[^>]*`, which stops dead at that inner `>`. The match
+is then a truncated half-tag — and these two passes **write**, so the truncation gets written back:
+`<form action="<%= u %>">` became `<form action="<%= u % enctype="…">`, a broken page produced by
+the pass whose whole job is to prevent one. Masking blanks those expressions to spaces of **equal
+length**, so a span found in the masked text still addresses the same characters in the real one;
+`strip_external_assets` then cuts by span rather than re-running `re.sub` on the raw text, because
+the two regions differ around an expression and the difference is a dangling `">`. A file with no
+template tags is returned byte-for-byte, which is why every Flask behaviour is unchanged — and the
+Jinja half of the hazard (`{% if a > b %}` inside a tag) was being corrupted before this too.
 
 ### Skills (`app/resources/skills/`)
 

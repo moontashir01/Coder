@@ -52,6 +52,14 @@ All notable changes to Coder are documented here. The format follows
   no `node_modules` until someone runs `npm install`, which needs the network —
   the checks **fail naming that command** instead of quietly skipping, and
   `--npm-install` lets the eval runner (never Coder) do it.
+  Two repairs that had only ever run on Flask pages now run on Node views too:
+  a file-upload form gets the `enctype` without which the browser posts only the
+  filename, and a CDN stylesheet or font link — dead weight on an offline
+  machine — is stripped. Both now also cope with a template expression inside
+  the tag they are editing: `<form action="<%= url %>">` and
+  `{% if a > b %}` contain a `>`, which used to truncate the match and write a
+  corrupted tag back to the page. That last one was quietly damaging Jinja
+  templates too.
 - **Generated sites now come with a design system, and Coder can look at them**
   (`docs/web-quality-plan.md`). Every build ships a real component stylesheet and
   a Jinja macro library, and the style you ask for is *written* into

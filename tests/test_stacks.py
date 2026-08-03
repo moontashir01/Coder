@@ -32,6 +32,7 @@ from app.agent.stacks import (
 )
 from app.agent.stacks.flask_adapter import FLASK
 from app.agent.stacks.node_adapter import NODE
+from config.settings import settings
 
 
 class _Spec:
@@ -1013,6 +1014,85 @@ async def test_the_link_check_really_reaches_an_ejs_view(tmp_path, monkeypatch):
 
     assert "repointed" in note and "/product -> /products" in note
     assert '<a href="/products">Shop</a>' in view.read_text(encoding="utf-8")
+
+
+async def test_the_upload_fix_really_reaches_an_ejs_view(tmp_path, monkeypatch):
+    """The same reachability hole as the link check, in the pass whose whole job
+    is to stop an upload silently doing nothing.
+
+    Node really does generate upload forms (`crud_node.has_uploads`,
+    `ui.field(type='file')`), and `fix_form_enctype` has exactly one caller — so
+    while that caller filtered on `.html`, a `.ejs` upload form could never be
+    repaired by anything.
+    """
+    from app.agent.core import AgentCore
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "allow_network", True)  # keep the other pass inert
+    view = tmp_path / "views" / "add_product.ejs"
+    view.parent.mkdir()
+    view.write_text(
+        '<form action="<%= url %>"><input type="file" name="cover"></form>\n',
+        encoding="utf-8",
+    )
+
+    agent = AgentCore(session_id="pytest_n6_enctype_ejs")
+    agent._stack_key = NODE.key
+
+    note = await agent._fix_upload_form(view, "views/add_product.ejs")
+
+    assert "enctype" in note
+    body = view.read_text(encoding="utf-8")
+    assert 'enctype="multipart/form-data"' in body
+    assert "<%= url %>" in body  # and the expression survived
+
+
+async def test_the_offline_asset_strip_really_reaches_an_ejs_view(
+    tmp_path, monkeypatch
+):
+    """Until this gate took `template_ext`, the prompt-level guard in
+    `buildspec.to_context_block` was the ONLY thing keeping a Node build offline
+    — a hint the model is free to ignore, with no deterministic backstop."""
+    from app.agent.core import AgentCore
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "allow_network", False)
+    view = tmp_path / "views" / "index.ejs"
+    view.parent.mkdir()
+    view.write_text(
+        '<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=X">\n'
+        "<h1><%= projectName %></h1>\n",
+        encoding="utf-8",
+    )
+
+    agent = AgentCore(session_id="pytest_n6_offline_ejs")
+    agent._stack_key = NODE.key
+
+    note = await agent._strip_offline_dead_assets(view, "views/index.ejs")
+
+    assert note
+    body = view.read_text(encoding="utf-8")
+    assert "fonts.googleapis" not in body
+    assert "<%= projectName %>" in body
+
+
+async def test_neither_pass_touches_a_javascript_file(tmp_path, monkeypatch):
+    """Widening the gate must not widen it to everything: `.js` carries neither
+    a form nor a stylesheet link, and rewriting one would be a new failure."""
+    from app.agent.core import AgentCore
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "allow_network", False)
+    script = tmp_path / "app.js"
+    original = 'const u = "https://fonts.googleapis.com/css";\n'
+    script.write_text(original, encoding="utf-8")
+
+    agent = AgentCore(session_id="pytest_n6_js_untouched")
+    agent._stack_key = NODE.key
+
+    assert await agent._fix_upload_form(script, "app.js") == ""
+    assert await agent._strip_offline_dead_assets(script, "app.js") == ""
+    assert script.read_text(encoding="utf-8") == original
 
 
 async def test_the_link_check_still_ignores_a_file_that_is_not_a_template(

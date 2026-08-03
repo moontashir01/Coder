@@ -734,6 +734,94 @@ def test_only_the_form_with_the_file_input_is_changed():
     assert '<form action="/search">' in fixed
 
 
+# --- template expressions inside the tag ------------------------------------
+#
+# `<% ... %>` and `{% if a > b %}` can contain a `>`, and every regex here scans
+# an attribute list with `[^>]*`, which stops dead at that inner `>`. The match
+# is then a truncated half-tag — and these two passes WRITE, so the truncation
+# gets written back. `mask_template_tags` is the fix.
+
+
+def test_masking_blanks_template_tags_without_moving_anything():
+    """Length must be preserved, or a span found in the masked text addresses
+    the wrong characters in the real one."""
+    from app.agent.verify import mask_template_tags
+
+    text = '<a href="<%= u %>">{{ x }}</a>'
+    masked = mask_template_tags(text)
+    assert len(masked) == len(text)
+    assert "<%=" not in masked and "{{" not in masked
+    assert masked.startswith('<a href="') and masked.endswith("</a>")
+
+
+def test_an_ejs_upload_form_is_fixed_without_mangling_its_expression():
+    """THE corruption this guards against. Unmasked, `[^>]*` ends the open tag at
+    the `>` of `%>`, and the fix writes back
+    `<form action="<%= url % enctype="...">` — a broken page from a pass whose
+    entire job is to prevent a broken page."""
+    view = '<form action="<%= url %>"><input type="file" name="cover"></form>'
+
+    fixed, count = fix_form_enctype(view)
+
+    assert count == 1
+    assert "<%= url %>" in fixed, "the EJS expression must survive intact"
+    assert 'enctype="multipart/form-data"' in fixed and 'method="post"' in fixed
+
+
+def test_a_jinja_comparison_inside_the_tag_survives_too():
+    """`{% if a > b %}` is the same hazard on the stack that already had this
+    pass — it was silently corrupting these before N6's masking."""
+    html = (
+        '<form action="/x" {% if wide > 2 %}class="w"{% endif %}>'
+        '<input type="file"></form>'
+    )
+
+    fixed, count = fix_form_enctype(html)
+
+    assert count == 1
+    assert "{% if wide > 2 %}" in fixed
+
+
+def test_an_ejs_view_gets_its_cdn_link_stripped():
+    view = (
+        '<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter">\n'
+        "<section><h1><%= title %></h1></section>\n"
+    )
+
+    cleaned, removed = strip_external_assets(view, ".ejs")
+
+    assert len(removed) == 1 and "fonts.googleapis" in removed[0]
+    assert "fonts.googleapis" not in cleaned
+    assert "<%= title %>" in cleaned
+
+
+def test_stripping_cuts_the_whole_tag_when_an_attribute_holds_an_expression():
+    """Removing by span, not by re-running the regex on raw text: the two differ
+    around a template expression, and the difference is a dangling `">` left in
+    the page."""
+    view = (
+        '<link rel="stylesheet" href="https://cdn.example.com/a.css" '
+        'data-k="<%= k %>">\n<p>hi</p>\n'
+    )
+
+    cleaned, removed = strip_external_assets(view, ".ejs")
+
+    assert len(removed) == 1
+    assert "cdn.example.com" not in cleaned
+    assert '">' not in cleaned  # no half-tag left behind
+    assert cleaned.strip() == "<p>hi</p>"
+
+
+def test_masking_is_a_no_op_on_ordinary_html():
+    """Every existing Flask behaviour has to come through unchanged — a file with
+    no template tags is returned byte-for-byte."""
+    from app.agent.verify import mask_template_tags
+
+    html = '<form action="/upload"><input type="file"></form>'
+    assert mask_template_tags(html) == html
+    assert fix_form_enctype(html)[1] == 1
+
+
 async def test_verify_and_repair_fixes_the_upload_form(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(settings, "allow_network", True)  # keep stage 0 inert

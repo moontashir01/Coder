@@ -101,25 +101,35 @@ the entry file, the template dir, the route parser and the database reader.
    by `/stack`: no import repair, no template-scoped editing, an import
    dependency graph that stays Python-only, and routes read by regex rather than
    by a parser. Flask stays the default because of them.
-4. **Two more stage-0 passes are still `.html`-only, and should probably take
-   the adapter's `template_ext` the way `_check_endpoints` now does.** Found
-   while wiring N4's link check; deliberately NOT changed here, because they are
-   separate features and were not part of N4's scope. Both fail silently on a
-   Node build, which is the failure mode this codebase cares most about:
-   - **`core._fix_upload_form`** (`core.py`, the `(".html", ".htm")` gate) — a
-     `<form>` with `<input type="file">` and no `enctype="multipart/form-data"`
-     posts only the filename. Nothing about that is Jinja-specific, so an `.ejs`
-     upload form currently never gets the fix.
-   - **`core._strip_offline_dead_assets`** (same gate plus the CSS types) — a
-     generated Node site can still ship a Google Fonts `<link>`, which offline
-     costs a DNS timeout per page and then renders in the wrong font. CLAUDE.md's
-     "Generated sites are kept offline too" is therefore only true of Flask today.
+4. **`_repair_page_links` and `_repair_nav_consistency` are still `.html`-only,
+   and that is FINE** — do not "fix" them to match the others. The first
+   rewrites a link only when the target exists as a sibling file, because a real
+   route in a server-rendered app must not be touched; on Node every path IS a
+   route. The second reconciles navs across pages, and on Node the nav lives in
+   `layout.ejs` while views carry none, so it has nothing to reconcile.
 
-   `_repair_page_links` and `_repair_nav_consistency` are also `.html`-only and
-   that is **fine** — the first rewrites links only when the target exists as a
-   sibling file (a real route in a server-rendered app must not be touched), and
-   on Node the nav lives in `layout.ejs` and views carry none, so the second has
-   nothing to reconcile. Leave both alone.
+   (The other two — `_fix_upload_form` and `_strip_offline_dead_assets` — WERE
+   `.html`-only and are now fixed; see below.)
+
+## The last two `.html`-only passes, now closed
+
+`core._fix_upload_form` and `core._strip_offline_dead_assets` both took the
+stack's `template_ext`, the way `_check_endpoints` did in N4. Before that, a
+`.ejs` upload form could not be repaired by anything (`fix_form_enctype` has
+exactly one caller), and a Node build's only defence against a CDN `<link>` was
+a prompt-level hint the model is free to ignore.
+
+**The important part was not the gate.** Widening it alone would have started
+CORRUPTING files: `<% … %>` and `{% if a > b %}` can contain a `>`, every regex
+in `verify.py` scans attributes with `[^>]*`, and both of these passes write
+their match back — so `<form action="<%= u %>">` would have been rewritten as
+`<form action="<%= u % enctype="…">`. `verify.mask_template_tags` blanks those
+expressions to **equal-length** spaces so spans still line up, and
+`strip_external_assets` now cuts by span instead of re-running `re.sub` on raw
+text. A file with no template tags comes back byte-for-byte.
+
+This also fixed the Jinja half — `{% if a > b %}` inside a tag was being
+corrupted on Flask before anyone noticed.
 
 ## Things worth not re-learning
 

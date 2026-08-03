@@ -2289,8 +2289,19 @@ class AgentCore:
         invisible to every other check — the HTML is valid, the page renders, the
         button looks fine. Measured on the live two-turn demo, on the admin form
         the amendment had just created. Deterministic and purely additive.
+
+        Takes the stack's own template extension as well as `.html`: nothing
+        about a missing `enctype` is Jinja-specific, and the Node stack really
+        does generate upload forms (`crud_node.has_uploads`,
+        `ui.field(type='file')`). Gated on `.html` alone, this had exactly one
+        caller and it never fired on a `.ejs` view — an upload that silently
+        does nothing, on the stack with no other check that could see it.
         """
-        if target_path.suffix.lower() not in (".html", ".htm"):
+        if target_path.suffix.lower() not in (
+            ".html",
+            ".htm",
+            self._adapter.template_ext,
+        ):
             return ""
         try:
             text = target_path.read_text(encoding="utf-8", errors="replace")
@@ -2445,11 +2456,25 @@ class AgentCore:
         Deterministic, no LLM. Inert when `settings.allow_network` is on (the
         CDN would actually work) and on file types that can't carry one.
         Best-effort: a failure here never fails the write.
+
+        The stack's template extension counts as a markup file: a `.ejs` view can
+        carry a CDN `<link>` exactly as a Jinja page can, and offline that is the
+        same dead DNS lookup on every request. Until this gate took it, the
+        prompt-level guard (`buildspec.to_context_block` emitting system font
+        stacks) was the ONLY thing keeping a Node build offline — a hint the
+        model is free to ignore, with no deterministic backstop behind it.
         """
         if settings.allow_network:
             return ""
         suffix = target_path.suffix.lower()
-        if suffix not in (".html", ".htm", ".css", ".scss", ".less"):
+        if suffix not in (
+            ".html",
+            ".htm",
+            ".css",
+            ".scss",
+            ".less",
+            self._adapter.template_ext,
+        ):
             return ""
         try:
             text = target_path.read_text(encoding="utf-8", errors="replace")
