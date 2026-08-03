@@ -1,0 +1,9 @@
+node_modules/
+npm-debug.log*
+
+# Local secrets — DATABASE_URL lives here, not in the repo.
+.env
+
+# User uploads are data, not source. Keep the directory, drop its contents.
+public/uploads/*
+!public/uploads/.gitkeep

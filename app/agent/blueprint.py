@@ -33,6 +33,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from app.agent.buildspec import wants_restyle
 from app.agent.runtime_probe import NO_STACK, Stack
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -177,6 +178,14 @@ def should_amend(message: str, spec_exists: bool) -> bool:
         return False
     if _SPLIT_RE.search(m):
         return False  # split/refactor is _multi_file_flow's, as it always was
+    # A restyle is an amendment that carries none of the incremental verbs:
+    # "make it navy" changes the project without adding, updating or removing
+    # anything, so it fell through to ordinary routing and no stage on that path
+    # rewrites theme.css. Yielding to `should_blueprint` keeps a greenfield
+    # request that happens to name a look ("build me a blog, make it purple") on
+    # the build path, where the theme is written anyway.
+    if wants_restyle(m) and not should_blueprint(m):
+        return True
     return bool(_AMEND_VERB_RE.search(m))
 
 
@@ -293,6 +302,9 @@ MAX_FEATURES = 20
 MAX_ENDPOINTS = 12
 MAX_SCHEMA = 8
 MAX_BINDINGS = 8
+# How many sections `derive_home_page` will link from the home page. A home
+# page that lists every route is a sitemap, not a home page.
+MAX_HOME_LINKS = 8
 
 _FILENAME_RE = re.compile(r"^[\w./-]+$")
 
@@ -701,15 +713,19 @@ def derive_pages_from_entities(
     CREATES one, and the routes behind both. Whatever the model already planned
     is kept as-is — this only fills holes, and it never renames or removes.
 
-    Flask only. The fixed `templates/`+`@app.route` layout is what makes the
-    synthesized paths correct; on the stdlib or Node stacks the file layout is
-    the model's own, so guessing filenames there would create files nothing
-    serves. Those stacks simply keep whatever the layout call produced.
+    Runs for any stack that ships a SCAFFOLD (Flask, Node — phase N3), because
+    a fixed `templates/`+`@app.route` or `views/`+`app.get` layout is what makes
+    the synthesized paths correct. On the stdlib or fastapi stacks the file
+    layout is the model's own, so guessing filenames there would create files
+    nothing serves; those keep whatever the layout call produced.
     """
-    if not entities or stack.backend != "flask":
+    adapter = _adapter_for(stack)
+    if not entities or adapter is None:
         return files, features, contract
 
-    planned_pages = [pf for pf in files if pf.filename.lower().endswith(".html")]
+    ext = adapter.template_ext
+    tpl_dir = adapter.template_dir
+    planned_pages = [pf for pf in files if pf.filename.lower().endswith((".html", ext))]
     new_files: list[PlannedFile] = []
     new_features: list[Feature] = []
     new_endpoints: list[Endpoint] = []
@@ -717,8 +733,8 @@ def derive_pages_from_entities(
     routes = {(e.method, e.path) for e in contract.endpoints}
 
     for entity in entities:
-        list_tpl = f"templates/{entity.table}.html"
-        form_tpl = f"templates/new_{entity.name}.html"
+        list_tpl = f"{tpl_dir}/{entity.table}{ext}"
+        form_tpl = f"{tpl_dir}/new_{entity.name}{ext}"
         list_path = f"/{entity.table}"
         form_path = f"/{entity.table}/new"
 
@@ -758,7 +774,7 @@ def derive_pages_from_entities(
                         f"List every row of `{entity.table}` "
                         f"({', '.join(f.name for f in entity.fields)}), one card or "
                         f"table row each, with a link to the page that adds a new "
-                        f"{entity.name}. Extends base.html; the rows come from the "
+                        f"{entity.name}. {adapter.page_note} The rows come from the "
                         f"route as a `{entity.table}` variable."
                     ),
                     role="frontend",
@@ -780,8 +796,8 @@ def derive_pages_from_entities(
                     instruction=(
                         f"A form that adds one {entity.name}: "
                         f'<form method="post" action="{form_path}"> with an input '
-                        f"named exactly for each of {', '.join(writable)}. Extends "
-                        "base.html. No fetch() — a plain form post."
+                        f"named exactly for each of {', '.join(writable)}. "
+                        f"{adapter.page_note} No fetch() — a plain form post."
                     ),
                     role="frontend",
                     reads=(entity.name,),
@@ -830,6 +846,137 @@ def derive_pages_from_entities(
     )
 
 
+# The scaffold ships `templates/index.html` as a placeholder hero, and
+# `scaffold_flask` never overwrites — so the home page was the one page in the
+# site that nothing ever wrote. The layout call is not asked for it (the Flask
+# layout table names `templates/<page>.html` and no prompt mentions a home
+# page), and `derive_pages_from_entities` covers entities, which the home page
+# belongs to none of. Every build therefore shipped the same "This project was
+# scaffolded by Coder and is already running" block as its front door.
+HOME_TEMPLATE = "templates/index.html"
+
+
+def _adapter_for(stack: Stack):
+    """The stack adapter that OWNS this build's file layout, or None.
+
+    None means "this stack has no scaffold, so its file layout is the model's
+    own" — stdlib, fastapi, none — and the derivation passes then leave the plan
+    exactly as the layout call produced it, which is the pre-N3 behaviour for
+    everything except Node.
+
+    Imported inside the function: `stacks.flask_adapter` -> `scaffold` -> this
+    module, so a top-level import would close the cycle.
+    """
+    if stack is None:
+        return None
+    from app.agent.stacks import get_adapter, key_for_stack
+
+    adapter = get_adapter(key_for_stack(stack.language, stack.backend))
+    return adapter if stack.backend in adapter.backends else None
+
+
+def _home_label(path: str, template: str) -> str:
+    """A human label for a section the home page links to (`/products` -> Products)."""
+    stem = (path or "").strip("/").split("/")[0]
+    if not stem:
+        stem = template.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    return " ".join(w.capitalize() for w in _STEM_SPLIT_RE.split(stem.lower()) if w)
+
+
+def derive_home_page(
+    files: tuple[PlannedFile, ...],
+    features: tuple[Feature, ...],
+    contract: ApiContract,
+    stack: Stack,
+) -> tuple[tuple[PlannedFile, ...], tuple[Feature, ...]]:
+    """Put the home page in the build plan, since nothing else ever does.
+
+    Same rule as `derive_pages_from_entities` and `scaffold.py` before it —
+    deterministic beats generated — applied to the one page every visitor sees
+    first. Planning it is all that is needed: it is not `_FROZEN`, so
+    `_file_op_flow` routes the existing scaffold file to `_surgical_edit`, and
+    `template_edit_region` confines that edit to `{% block content %}`. The
+    action is therefore `edit`, which is also what the plan manifest should say.
+
+    **Whatever the layout call planned wins.** If it named `templates/index.html`
+    itself, this returns untouched — planning it twice would put the same file
+    through two generation passes, the second overwriting the first.
+
+    Links come from the contract's own GET endpoints rather than from the entity
+    list, so the model's own pages are reachable too. Form pages are skipped ("add
+    a product" is a button on the products page, not a section of the site) and so
+    are parameterised routes, which have no fixed URL to link.
+
+    Scaffolded stacks only, for `derive_pages_from_entities`' reason: the fixed
+    layout is what makes the path correct. On a stack with no scaffold the file
+    layout is the model's own and this would name a file nothing serves.
+    """
+    adapter = _adapter_for(stack)
+    if adapter is None:
+        return files, features
+    home = adapter.home_template.lower()
+    if any(pf.filename.replace("\\", "/").lower() == home for pf in files):
+        return files, features
+
+    links: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for endpoint in contract.endpoints:
+        path = endpoint.path or ""
+        if (endpoint.method or "").upper() != "GET" or not endpoint.template:
+            continue
+        if path in ("", "/") or path in seen or "<" in path:
+            continue
+        stem = endpoint.template.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        if _is_form_stem(stem):
+            continue
+        label = _home_label(path, endpoint.template)
+        if not label:
+            continue
+        seen.add(path)
+        links.append((label, path))
+        if len(links) >= MAX_HOME_LINKS:
+            break
+
+    if links:
+        body = (
+            'then a `<div class="grid">` holding one card per section of the '
+            "site, each linking to its page: "
+            + ", ".join(f"{label} ({path})" for label, path in links)
+            + "."
+        )
+    else:
+        body = (
+            "then one short paragraph saying what a visitor can do here, linking "
+            "only to pages that exist."
+        )
+
+    instruction = (
+        "The home page a visitor lands on. It currently holds the scaffold's "
+        "placeholder text, which must be REPLACED — none of it belongs in the "
+        "finished site. Write: a "
+        '`<section class="hero">` with an `<h1>` naming this site and a '
+        '`<p class="lede">` saying in one sentence what it is for, '
+        + body
+        + " "
+        + adapter.home_edit_note
+        + " Use the shipped macros and classes — write no new CSS and no "
+        "`<style>` block."
+    )
+
+    return (
+        files
+        + (
+            PlannedFile(
+                filename=adapter.home_template,
+                action="edit",
+                instruction=instruction,
+                role="frontend",
+            ),
+        ),
+        features + (Feature("Home page", TIER_CORE, (adapter.home_template,)),),
+    )
+
+
 def blueprint_from_data(
     data: dict | None,
     message: str,
@@ -875,6 +1022,8 @@ def blueprint_from_data(
     files, features, contract = derive_pages_from_entities(
         files, features, contract, entities, stack
     )
+    # After the pages exist, so the home page can link the routes they added.
+    files, features = derive_home_page(files, features, contract, stack)
 
     return Blueprint(
         summary=summary,

@@ -38,6 +38,11 @@ _PORT_PATTERNS = (
     re.compile(r"HTTPServer\(\s*\([^,]*,\s*(\d{2,5})\s*\)"),  # (('', 8000))
     re.compile(r"TCPServer\(\s*\([^,]*,\s*(\d{2,5})\s*\)"),
     re.compile(r"\.listen\(\s*(\d{2,5})"),  # node
+    # `const PORT = process.env.PORT || 3000` — the idiomatic Node line, and
+    # the one the Node scaffold writes. Without it the port is only found in
+    # `_COMMON_PORTS`, so the probe tries 8000/5000/8080 first and would attach
+    # to whatever else happens to be listening there.
+    re.compile(r"process\.env\.PORT\s*(?:\|\||\?\?)\s*(\d{2,5})"),
     re.compile(r"run\([^)]*port\s*=\s*(\d{2,5})", re.IGNORECASE),  # flask
     re.compile(r"uvicorn\.run\([^)]*port\s*=\s*(\d{2,5})", re.IGNORECASE),
     re.compile(r"\bPORT\s*[:=]\s*(\d{2,5})"),
@@ -47,11 +52,20 @@ _PORT_PATTERNS = (
 
 @dataclass(frozen=True)
 class ProbeCheck:
-    """One functional assertion about the running app."""
+    """One functional assertion about the running app.
+
+    ``owner`` says whose defect a failure is, and exists because Phase W5/W6
+    checks ride in the same list: a table that scrolls sideways at 390px is
+    fixed in a template or the stylesheet, and feeding it to
+    `_smoke_repair_instruction` would send the model to rewrite the *server*
+    file for a CSS problem. Only `owner == "app"` failures belong to the backend
+    repair loop; everything else is repaired by whoever added it.
+    """
 
     label: str
     ok: bool
     detail: str = ""
+    owner: str = "app"
 
     def line(self) -> str:
         return f"  {'ok  ' if self.ok else 'FAIL'} {self.label}" + (
@@ -178,6 +192,7 @@ def run_smoke_test(
     timeout: float = 8.0,
     warmup: float = 1.5,
     spec=None,
+    on_serving=None,
 ) -> SmokeResult:
     """Start ``server_file`` in ``workdir``, see if it runs, probe it, kill it.
 
@@ -188,6 +203,13 @@ def run_smoke_test(
     exercised against its own contract by `functional_probe` (Phase 5), and the
     result carries per-check outcomes. Without it the behaviour is exactly the
     old liveness test, so every existing caller is unaffected.
+
+    ``on_serving``: ``callable(port) -> Sequence[ProbeCheck]``, run once the
+    server is answering and before it is killed. This is the door the browser
+    checks come through (Phase W5/W6): they need a live server, and starting a
+    SECOND one would fight this one for :5000 and for `app.db`. One start, one
+    teardown, every probe in between. Best-effort — a hook that raises costs its
+    own observations and nothing else.
     """
     server_file = Path(server_file)
     workdir = Path(workdir)
@@ -262,6 +284,11 @@ def run_smoke_test(
                             checks = tuple(functional_probe(spec, port))
                         except Exception:
                             checks = ()  # best-effort: never fail a turn here
+                    if on_serving is not None:
+                        try:
+                            checks += tuple(on_serving(port) or ())
+                        except Exception:
+                            pass  # same rule: an observation, never the turn
                     return SmokeResult(
                         True,
                         True,

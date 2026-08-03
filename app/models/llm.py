@@ -4,15 +4,20 @@ from langchain_ollama import ChatOllama
 from config.settings import settings
 
 
-def get_llm(temperature: float = 0.1, json_mode: bool = False) -> ChatOllama:
+def get_llm(
+    temperature: float = 0.1, json_mode: bool = False, model: str = ""
+) -> ChatOllama:
     """Factory for ChatOllama instances.
 
     Args:
         temperature: 0.1 for coding/tool tasks, 0.7 for planning/explanations.
         json_mode: When True, constrains output to valid JSON via Ollama format param.
+        model: override the model name (Phase W9's `planner_model`/`judge_model`
+            roles). Empty means `settings.llm_model`, which is what `/model`
+            switches and what every existing caller gets.
     """
     kwargs: dict = {
-        "model": settings.llm_model,
+        "model": model or settings.llm_model,
         "base_url": settings.ollama_base_url,
         "temperature": temperature,
         # Ollama defaults num_ctx to 4096 no matter what the model supports, and

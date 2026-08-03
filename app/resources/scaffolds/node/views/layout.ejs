@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title><%= typeof title !== "undefined" && title ? title : projectName %></title>
+    <!-- style.css defines the components; theme.css re-declares the colour and
+         font variables they are written in terms of. theme.css MUST stay last:
+         it is the file that wins, and it is the only one a restyle touches. -->
+    <link rel="stylesheet" href="/css/style.css" />
+    <link rel="stylesheet" href="/css/theme.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <!-- Plain URLs on purpose, exactly as on the Flask stack: a link helper
+           that throws when a route is renamed lives in the layout, so the error
+           would break EVERY page rather than 404 one of them. -->
+      <a class="brand" href="/"><%= projectName %></a>
+
+      <!-- THE ONLY navigation in this project. Every view is wrapped in this
+           file, so adding a link here adds it to every page at once. Never copy
+           this nav into a view. -->
+      <nav class="site-nav">
+        <a href="/">Home</a>
+      </nav>
+    </header>
+
+    <main class="site-main">
+      <!-- Flashed messages render here for EVERY page. Pass `messages` from a
+           route as a list of { category, message }. Don't repeat this in a
+           view — the message would appear twice. -->
+      <%- ui.flash_messages(typeof messages !== "undefined" ? messages : []) %>
+
+      <%- body %>
+    </main>
+
+    <footer class="site-footer">
+      <p><%= projectName %></p>
+    </footer>
+
+    <script src="/js/app.js"></script>
+  </body>
+</html>

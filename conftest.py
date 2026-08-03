@@ -61,6 +61,11 @@ def _no_blueprint(monkeypatch):
     monkeypatch.setattr(settings, "expand_requirements", False)
     monkeypatch.setattr(settings, "blueprint_smoke_test", False)
     monkeypatch.setattr(settings, "schema_first", False)
+    # Phase W7's visual critique — the same trap a third time. It fires inside
+    # the smoke stage, calls the VISION model, and ships off precisely so a
+    # machine without one behaves as before; a test that turns the smoke test
+    # back on must not silently acquire an Ollama dependency with it.
+    monkeypatch.setattr(settings, "check_visual", False)
     # Same trap again for Phase B's tier-2 classifier: it fires when the regex
     # gate MISSES, which is most test prompts, and it runs before any method a
     # blueprint test would think to patch.

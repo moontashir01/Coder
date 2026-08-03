@@ -4,6 +4,7 @@ Constructing the ChromaDB client or opening .symbols.db is deferred behind
 get_vector_store()/get_symbol_index(); merely importing the package (or the
 modules that used to hold eager singletons) writes nothing to the cwd.
 """
+
 import os
 import subprocess
 import sys

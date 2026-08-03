@@ -3,15 +3,15 @@
 Matching is tested in keyword-only mode (use_embeddings=False) so Ollama is
 never contacted.
 """
+
 import pytest
 
-from app.skills.loader import SkillLoader, SkillDefinition, _parse_skill_md
+from app.skills.loader import SkillDefinition, SkillLoader, _parse_skill_md
 from app.skills.matcher import (
-    match_skills,
-    build_skills_context,
     _keyword_score,
+    build_skills_context,
+    match_skills,
 )
-
 
 SKILL_MD = """# Skill Name: FastAPI Builder
 
@@ -39,6 +39,7 @@ def skills_dir(tmp_path):
 # Parsing
 # ---------------------------------------------------------------------------
 
+
 def test_parse_skill_md(tmp_path):
     path = tmp_path / "SKILL.md"
     path.write_text(SKILL_MD, encoding="utf-8")
@@ -61,6 +62,7 @@ def test_parse_skill_md_empty_returns_none(tmp_path):
 # Loader
 # ---------------------------------------------------------------------------
 
+
 def test_loader_discovers_skill(skills_dir):
     loader = SkillLoader(skills_dir=skills_dir)
     count = loader.load_all()
@@ -72,9 +74,9 @@ def test_loader_discovers_skill(skills_dir):
 def test_loader_get_by_key_and_name(skills_dir):
     loader = SkillLoader(skills_dir=skills_dir)
     loader.load_all()
-    assert loader.get("fastapi_builder") is not None          # directory key
-    assert loader.get("FastAPI Builder") is not None           # display name
-    assert loader.get("fastapi builder") is not None           # case-insensitive
+    assert loader.get("fastapi_builder") is not None  # directory key
+    assert loader.get("FastAPI Builder") is not None  # display name
+    assert loader.get("fastapi builder") is not None  # case-insensitive
     assert loader.get("does_not_exist") is None
 
 
@@ -100,6 +102,7 @@ def test_loader_missing_dir_returns_zero(tmp_path):
 # ---------------------------------------------------------------------------
 # Matcher
 # ---------------------------------------------------------------------------
+
 
 def _skill(**kw):
     defaults = dict(
@@ -160,8 +163,10 @@ def test_match_skills_caps_at_two(tmp_path):
 
 
 def test_build_skills_context():
-    skills = [_skill(name="Alpha", instructions="alpha steps"),
-              _skill(name="Beta", instructions="beta steps")]
+    skills = [
+        _skill(name="Alpha", instructions="alpha steps"),
+        _skill(name="Beta", instructions="beta steps"),
+    ]
     ctx = build_skills_context(skills)
     assert "Alpha" in ctx
     assert "alpha steps" in ctx

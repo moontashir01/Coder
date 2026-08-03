@@ -41,6 +41,11 @@ class CheckContext:
     # Every turn's answer, in order — so a check can look at what turn 2 said
     # rather than only the last thing printed.
     answers: list[str] = field(default_factory=list)
+    # Memo for the browser-driven checks (Phase W10). Every one of them needs
+    # the app running and a browser open; done per check that is five server
+    # launches and five Chromium starts for one task. Filled in by
+    # `evals.checks._browser_report`, which is the only thing that reads it.
+    browser: object | None = None
 
 
 @dataclass

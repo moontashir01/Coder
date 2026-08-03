@@ -130,6 +130,101 @@ _CREATE_TABLE_HEAD_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
+# SQL dialects (Phase N3, docs/node-stack-plan.md)
+# ---------------------------------------------------------------------------
+# The entity list is the single source of truth for BOTH stacks, so the only
+# thing that may differ between them is how that truth is spelled. Keeping the
+# differences in one small table — rather than in two copies of the DDL writer —
+# is what stops the sqlite schema and the PostgreSQL schema drifting apart while
+# both claim to come from the same `Entity`.
+#
+# `SQLITE` is the default everywhere, so every existing Flask caller is
+# unchanged byte-for-byte.
+
+
+@dataclass(frozen=True)
+class Dialect:
+    """How one database spells the handful of things that differ.
+
+    Five differences, and every one of them is a bug if you get it wrong
+    silently: an autoincrement key that isn't one, a type the server rejects, a
+    placeholder that binds nothing, an insert that cannot report the id it just
+    created, and an ALTER that raises on the second startup.
+    """
+
+    key: str  # "sqlite" | "postgres"
+    # The full declaration for an autoincrement primary key, minus the name.
+    serial_pk: str
+    # Canonical type (`_SQL_TYPES`) -> the type this server actually has.
+    type_map: dict[str, str]
+    # `?` vs `$1` — the reason this is a function and not a constant.
+    positional: bool
+    # How a generated migration is written in the target language.
+    migration_template: str
+
+    def column_type(self, canonical: str) -> str:
+        return self.type_map.get(canonical, canonical)
+
+    def placeholder(self, index: int) -> str:
+        """Bind marker for the ``index``-th value, 1-based."""
+        return f"${index}" if self.positional else "?"
+
+    def placeholders(self, count: int) -> str:
+        return ", ".join(self.placeholder(i) for i in range(1, count + 1))
+
+    def column_ddl(self, name: str, canonical: str, pk: bool, required: bool) -> str:
+        """One column of a CREATE TABLE."""
+        if pk and canonical == "INTEGER":
+            return f"{name} {self.serial_pk}"
+        parts = [name, self.column_type(canonical)]
+        if pk:
+            parts.append("PRIMARY KEY")
+        elif required:
+            parts.append("NOT NULL")
+        return " ".join(parts)
+
+    def migration_call(self, table: str, column: str, canonical: str) -> str:
+        return self.migration_template.format(
+            table=table, column=column, decl=self.column_type(canonical)
+        )
+
+
+SQLITE = Dialect(
+    key="sqlite",
+    serial_pk="INTEGER PRIMARY KEY AUTOINCREMENT",
+    type_map={},  # the canonical names ARE the SQLite storage classes
+    positional=False,
+    # `db.ensure_column` (shipped by the Flask scaffold) is the primitive: a
+    # PRAGMA check then an ALTER, because SQLite has no `IF NOT EXISTS` here.
+    migration_template='ensure_column(conn, "{table}", "{column}", "{decl}")',
+)
+
+POSTGRES = Dialect(
+    key="postgres",
+    serial_pk="SERIAL PRIMARY KEY",
+    # REAL exists in PostgreSQL but is a 4-byte float — wrong for a price, which
+    # is what REAL overwhelmingly means in a generated schema. NUMERIC is exact.
+    type_map={"REAL": "NUMERIC", "BLOB": "BYTEA"},
+    positional=True,
+    # PostgreSQL HAS `ADD COLUMN IF NOT EXISTS`, so `ensureColumn` is a one-liner
+    # rather than sqlite's read-then-alter. It is still DDL against a live
+    # server, which is why a failure must be reported and never swallowed.
+    migration_template='await ensureColumn(client, "{table}", "{column}", "{decl}")',
+)
+
+DIALECTS = {SQLITE.key: SQLITE, POSTGRES.key: POSTGRES}
+
+
+def get_dialect(key: str | None) -> Dialect:
+    """The dialect for ``key``, defaulting to SQLite for anything unknown.
+
+    Total, for `stacks.get_adapter`'s reason: a spec written before dialects
+    existed names none, and that must keep working rather than raising.
+    """
+    return DIALECTS.get(str(key or "").strip().lower(), SQLITE)
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
@@ -145,15 +240,8 @@ class Field:
     required: bool = False
     added_in: int = 1
 
-    def to_ddl(self) -> str:
-        parts = [self.name, self.type]
-        if self.pk:
-            parts.append(
-                "PRIMARY KEY AUTOINCREMENT" if self.type == "INTEGER" else "PRIMARY KEY"
-            )
-        elif self.required:
-            parts.append("NOT NULL")
-        return " ".join(parts)
+    def to_ddl(self, dialect: Dialect = SQLITE) -> str:
+        return dialect.column_ddl(self.name, self.type, self.pk, self.required)
 
     def is_upload(self) -> bool:
         return self.name.endswith(("_path", "_image", "_file")) or self.type in (
@@ -173,7 +261,7 @@ class Entity:
         low = (name or "").lower()
         return next((f for f in self.fields if f.name.lower() == low), None)
 
-    def to_ddl(self) -> str:
+    def to_ddl(self, dialect: Dialect = SQLITE) -> str:
         """`CREATE TABLE IF NOT EXISTS` for the fields present at revision 1.
 
         Fields added later are NOT included: they belong in `migrations()` as
@@ -182,7 +270,7 @@ class Entity:
         `added_in`.
         """
         base = [f for f in self.fields if f.added_in <= 1] or list(self.fields)
-        cols = ",\n    ".join(f.to_ddl() for f in base)
+        cols = ",\n    ".join(f.to_ddl(dialect) for f in base)
         return f"CREATE TABLE IF NOT EXISTS {self.table} (\n    {cols}\n)"
 
     def summary(self) -> str:
@@ -533,7 +621,7 @@ def _searchable_sql(text: str) -> list[str]:
     return sql_strings(text)
 
 
-def entities_from_sql(sources: dict[str, str]) -> list[Entity]:
+def entities_from_sql(sources: dict[str, str], strings_reader=None) -> list[Entity]:
     """Entities recovered from real `CREATE TABLE` statements on disk.
 
     Used only as a fallback when the blueprint declared no schema — the
@@ -545,10 +633,14 @@ def entities_from_sql(sources: dict[str, str]) -> list[Entity]:
     A source that doesn't parse falls back to its raw text, since a half-written
     file is exactly when this information is still worth having.
     """
+    # `_searchable_sql` reads Python string literals via `ast`. A JS project
+    # passes `crud_node.js_strings` instead — same rule (literals only, never a
+    # comment), different language.
+    read_strings = strings_reader or _searchable_sql
     out: list[Entity] = []
     seen: set[str] = set()
     for text in sources.values():
-        for literal in _searchable_sql(text):
+        for literal in read_strings(text):
             for table_raw, cols in _create_table_blocks(literal):
                 table = _ident(table_raw)
                 if not table or table.lower() in seen:
@@ -824,25 +916,25 @@ class ProjectSpec:
 
     # -- schema ----------------------------------------------------------
 
-    def ddl(self) -> list[str]:
+    def ddl(self, dialect: Dialect = SQLITE) -> list[str]:
         """`CREATE TABLE IF NOT EXISTS` per entity, ready to execute."""
-        return [e.to_ddl() for e in self.entities]
+        return [e.to_ddl(dialect) for e in self.entities]
 
-    def migrations(self, since: int = 0) -> list[str]:
-        """`ensure_column(...)` calls for every field added after ``since``.
+    def migrations(self, since: int = 0, dialect: Dialect = SQLITE) -> list[str]:
+        """Column-addition calls for every field added after ``since``.
 
         This is why fields carry `added_in`. Adding a field to an entity in turn
         3 must not mean dropping the table — it means one more idempotent
         `ALTER TABLE ADD COLUMN`, which runs on startup against the rows already
-        stored. `db.ensure_column` (shipped by the scaffold) is the primitive.
+        stored. The scaffold ships the primitive on both stacks:
+        `db.ensure_column` (sqlite, a PRAGMA read then an ALTER) and
+        `db.ensureColumn` (PostgreSQL, `ADD COLUMN IF NOT EXISTS`).
         """
         out: list[str] = []
         for entity in self.entities:
             for f in entity.fields:
                 if f.added_in > since and not f.pk:
-                    out.append(
-                        f'ensure_column(conn, "{entity.table}", "{f.name}", "{f.type}")'
-                    )
+                    out.append(dialect.migration_call(entity.table, f.name, f.type))
         return out
 
     # -- prompt threading -------------------------------------------------
@@ -1317,9 +1409,31 @@ class ProjectSpec:
         if not entities:
             entities = entities_from_sql(py_sources)
 
-        # Real route -> template mapping, when app.py exists.
+        # Phase N0: which files are "the backend" and how a route is spelled in
+        # them is the stack's answer, not `.py` + `@app.route`. Imported inside
+        # the function because `stacks.flask_adapter` imports this module — a
+        # top-level import would close the cycle. On Flask this resolves to
+        # exactly the two lines it replaced.
+        from app.agent.stacks import get_adapter, key_for_stack
+
+        adapter = get_adapter(
+            key_for_stack(
+                stack.language if stack else "", stack.backend if stack else ""
+            )
+        )
+        entry_stem = Path(adapter.entry_file).stem
+        backend_sources = (
+            py_sources
+            if adapter.language == "python"
+            else _read_sources(root, adapter.source_globs)
+        )
+        handler_file = (
+            adapter.entry_file if (root / adapter.entry_file).is_file() else ""
+        )
+
+        # Real route -> template mapping, when the server file exists.
         route_map: dict[str, tuple[str, str]] = {}  # template -> (method, path)
-        routes = routes_from_source(py_sources.get("app", ""))
+        routes = adapter.routes_from_source(backend_sources.get(entry_stem, ""))
         for method, path, _view, template in routes:
             if template and template not in route_map:
                 route_map[template] = (method, path)
@@ -1331,7 +1445,7 @@ class ProjectSpec:
         # blueprint declared `POST /api/login`, the coverage check reported it
         # unwired on the same turn, and the spec claimed it existed.
         real_routes = {(m, p) for m, p, _v, _t in routes}
-        backend_text = "\n".join(py_sources.values())
+        backend_text = "\n".join(backend_sources.values())
         endpoints: list[SpecEndpoint] = []
         for ep in bp.contract.endpoints[:MAX_ENDPOINTS]:
             defined = (
@@ -1352,7 +1466,7 @@ class ProjectSpec:
                     path=ep.path,
                     request=ep.request,
                     response=ep.response,
-                    handler="app.py" if (root / "app.py").is_file() else "",
+                    handler=handler_file,
                     template=_norm_filename(ep.template),
                     # Declared by the layout call (Phase C2) when it said so;
                     # `_guess_entity`'s substring match on the path is now the
@@ -1369,7 +1483,7 @@ class ProjectSpec:
                     SpecEndpoint(
                         method=method,
                         path=path,
-                        handler="app.py",
+                        handler=handler_file or adapter.entry_file,
                         template=template,
                         entity=_guess_entity(path, entities),
                     )
@@ -1387,13 +1501,17 @@ class ProjectSpec:
                 purpose=" ".join((pf.instruction or "").split())[:120],
                 reads=tuple(pf.reads)[:5],
             )
-            if not fname.lower().endswith((".html", ".htm")):
+            # Phase N0: `.ejs` is a page on the Node stack. Without the stack's
+            # own extension here a Node build records ZERO pages, and a spec
+            # with no pages silently disarms the functional probe's "every page
+            # renders" step and `_resolve_target_from_spec`.
+            if not fname.lower().endswith((".html", ".htm", adapter.template_ext)):
                 continue
             if is_layout_template(root / fname, fname):
                 continue  # the shell every page extends is not itself a page
             if len(pages) >= MAX_PAGES:
                 continue
-            template_key = fname.split("templates/", 1)[-1]
+            template_key = fname.split(f"{adapter.template_dir}/", 1)[-1]
             method_path = route_map.get(fname) or route_map.get(template_key)
             stem = Path(fname).stem
             seen_templates.add(fname)
@@ -1425,7 +1543,9 @@ class ProjectSpec:
         for method, path, _view, template in routes:
             if method != "GET" or not template or len(pages) >= MAX_PAGES:
                 continue
-            resolved = _resolve_template(root, template)
+            resolved = _resolve_template(
+                root, template, adapter.template_dir, adapter.template_ext
+            )
             if not resolved or resolved in seen_templates:
                 continue
             if is_layout_template(root / resolved, resolved):
@@ -1487,30 +1607,59 @@ class ProjectSpec:
         than being adopted wrongly.
         """
         root = Path(root)
+        # Phase N4: try Python/Flask first — unchanged, so an existing Flask
+        # repo adopts exactly as it did — then Node. Whichever yields real
+        # routes wins; if neither does, this still declines, so an ordinary
+        # folder never acquires an invented contract.
         py_sources = _read_python(root)
-        if not py_sources:
+        sources, ext, read_strings, language = py_sources, ".py", None, "python"
+        read_routes = routes_from_source
+        template_dir, template_ext = "templates", ".html"
+
+        if not _has_routes(py_sources, routes_from_source):
+            from app.agent.crud_node import js_strings
+            from app.agent.stacks import get_adapter
+
+            node = get_adapter("node")
+            js_sources = _read_sources(root, node.source_globs)
+            if not _has_routes(js_sources, node.routes_from_source):
+                return None
+            sources, ext, read_strings, language = (
+                js_sources,
+                ".js",
+                js_strings,
+                "node",
+            )
+            read_routes = node.routes_from_source
+            template_dir, template_ext = node.template_dir, node.template_ext
+
+        if not sources:
             return None
 
         # (method, path) -> handler file, keeping the first definition seen.
         handlers: dict[tuple[str, str], str] = {}
         routes: list[tuple[str, str, str, str]] = []
-        for stem in sorted(py_sources):
-            for method, path, view, template in routes_from_source(py_sources[stem]):
+        for stem in sorted(sources):
+            for method, path, view, template in read_routes(sources[stem]):
                 key = (method, path)
                 if key in handlers:
                     continue
-                handlers[key] = f"{stem}.py"
+                handlers[key] = f"{stem}{ext}"
                 routes.append((method, path, view, template))
         if not routes:
             return None
 
-        entities = entities_from_sql(py_sources)
+        entities = entities_from_sql(sources, read_strings)
 
         endpoints: list[SpecEndpoint] = []
         pages: list[Page] = []
         seen_templates: set[str] = set()
         for method, path, _view, template in routes:
-            resolved = _resolve_template(root, template) if template else ""
+            resolved = (
+                _resolve_template(root, template, template_dir, template_ext)
+                if template
+                else ""
+            )
             if len(endpoints) < MAX_ENDPOINTS:
                 endpoints.append(
                     SpecEndpoint(
@@ -1554,15 +1703,18 @@ class ProjectSpec:
             )
             for rel in _disk_files(root)
         }
-        flask = any(uses_flask(text) for text in py_sources.values())
+        if language == "node":
+            backend = "express"
+        else:
+            backend = "flask" if any(uses_flask(t) for t in sources.values()) else ""
         return cls(
             name=root.name,
             summary=(
                 f"Existing project read from disk: {len(entities)} table(s), "
                 f"{len(endpoints)} route(s), {len(pages)} page(s)."
             ),
-            language="python",
-            backend="flask" if flask else "",
+            language=language,
+            backend=backend,
             revision=1,
             entities=tuple(entities),
             endpoints=tuple(endpoints),
@@ -1584,8 +1736,11 @@ def is_layout_template(path: Path, filename: str = "") -> bool:
     an amendment turn would then try to link to. Detected by name and, more
     reliably, by shape: it defines `{% block %}`s without extending anything.
     """
-    if Path(filename or path).name.lower() in ("base.html", "layout.html"):
+    name = Path(filename or path).name.lower()
+    if name in ("base.html", "layout.html", "layout.ejs"):
         return True
+    if name.startswith("_"):
+        return True  # a partial / macro file, on either stack
     try:
         text = Path(path).read_text(encoding="utf-8", errors="replace")
     except Exception:
@@ -1593,15 +1748,27 @@ def is_layout_template(path: Path, filename: str = "") -> bool:
     return "{% block" in text and "{% extends" not in text
 
 
-def _resolve_template(root: Path, template: str) -> str:
-    """`render_template("index.html")` -> the repo-relative path it refers to."""
+def _resolve_template(
+    root: Path, template: str, subdir: str = "templates", ext: str = ""
+) -> str:
+    """`render_template("index.html")` -> the repo-relative path it refers to.
+
+    ``subdir``/``ext`` come from the stack. Express names a view WITHOUT its
+    extension (`res.render("products")` -> `views/products.ejs`), so the
+    extension has to be supplied rather than assumed to be part of the name.
+    Falls back to the conventional path when nothing matches on disk, which is
+    what lets a page be recorded before the file is written.
+    """
     name = _norm_filename(template)
     if not name:
         return ""
-    for candidate in (f"templates/{name}", name):
+    names = [name]
+    if ext and not name.lower().endswith(ext):
+        names.append(f"{name}{ext}")
+    for candidate in [f"{subdir}/{n}" for n in names] + names:
         if (root / candidate).is_file():
             return candidate
-    return f"templates/{name}"
+    return f"{subdir}/{names[-1]}"
 
 
 def _nav_label(stem: str) -> str:
@@ -1635,6 +1802,41 @@ def _role_for(filename: str) -> str:
     if low.endswith(".py"):
         return "backend"
     return "config"
+
+
+def _has_routes(sources: dict[str, str], reader) -> bool:
+    """Does any of these modules really define a route? Best-effort.
+
+    The gate that decides which stack `from_disk` adopts as, and the reason it
+    can decline entirely: a folder of ordinary Python or JavaScript defines no
+    routes and must never acquire an invented contract.
+    """
+    for text in (sources or {}).values():
+        try:
+            if reader(text):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _read_sources(root: Path, globs: tuple[str, ...]) -> dict[str, str]:
+    """Top-level sources matching ``globs``, keyed by stem. Best-effort.
+
+    The stack-agnostic form of `_read_python`: the Node adapter's globs pick up
+    `server.js` / `models.js` where Flask's pick up `app.py` / `models.py`.
+    """
+    out: dict[str, str] = {}
+    for glob in globs:
+        try:
+            for path in sorted(root.glob(glob)):
+                try:
+                    out[path.stem] = path.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+        except Exception:
+            logger.debug("could not list %s in %s", glob, root)
+    return out
 
 
 def _read_python(root: Path) -> dict[str, str]:
@@ -1678,6 +1880,13 @@ _DISK_GLOBS = (
     "templates/**/*.htm",
     "static/**/*.css",
     "static/**/*.js",
+    # The Node layout (Phase N4). `node_modules/` is not reachable by any of
+    # these, which is the point — a vendored dependency tree would flood
+    # `files` and it rides in a prompt.
+    "*.js",
+    "views/**/*.ejs",
+    "public/**/*.css",
+    "public/**/*.js",
 )
 
 

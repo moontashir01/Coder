@@ -460,3 +460,82 @@ async def test_chat_falls_through_to_the_blueprint_when_the_amendment_declines(
     answer, _ = await agent.chat("add a footer to the page")
     assert answer == "normal routing"
     assert routed
+
+
+# ---------------------------------------------------------------------------
+# The restyle pass — "now make it purple" on turn 2
+# ---------------------------------------------------------------------------
+# The whole design system is written in custom properties so a restyle is a
+# one-file change. But `write_theme`'s only caller sat beside the scaffold copy,
+# and `scaffold_flask` returns nothing once the files exist — so from turn 2 on
+# every restyle request was deterministically a no-op, on a demo built in parts.
+
+
+def _write_theme_file(root):
+    css = root / "static" / "css" / "theme.css"
+    css.parent.mkdir(parents=True, exist_ok=True)
+    css.write_text(":root {\n  --color-accent: #5b9bff;\n}\n", encoding="utf-8")
+    return css
+
+
+async def test_restyle_rewrites_the_theme_on_a_later_turn(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_project(tmp_path)
+    css = _write_theme_file(tmp_path)
+    agent = AgentCore(session_id="pytest_restyle")
+
+    note = agent._restyle_project(tmp_path, "now make it purple")
+
+    written = css.read_text(encoding="utf-8")
+    assert "--color-accent" in written and "#5b9bff" not in written
+    assert "purple" in note.lower()
+    # A restyle changes no markup — that is the point of the token layer.
+    assert "no markup changed" in note
+
+
+async def test_restyle_leaves_the_theme_alone_when_no_look_was_asked_for(
+    tmp_path, monkeypatch
+):
+    """The rule `write_theme` was written to protect: a theme the user
+    hand-edits must survive the next turn."""
+    monkeypatch.chdir(tmp_path)
+    _write_project(tmp_path)
+    css = _write_theme_file(tmp_path)
+    before = css.read_text(encoding="utf-8")
+    agent = AgentCore(session_id="pytest_restyle_noop")
+
+    assert agent._restyle_project(tmp_path, "add a checkout page") == ""
+    assert css.read_text(encoding="utf-8") == before
+
+
+async def test_restyle_never_introduces_a_theme_to_a_project_without_one(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    _write_project(tmp_path)
+    agent = AgentCore(session_id="pytest_restyle_absent")
+
+    assert agent._restyle_project(tmp_path, "make it purple") == ""
+    assert not (tmp_path / "static" / "css" / "theme.css").exists()
+
+
+async def test_a_pure_restyle_is_reported_even_with_an_empty_delta(
+    tmp_path, monkeypatch
+):
+    """A restyle produces no entities, fields or files, so the delta is empty
+    and `_amend_project` returned None here — the turn then fell through to
+    routing that rewrites no theme, and nothing happened at all."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "expand_requirements", True)
+    _write_project(tmp_path)
+    css = _write_theme_file(tmp_path)
+    spec = _bookshop_spec()
+    spec.save(tmp_path)
+
+    agent = AgentCore(session_id="pytest_restyle_delta")
+    agent._llm_blueprint = ScriptedLLM(['{"summary": "restyle"}'])
+
+    answer, trace = await agent._amend_project("now make it purple", spec, [])
+
+    assert answer and "restyled" in answer.lower()
+    assert "#5b9bff" not in css.read_text(encoding="utf-8")

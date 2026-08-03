@@ -67,7 +67,9 @@ class Executor:
             return False
         return True
 
-    async def execute(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def execute(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
         """Look up, validate, and call a tool. Supports sync and async handlers."""
         try:
             tool = self._registry.get(tool_name)
@@ -88,7 +90,11 @@ class Executor:
 
         error = _validate_args(tool.parameters, arguments)
         if error:
-            return {"success": False, "result": "", "error": f"Argument validation failed: {error}"}
+            return {
+                "success": False,
+                "result": "",
+                "error": f"Argument validation failed: {error}",
+            }
 
         # Human-in-the-loop approval (Step 6 / S3, S6): consult the hook before
         # running any mutating/shell tool.
@@ -116,4 +122,8 @@ class Executor:
         except TypeError as e:
             return {"success": False, "result": "", "error": f"Tool call error: {e}"}
         except Exception as e:
-            return {"success": False, "result": "", "error": f"Tool execution error: {e}"}
+            return {
+                "success": False,
+                "result": "",
+                "error": f"Tool execution error: {e}",
+            }

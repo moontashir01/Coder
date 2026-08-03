@@ -438,7 +438,7 @@ async def test_route_one_multistep_runs_tool_loop_without_project(monkeypatch):
 
 
 async def test_route_one_repair_request_escalates_to_tool_loop(monkeypatch):
-    """"fix the navigation" names no file the gates recognize. It must reach the
+    """ "fix the navigation" names no file the gates recognize. It must reach the
     tool loop, not _direct_answer — that path carries no tools, so the model can
     only reply "please paste the file contents" (the reported failure)."""
     a = AgentCore(session_id="pytest_repair")

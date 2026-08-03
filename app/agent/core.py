@@ -3,7 +3,6 @@ import json
 import logging
 import re
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -21,27 +20,24 @@ from app.agent.blueprint import (
     should_blueprint,
     wants_static_only,
 )
+from app.agent.browser import available as browser_available
+from app.agent.browser import install_hint as browser_install_hint
 from app.agent.buildspec import (
     SPEC_INSTRUCTIONS,
     BuildSpec,
     build_spec_from_data,
     mentions_shared_spec,
+    resolve_theme,
+    theme_css,
+    wants_restyle,
 )
+from app.agent.candidates import describe_choice, is_high_value, pick_best
 from app.agent.context_budget import render_transcript, split_history_at_budget
-from app.agent.crud import (
-    api_context,
-    apply_table_block,
-    models_source,
-    plaintext_password_writes,
-    seed_source,
-)
+from app.agent.crud import plaintext_password_writes
 from app.agent.executor import Executor
 from app.agent.impact import (
-    DB_FILE,
-    apply_migration_block,
     describe,
     impacted_files,
-    migration_block,
     restore_page_routes,
     vanished_routes,
 )
@@ -52,6 +48,13 @@ from app.agent.intent import (
     filter_complaints,
     parse_verdict,
     should_check_intent,
+)
+from app.agent.pageaudit import (
+    Finding,
+    SiteAudit,
+    audit_site,
+    repair_instruction,
+    repair_plan,
 )
 from app.agent.planner import Planner, _extract_json
 from app.agent.projectspec import (
@@ -83,25 +86,28 @@ from app.agent.references import (
     set_active_link,
 )
 from app.agent.runtime_probe import detect_stack
-from app.agent.scaffold import (
-    convert_to_child_template,
-    is_frozen,
-    is_web_app,
-    project_name,
-    restore_index_route,
-    scaffold_context,
-    scaffold_flask,
-    templates_without_inheritance,
-)
-from app.agent.smoke import run_smoke_test
+from app.agent.scaffold import BlockRegion, is_web_app, project_name
+from app.agent.smoke import ProbeCheck, run_smoke_test
+from app.agent.stacks import get_adapter, probe_prefer, resolve_key
+from app.agent.templatedeps import TemplateGraph, build_graph
 from app.agent.tool_registry import ToolRegistry, create_registry
 from app.agent.verify import (
     check_file,
+    fix_endpoint_names,
     fix_form_enctype,
+    form_method_mismatches,
     is_verifiable,
     strip_external_assets,
+    unresolved_endpoints,
 )
-from app.agent.vision import _describe_image, is_image
+from app.agent.vision import _describe_image, ask_about_image, is_image
+from app.agent.visualcheck import (
+    VISUAL_SYSTEM,
+    build_visual_prompt,
+    build_visual_repair_prompt,
+    filter_visual_complaints,
+    parse_visual_verdict,
+)
 from app.memory.conversation import ConversationMemory
 from app.memory.project_memory import ProjectMemory, project_memory
 from app.models.llm import get_llm, get_streaming_llm
@@ -209,8 +215,13 @@ def _blueprint_from_spec(spec: ProjectSpec) -> Blueprint:
             ),
             data_schema=tuple(e.summary() for e in spec.entities),
         ),
+        # Phase N1: the SPEC's stack, not the session setting. This blueprint is
+        # rebuilt from a project that already exists, so opening a Node project
+        # with `web_stack` left at "flask" must not make the post-amendment
+        # checks run the wrong scaffold's rules against it.
         stack=detect_stack(
-            allow_network=settings.allow_network, prefer=settings.web_stack
+            allow_network=settings.allow_network,
+            prefer=probe_prefer(spec, settings.web_stack),
         ),
     )
 
@@ -1006,6 +1017,25 @@ class AgentCore:
         # of flip-flopping between an actionable and a thin blueprint run to run.
         self._llm_blueprint = get_llm(temperature=0.0, json_mode=True)
         self._llm_stream = get_streaming_llm(temperature=0.1)
+        # W9 roles. Empty setting = None here, and the properties below then
+        # hand back the general instance — so `/model`, `set_model` and every
+        # test that patches `_llm_blueprint`/`_llm_edit` keep working unchanged,
+        # and a role model only exists when someone asked for one.
+        self._llm_planner_override = (
+            get_llm(temperature=0.0, json_mode=True, model=settings.planner_model)
+            if settings.planner_model
+            else None
+        )
+        self._llm_judge_override = (
+            get_llm(temperature=0.0, json_mode=False, model=settings.judge_model)
+            if settings.judge_model
+            else None
+        )
+        # The extra samples for best-of-N, drawn hotter than the first so they
+        # actually differ. Built once; unused when best_of_n is 1 (the default).
+        self._llm_sample = get_llm(
+            temperature=settings.best_of_temperature, json_mode=False
+        )
         self._project_path: str | None = None
         # The project's persistent contract (app/agent/projectspec.py), reloaded
         # at the top of every chat() turn. None means "no memory yet".
@@ -1029,10 +1059,39 @@ class AgentCore:
         # which swaps the loaded Ollama model and takes seconds). The REPL
         # installs a hook that writes into its Live region; unset = silent.
         self.status_hook: Callable[[str], None] | None = None
+        # Request text -> the entities `_extract_schema` returned for it (W9).
+        # Per session and never persisted: it exists to stop `/plan` and the
+        # build that follows it paying twice for a temperature-0 answer.
+        self._schema_cache: dict[str, tuple[Entity, ...]] = {}
         # Image path (+ mtime/size) -> description. One screenshot is referenced
         # by every sub-task of a compound build, and each vision call costs a
         # model swap, so describe it once and reuse it until the file changes.
         self._image_desc_cache: dict[tuple, str] = {}
+        # Phase N0: which stack this turn builds on. Chosen once per turn in
+        # chat() from the SPEC first and the setting second (see `_adapter`), so
+        # opening a Node project with web_stack left at "flask" cannot send an
+        # amendment to write Python `ensure_column` calls into a db.py that does
+        # not exist. Defaults to Flask, which is what every path did before the
+        # seam existed.
+        self._stack_key: str = ""
+
+    @property
+    def _adapter(self):
+        """The stack adapter for this turn — Flask unless the project says Node.
+
+        A property rather than an attribute set in `__init__`: the tests (and
+        `/plan`, and `preview_amendment`) call the flows directly without going
+        through `chat()`, and every one of them must still get today's Flask
+        behaviour rather than whatever the last turn left behind.
+        """
+        return get_adapter(self._stack_key or resolve_key(None, settings.web_stack))
+
+    def _select_stack(self, spec: ProjectSpec | None) -> None:
+        """Pin this turn's stack. **Project memory beats the session default.**
+
+        The load-bearing rule of Phase N1 — see `stacks.resolve_key`.
+        """
+        self._stack_key = resolve_key(spec, settings.web_stack)
 
     # ------------------------------------------------------------------
     # Project management
@@ -1115,6 +1174,22 @@ class AgentCore:
                 self._watcher.stop()
             finally:
                 self._watcher = None
+
+    @property
+    def _llm_planner(self):
+        """The model that PLANS (blueprint, schema, delta, web-intent).
+
+        A property, not an attribute: with no `planner_model` set it must be the
+        live `_llm_blueprint`, which `set_model` replaces and tests patch. An
+        attribute captured at construction would silently keep the old object.
+        """
+        return self._llm_planner_override or self._llm_blueprint
+
+    @property
+    def _llm_judge(self):
+        """The model that JUDGES (intent). See `_llm_planner` for why it's a
+        property — `tests/test_intent.py` patches `_llm_edit` after construction."""
+        return self._llm_judge_override or self._llm_edit
 
     def set_skills_context(self, skills_text: str) -> None:
         self._skills_context = skills_text
@@ -1659,6 +1734,22 @@ class AgentCore:
             return ""
         return spec.to_context_block()
 
+    def _template_graph(self) -> TemplateGraph:
+        """The project's Jinja edges, read fresh (Phase W8).
+
+        Deliberately not cached: it is a handful of small files next to an LLM
+        call, and a cache would go stale on exactly the turn that just wrote a
+        template — the turn that needs it. Best-effort, like every other
+        derived-from-disk fact here.
+        """
+        try:
+            return self._adapter.build_template_graph(
+                Path(self._project_path or Path.cwd())
+            )
+        except Exception:
+            logger.debug("template graph unavailable", exc_info=True)
+            return TemplateGraph()
+
     def _resolve_target_from_spec(self, user_message: str) -> str | None:
         """ "the products page" → `templates/products.html` (D4).
 
@@ -1706,6 +1797,16 @@ class AgentCore:
             for name in spec.files:
                 if _named(Path(name).stem):
                     hits.add(name)
+        if not hits:
+            # W8: nothing in the spec's own vocabulary matched. The templates
+            # themselves know which page shows a product — "put the price on the
+            # product listing" names no page, no route and no file. Same
+            # strictness: exactly one template, or fall through.
+            named_entities = [
+                e.name for e in spec.entities if _named(e.name) or _named(e.table)
+            ]
+            if named_entities:
+                hits.update(self._template_graph().templates_reading(*named_entities))
         if len(hits) != 1:
             return None
         found = hits.pop()
@@ -1771,13 +1872,34 @@ class AgentCore:
 
         # Editing an existing file → try a surgical SEARCH/REPLACE edit first.
         if full_existing and target_path is not None:
+            # W3: on a child template the edit almost always belongs to ONE
+            # block, and a 7B's SEARCH/REPLACE routinely replaces the whole file
+            # with just that block — deleting `{% extends %}` and the title with
+            # it. Send only the block body and the rest is untouchable by
+            # construction, which beats `_restore_scaffold_invariants` repairing
+            # it afterwards. None here (not a template, no `{% extends %}`,
+            # ambiguous blocks) means today's path, unchanged.
+            region = self._adapter.template_edit_region(filename, full_existing)
             edited = await self._surgical_edit(
                 filename,
                 target_path,
                 full_existing,
                 user_message,
                 extra_context=extra_context,
+                region=region,
             )
+            if edited is None and region is not None:
+                # The edit did not belong to that block after all (a request
+                # about the title, say). Fall back to the whole-file SEARCH/
+                # REPLACE path *before* the rewrite — it is the existing, tested
+                # behaviour, and it must never become a new failure mode.
+                edited = await self._surgical_edit(
+                    filename,
+                    target_path,
+                    full_existing,
+                    user_message,
+                    extra_context=extra_context,
+                )
             if edited is not None:
                 return edited
             # else: blocks didn't parse/match → fall through to whole-file rewrite.
@@ -1818,8 +1940,13 @@ class AgentCore:
         except Exception as e:
             return f"LLM error while generating the file: {e}", []
 
-        name, content = _parse_file_output(
-            raw, fallback=filename or _infer_filename(user_message), target=filename
+        fallback = filename or _infer_filename(user_message)
+        name, content = _parse_file_output(raw, fallback=fallback, target=filename)
+        # W9: for a file where one bad line costs the whole page, sample again
+        # and keep whichever candidate the deterministic checks prefer. Default
+        # N=1 skips this entirely.
+        content, choice_note = await self._best_of_candidates(
+            messages, name, content, fallback, filename, workdir, on_token
         )
         out_path = workdir / name
         result = await self.executor.execute(
@@ -1836,6 +1963,8 @@ class AgentCore:
         if result.get("success"):
             verb = "Updated" if full_existing else "Created"
             answer = f"{verb} `{name}` ({len(content)} bytes) in {workdir}"
+            if choice_note:
+                answer += f" — {choice_note}"
             note, extra = await self._verify_and_repair(
                 out_path, name, user_message, extra_context
             )
@@ -1848,6 +1977,65 @@ class AgentCore:
             answer = f"Failed to write {name}: {result.get('error')}"
         return answer, trace
 
+    async def _best_of_candidates(
+        self,
+        messages: list,
+        name: str,
+        first: str,
+        fallback: str,
+        target: str | None,
+        workdir: Path,
+        on_token: Callable[[str], None] | None,
+    ) -> tuple[str, str]:
+        """Sample the same file again and keep the best one (Phase W9).
+
+        Returns `(content, note)`. The note is non-empty only when more than one
+        candidate really was generated — a silent doubling of latency is exactly
+        what a user should be able to see, and switch off.
+
+        Three things it will not do:
+          * **Nothing at N=1**, the default. The extra call is opt-in.
+          * **Nothing while streaming.** The user is watching candidate #1's
+            tokens; showing those and then shipping #2 would be a lie.
+          * **Nothing for a file where a defect is cheap** (`is_high_value`).
+        """
+        n = max(1, int(settings.best_of_n))
+        if n < 2 or on_token is not None or not is_high_value(name):
+            return first, ""
+
+        candidates: list[tuple[str, str]] = [(name, first)]
+        for _ in range(n - 1):
+            try:
+                raw = await asyncio.to_thread(
+                    lambda: str(self._llm_sample.invoke(messages).content)
+                )
+            except Exception:
+                logger.debug("best-of-N: extra sample failed", exc_info=True)
+                break
+            other_name, other = _parse_file_output(
+                raw, fallback=fallback, target=target
+            )
+            if other.strip():
+                candidates.append((other_name, other))
+        if len(candidates) < 2:
+            return first, ""
+
+        # The endpoint set makes the `url_for` half of the score real; without
+        # the server file on disk it is skipped rather than guessed (see
+        # `score_candidate`).
+        endpoints: set[str] | None = None
+        try:
+            entry = workdir / self._adapter.entry_file
+            source = entry.read_text(encoding="utf-8", errors="replace")
+            routes = self._adapter.routes_from_source(source)
+            if routes:
+                endpoints = {view for _m, _p, view, _t in routes}
+        except Exception:
+            endpoints = None
+
+        best, scores = pick_best(candidates, name, endpoints)
+        return candidates[best][1], describe_choice(best, scores)
+
     async def _surgical_edit(
         self,
         filename: str,
@@ -1855,11 +2043,18 @@ class AgentCore:
         full_content: str,
         user_message: str,
         extra_context: str = "",
+        region: BlockRegion | None = None,
     ) -> tuple[str, list[dict]] | None:
         """Edit an existing file via SEARCH/REPLACE blocks.
 
         Returns (answer, trace) on success, or None to signal the caller should
         fall back to a whole-file rewrite (no blocks parsed, or none matched).
+
+        ``region`` (Phase W3) confines the edit to one Jinja block: the model is
+        shown only that block's body, the blocks it returns are matched only
+        against that body, and the result is spliced back. `{% extends %}`,
+        `{% block title %}` and the file's other blocks cannot be lost, because
+        they are never part of the text being edited.
         """
         # Deliberately NOT the full persona prompt — its "confirm what you did"
         # rule pushes the model toward prose. Keep it a strict editing engine.
@@ -1871,8 +2066,29 @@ class AgentCore:
         guard = _extension_guard(filename)
         guard_line = f"IMPORTANT: {guard}\n\n" if guard else ""
         extra_block = f"{extra_context}\n\n" if extra_context else ""
+        editable = full_content if region is None else region.body
+        if region is None:
+            head = f"File: {filename}\nCurrent content:\n{full_content[:6000]}\n\n"
+        else:
+            siblings = (
+                " Its other block(s): "
+                + ", ".join(f"{{% block {n} %}}" for n in region.siblings)
+                + "."
+                if region.siblings
+                else ""
+            )
+            head = (
+                f"File: {filename} — a Jinja child template. It extends "
+                '"base.html", which owns the <html> document, the <head>, the '
+                f"navigation and the footer.{siblings}\n"
+                f"You are editing ONLY the body of {{% block {region.name} %}}, "
+                "shown below. Do not output any `{% extends %}`, `{% block %}` "
+                "or `{% endblock %}` line — they are not part of this text, and "
+                "SEARCH must match the text below exactly.\n\n"
+                f"Body of {{% block {region.name} %}}:\n{region.body[:6000]}\n\n"
+            )
         ctx = (
-            f"File: {filename}\nCurrent content:\n{full_content[:6000]}\n\n"
+            f"{head}"
             f"{extra_block}"
             f"{guard_line}"
             f"Request: {user_message}\n\n"
@@ -1907,9 +2123,13 @@ class AgentCore:
             if not blocks:
                 return None
 
-        new_content, applied, failed = _apply_search_replace(full_content, blocks)
+        new_content, applied, failed = _apply_search_replace(editable, blocks)
         if applied == 0:
             return None  # nothing matched → let caller rewrite the whole file
+        if region is not None:
+            # The ONLY writer of the spliced file: everything outside the block
+            # is copied through byte-for-byte.
+            new_content = region.splice(full_content, new_content)
 
         result = await self.executor.execute(
             "write_file", {"path": str(target_path), "content": new_content}
@@ -1923,6 +2143,8 @@ class AgentCore:
         ]
         if result.get("success"):
             answer = f"Edited `{filename}`: {applied} change(s) applied"
+            if region is not None:
+                answer += f" inside {{% block {region.name} %}}"
             if failed:
                 answer += f" ({failed} block(s) didn't match the file)"
             note, extra = await self._verify_and_repair(
@@ -1967,6 +2189,7 @@ class AgentCore:
         # unstyled). Runs first so the syntax check sees the final content.
         offline_note = await self._strip_offline_dead_assets(target_path, filename)
         enctype_note = await self._fix_upload_form(target_path, filename)
+        endpoint_note = await self._check_endpoints(target_path, filename)
 
         note, trace = await self._syntax_repair(target_path, filename)
         if note.startswith("verification failed"):
@@ -1984,10 +2207,68 @@ class AgentCore:
         # reintroduce the very names it fixes.
         import_note = await self._repair_missing_imports(target_path, filename)
 
-        for extra_note in (intent_note, offline_note, import_note, enctype_note):
+        for extra_note in (
+            intent_note,
+            offline_note,
+            import_note,
+            enctype_note,
+            endpoint_note,
+        ):
             if extra_note:
                 note = f"{note}; {extra_note}" if note else extra_note
         return note, trace
+
+    async def _check_endpoints(self, target_path: Path, filename: str) -> str:
+        """Validate a template's `url_for` targets against app.py (Phase W2).
+
+        A misnamed endpoint is a Jinja BuildError — a 500 on that page, from a
+        file that parses, renders in isolation and passes every other check.
+        Deterministic: a near-miss of a real view is a naming slip and is
+        repointed; anything else is reported, because inventing the route would
+        be generation.
+        """
+        if target_path.suffix.lower() not in (".html", ".htm"):
+            return ""
+        entry = Path(self._project_path or Path.cwd()) / self._adapter.entry_file
+        try:
+            routes = self._adapter.routes_from_source(
+                entry.read_text(encoding="utf-8", errors="replace")
+            )
+        except Exception:
+            return ""  # not a project of this shape, or the entry isn't written yet
+        if not routes:
+            return ""
+
+        try:
+            text = target_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+
+        # Phase N4: WHICH link is broken is the stack's question — Jinja names a
+        # route by its view (`url_for('products')`), EJS by its path
+        # (`href="/products"`). The rules are identical either way: repoint only
+        # an unambiguous near miss, report everything else.
+        fixed, fixes, problems = self._adapter.check_links(text, routes)
+
+        notes: list[str] = []
+        if fixes and fixed != text:
+            result = await self.executor.execute(
+                "write_file", {"path": str(target_path), "content": fixed}
+            )
+            if result.get("success"):
+                notes.append(
+                    "repointed " + ", ".join(f"{old} -> {new}" for old, new in fixes)
+                )
+            else:
+                logger.debug("endpoint fix: write failed for %s", filename)
+        if problems:
+            # Reported, not repaired: the fix is a route in the server file,
+            # which is the coverage check's job, not this file's.
+            notes.append(
+                "may not meet: "
+                + ", ".join(p.replace("may not meet: ", "") for p in problems)
+            )
+        return "; ".join(notes)
 
     async def _fix_upload_form(self, target_path: Path, filename: str) -> str:
         """Give a file-upload form the `enctype` it cannot work without.
@@ -2097,15 +2378,23 @@ class AgentCore:
         Reported, never fabricated: writing the missing function means inventing
         a query, which is generation rather than repair.
         """
+        # Python only, and deliberately: `unresolved_local_calls` /
+        # `duplicate_definitions` are built on stdlib `ast`. Handing them a `.js`
+        # file would not fail loudly, it would report nothing — so the Node
+        # adapter's source_globs give it nothing to read rather than a check
+        # that silently passes. The JS equivalent is phase N4's.
+        if self._adapter.language != "python":
+            return []
         sources: dict[str, str] = {}
         try:
-            for path in sorted(workdir.glob("*.py")):
-                try:
-                    sources[path.stem] = path.read_text(
-                        encoding="utf-8", errors="replace"
-                    )
-                except Exception:
-                    logger.debug("cross-module check: could not read %s", path.name)
+            for glob in self._adapter.source_globs:
+                for path in sorted(workdir.glob(glob)):
+                    try:
+                        sources[path.stem] = path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                    except Exception:
+                        logger.debug("cross-module check: could not read %s", path.name)
         except Exception:
             logger.debug("cross-module check: could not list %s", workdir)
             return []
@@ -2265,7 +2554,10 @@ class AgentCore:
         ]
         try:
             # Temperature 0 — a checker must not be creative about requirements.
-            raw = self._llm_edit.invoke(messages).content
+            # `_llm_judge` is `_llm_edit` unless a `judge_model` was chosen (W9):
+            # judging is a reasoning call, not codegen, and a different model may
+            # be better at it. Nothing changes until someone sets one.
+            raw = self._llm_judge.invoke(messages).content
         except Exception as e:
             logger.debug("intent check LLM error for %s: %s", filename, e)
             return []
@@ -2604,7 +2896,7 @@ class AgentCore:
             HumanMessage(content=f"Message: {user_message}\n\nYES or NO:"),
         ]
         try:
-            raw = str(self._llm_blueprint.invoke(messages).content or "")
+            raw = str(self._llm_planner.invoke(messages).content or "")
         except Exception as e:
             logger.debug("web-intent classification failed: %s", e)
             return False
@@ -2630,17 +2922,31 @@ class AgentCore:
         before this stage existed, taking the schema from the blueprint's own
         free-text `data_schema`.
         """
+        # W9's speed lever, and the cheapest one available: the call is
+        # temperature 0, so the same request in the same session cannot produce
+        # a different schema — and a re-run does happen, because `/plan`
+        # previews an amendment with the same message the build then uses
+        # ("preview == execution" is a documented requirement). Per session, not
+        # global: a cache that outlived the session would answer for a project
+        # it had never seen.
+        key = " ".join((user_message or "").lower().split())
+        if key in self._schema_cache:
+            return self._schema_cache[key]
+
         messages = [
             SystemMessage(content=_load_schema_prompt()),
             HumanMessage(content=f"Request: {user_message}\n\nOutput the JSON now:"),
         ]
         try:
-            raw = self._llm_blueprint.invoke(messages).content
+            raw = self._llm_planner.invoke(messages).content
             parsed = _extract_json(str(raw))
         except Exception as e:
             logger.debug("schema extraction failed: %s", e)
-            return ()
-        return entities_from_data(parsed if isinstance(parsed, dict) else None)
+            return ()  # NOT cached: a failure is a transient, not an answer
+        entities = entities_from_data(parsed if isinstance(parsed, dict) else None)
+        if entities:
+            self._schema_cache[key] = entities
+        return entities
 
     async def _expand_requirements(
         self, user_message: str, entities: tuple[Entity, ...] = ()
@@ -2663,9 +2969,16 @@ class AgentCore:
         # explicit opt-out, honoured as "no backend proposed" rather than by
         # refusing to plan the build. A full build is many calls and minutes on a
         # 7B, and someone who wants one static page must still be able to get it.
+        # Phase N1: the spec's stack first, so re-blueprinting a Node project
+        # stays Node even when the session default is still flask. With no spec
+        # (the greenfield case) this is exactly `settings.web_stack`, unchanged.
         stack = detect_stack(
             allow_network=settings.allow_network,
-            prefer="none" if wants_static_only(user_message) else settings.web_stack,
+            prefer=(
+                "none"
+                if wants_static_only(user_message)
+                else probe_prefer(self._spec, settings.web_stack)
+            ),
         )
         schema_block = ""
         if entities:
@@ -2688,7 +3001,7 @@ class AgentCore:
             ),
         ]
         try:
-            raw = self._llm_blueprint.invoke(messages).content
+            raw = self._llm_planner.invoke(messages).content
             parsed = _extract_json(str(raw))
             data = parsed if isinstance(parsed, dict) else None
         except Exception as e:
@@ -2721,7 +3034,7 @@ class AgentCore:
             ),
         ]
         try:
-            raw = self._llm_blueprint.invoke(messages).content
+            raw = self._llm_planner.invoke(messages).content
             parsed = _extract_json(str(raw))
         except Exception as e:
             logger.debug("delta extraction failed: %s", e)
@@ -2757,19 +3070,33 @@ class AgentCore:
         """
         workdir = Path(self._project_path or Path.cwd())
 
+        # A restyle is deterministic and independent of the delta: theme.css
+        # holds nothing but custom properties, so "make it navy" is a token
+        # rewrite rather than a generation task. It runs BEFORE the delta call
+        # because a pure restyle produces an empty delta and would return None
+        # here — which is exactly why "now make it purple" did nothing from turn
+        # 2 onwards, `write_theme` being reachable only beside the scaffold copy.
+        restyle_note = self._restyle_project(workdir, user_message)
+
         delta = await self._extract_delta(user_message, spec)
         if delta is None or delta.is_empty():
-            return None, []
+            return (restyle_note or None), []
 
         existing = _existing_project_files(workdir)
-        edits = impacted_files(spec, delta, existing)
+        # W8: the templates say which pages show which entity far more reliably
+        # than `Page.reads`, which is inferred from prose and is routinely empty
+        # on the listing page that matters. Additive — the graph only ever adds
+        # edges, so a project it cannot read behaves exactly as before.
+        edits = impacted_files(spec, delta, existing, graph=self._template_graph())
         # db.py is impacted, but its migration is written from the spec rather
         # than generated — a 7B model writing ALTER TABLE against live data is
         # risk with no upside.
-        edits = [e for e in edits if e.filename != DB_FILE]
+        edits = [e for e in edits if e.filename != self._adapter.db_module]
 
         notes: list[str] = []
         trace: list[dict] = []
+        if restyle_note:
+            notes.append(restyle_note)
 
         # -- 3a. deterministic schema change ------------------------------
         migration_note = self._apply_migrations(workdir, spec, delta)
@@ -2789,7 +3116,7 @@ class AgentCore:
                 c
                 for c in (
                     spec_block,
-                    scaffold_context(sorted(existing)),
+                    self._adapter.scaffold_context(sorted(existing)),
                     self._image_context(image_refs),
                 )
                 if c
@@ -2832,7 +3159,7 @@ class AgentCore:
         if updated:
             notes.append(describe([e for e in edits if e.filename in updated]))
 
-        if not trace and not migration_note:
+        if not trace and not migration_note and not restyle_note:
             return None, []  # nothing actually happened — defer to normal routing
 
         # -- 4. persist ----------------------------------------------------
@@ -2858,6 +3185,40 @@ class AgentCore:
 
         return "\n\n".join(n for n in notes if n), trace
 
+    def _restyle_project(self, workdir: Path, user_message: str) -> str:
+        """Rewrite `theme.css` when the message asks for a different look.
+
+        The whole design system is written in custom properties precisely so a
+        restyle is a one-file change with no markup edit anywhere — but the only
+        caller of `write_theme` sat beside the scaffold copy, and
+        `scaffold_flask` returns nothing once the files exist. So from turn 2 on,
+        every restyle request was deterministically a no-op, and the demo is
+        built in parts.
+
+        Narrow by construction: `wants_restyle` needs both restyle wording and a
+        theme that actually resolves, and the file must already exist — this
+        rewrites a theme, it never introduces one to a project that has none.
+        Best-effort, like `write_theme` itself: a failed restyle costs the look,
+        never the turn.
+        """
+        if not wants_restyle(user_message):
+            return ""
+        if not self._adapter.theme_exists(workdir):
+            return ""
+        theme = resolve_theme(user_message)
+        try:
+            if not self._adapter.write_theme(workdir, theme_css(theme)):
+                return ""
+        except Exception:
+            logger.warning("restyle: could not write theme.css", exc_info=True)
+            return ""
+        asked = ", ".join(theme.get("keywords") or ()) or "the requested style"
+        return (
+            f"Restyled the site for {asked} — rewrote "
+            f"`{self._adapter.theme_file}`, which every page and component is "
+            "written against, so no markup changed."
+        )
+
     def _check_amendment_regressions(self, workdir: Path, spec: ProjectSpec) -> str:
         """Restore or report routes the amendment deleted from an earlier turn.
 
@@ -2871,7 +3232,7 @@ class AgentCore:
         `render_template`); anything else is reported, because inventing a POST
         handler's body is generation rather than repair. Best-effort throughout.
         """
-        app_py = workdir / "app.py"
+        app_py = workdir / self._adapter.entry_file
         if not app_py.is_file():
             return ""
         try:
@@ -2879,7 +3240,7 @@ class AgentCore:
             missing = vanished_routes(spec, source)
             if not missing:
                 return ""
-            updated, restored = restore_page_routes(source, missing)
+            updated, restored = self._adapter.restore_routes(source, missing)
             if restored and not self._write_python_if_valid(app_py, updated):
                 restored = []  # declined: never leave app.py broken
         except Exception:
@@ -2938,31 +3299,13 @@ class AgentCore:
             return set(), ""
 
         spec = ProjectSpec(name=project_name(workdir), entities=tuple(entities))
-        owned: set[str] = set()
-
-        # db.py: insert the CREATE TABLEs into the scaffold's init_db().
-        db_path = workdir / DB_FILE
-        if db_path.is_file():
-            try:
-                source = db_path.read_text(encoding="utf-8", errors="replace")
-                updated, changed = apply_table_block(source, spec)
-                if changed and self._write_python_if_valid(db_path, updated):
-                    owned.add(DB_FILE)
-            except Exception:
-                logger.warning("could not write the schema into db.py", exc_info=True)
-
-        for rel, render in (
-            ("models.py", models_source),
-            ("seed.py", seed_source),
-        ):
-            path = workdir / rel
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(render(spec), encoding="utf-8", newline="\n")
-                owned.add(rel)
-            except Exception:
-                logger.warning("could not write %s", rel, exc_info=True)
-        return owned, api_context(spec)
+        # Phase N0: WHICH files these are, and what goes in them, is the one
+        # genuinely stack-shaped decision here — deriving the entities above is
+        # not. The Node adapter returns nothing and claims nothing until phase
+        # N3 teaches it PostgreSQL's dialect, which is the honest answer: an
+        # `api_context` naming helpers that were never written is the exact
+        # failure api_context exists to prevent, inverted.
+        return self._adapter.write_data_layer(workdir, spec)
 
     @staticmethod
     def _write_readme(workdir: Path, spec: ProjectSpec) -> None:
@@ -3044,12 +3387,29 @@ class AgentCore:
         `seed.py` and `db.py`'s schema are written by `crud.py`, not by the
         model. Short timeout, output discarded, failure reported not raised.
         """
-        seed = workdir / "seed.py"
+        # None means this stack has no deterministically-written seed script, so
+        # there is nothing safe to execute — the exception only holds because
+        # `crud.py` wrote the file, not the model.
+        command = self._adapter.seed_command()
+        if not command:
+            return ""
+        seed = workdir / command[-1]
         if not seed.is_file():
             return ""
+        # A seed that cannot reach its database is an environment problem, not a
+        # broken script, and reporting it as "`node seed.js` failed" sends the
+        # reader after the wrong thing. Same rule as the smoke gate: skipped,
+        # and SAID — never silently, and never dressed up as a script defect.
+        blocked = self._adapter.readiness(workdir)
+        if blocked:
+            return (
+                "\n\nmay not meet: the demo rows were NOT inserted — "
+                f"{blocked}. Run the seed yourself once that is fixed: "
+                f"`{self._adapter.seed_hint}`."
+            )
         try:
             proc = subprocess.run(
-                [sys.executable, "seed.py"],
+                command,
                 cwd=str(workdir),
                 capture_output=True,
                 text=True,
@@ -3062,8 +3422,9 @@ class AgentCore:
             return "\n\nSeeded the database with demo rows, so no page starts empty."
         first = (proc.stderr or "").strip().splitlines()
         return (
-            "\n\nmay not meet: `python seed.py` failed, so pages that list data "
-            "will start empty — " + (first[-1][:160] if first else "no output")
+            f"\n\nmay not meet: `{self._adapter.seed_hint}` failed, so pages that "
+            "list data will start empty — "
+            + (first[-1][:160] if first else "no output")
         )
 
     def _apply_migrations(
@@ -3078,33 +3439,12 @@ class AgentCore:
         """
         if not (delta.add_fields or delta.add_entities):
             return ""
-        db_path = workdir / DB_FILE
-        if not db_path.is_file():
-            return ""
 
         # Stamp the delta onto a copy so the migration reflects the NEW fields
         # without mutating the spec before it is merged for real.
         preview = ProjectSpec.from_dict(spec.to_dict())
         preview.merge_delta(delta)
-        block = migration_block(preview, since=spec.revision)
-        if not block:
-            return ""
-
-        try:
-            source = db_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return ""
-        updated, changed = apply_migration_block(source, block)
-        if not changed or not self._write_python_if_valid(db_path, updated):
-            return (
-                "may not meet: could not place the schema migration in db.py — "
-                "add it by hand: " + "; ".join(preview.migrations(since=spec.revision))
-            )
-        calls = preview.migrations(since=spec.revision)
-        return (
-            f"Wrote {len(calls)} schema migration(s) into `db.py` from the project "
-            "spec — existing rows are kept, not recreated."
-        )
+        return self._adapter.migration_note(workdir, preview, since=spec.revision)
 
     async def _run_blueprint(
         self, user_message: str, blueprint: Blueprint, at_refs: list[str]
@@ -3128,12 +3468,33 @@ class AgentCore:
 
         # Deterministic skeleton before any generation. Best-effort: a scaffold
         # failure must not cost the turn, it just means today's behaviour.
+        adapter = self._adapter
         scaffolded: list[str] = []
-        if is_web_app(blueprint) and blueprint.stack.backend == "flask":
+        themed = False
+        if is_web_app(blueprint) and blueprint.stack.backend in adapter.backends:
             try:
-                scaffolded = scaffold_flask(workdir, project_name(workdir))
+                scaffolded = adapter.scaffold(workdir, project_name(workdir))
             except Exception:
-                logger.warning("flask scaffold failed", exc_info=True)
+                logger.warning("%s scaffold failed", adapter.key, exc_info=True)
+            # Phase W1b: the style the request asked for, resolved to real
+            # tokens and WRITTEN, not described. `to_context_block` still states
+            # the palette so the model knows which variables exist, but the look
+            # no longer depends on it obeying that.
+            #
+            # Deliberately NOT gated on `scaffolded`: re-blueprinting an existing
+            # project copies nothing (`scaffold_flask` never overwrites), so that
+            # guard silently dropped the style on every turn but the first. The
+            # theme file must already exist — this restyles a project, it never
+            # drops a lone theme.css into one whose scaffold failed — and
+            # `resolve_theme` returns {} unless the request named a look, so an
+            # unstyled turn still cannot overwrite a hand-tuned theme.
+            if scaffolded or adapter.theme_exists(workdir):
+                try:
+                    themed = adapter.write_theme(
+                        workdir, theme_css(resolve_theme(user_message))
+                    )
+                except Exception:
+                    logger.warning("theme write failed", exc_info=True)
 
         # Phase 4a/4d: the data layer is 100% derivable from the declared
         # entities, so write it deterministically BEFORE generation and take it
@@ -3156,7 +3517,7 @@ class AgentCore:
             # Procfile, .gitignore). Everything else it wrote stays in the plan
             # and gets edited, so the domain layer still lands — dropping them
             # all would leave the placeholder home page as the finished site.
-            planned = tuple(pf for pf in planned if not is_frozen(pf.filename))
+            planned = tuple(pf for pf in planned if not adapter.is_frozen(pf.filename))
 
         files = planned[: settings.blueprint_max_files]
         over_budget = planned[settings.blueprint_max_files :]
@@ -3174,19 +3535,34 @@ class AgentCore:
         text_refs, image_refs = _split_image_refs(at_refs)
         image_ctx = self._image_context(image_refs)
         contract_block = blueprint.to_context_block()
-        scaffold_block = scaffold_context(scaffolded)
+        scaffold_block = adapter.scaffold_context(scaffolded)
+        # Only when a scaffold exists: naming macros and classes that are not on
+        # disk would have the model call `ui.table()` into a 500 (the
+        # `api_context` failure mode, one layer up).
+        ui_block = adapter.ui_context() if scaffolded else ""
         extra = "\n\n".join(
-            c for c in (contract_block, scaffold_block, data_api, image_ctx) if c
+            c
+            for c in (contract_block, scaffold_block, ui_block, data_api, image_ctx)
+            if c
         )
 
         answer, trace = await self._multi_file_flow(
             user_message, refs=text_refs, extra_context=extra, preplanned_ops=ops
         )
+        if themed:
+            # Reported independently of the scaffold: re-blueprinting an
+            # existing project copies no files but can still restyle it, and a
+            # theme rewritten without a word said about it is a silent change.
+            answer = (
+                f"Wrote `{adapter.theme_file}` from the style you asked for — "
+                "every page and component is written against those variables."
+                "\n\n" + answer
+            )
         if scaffolded:
             answer = (
-                f"Scaffolded a runnable Flask project first ({len(scaffolded)} "
-                "files: app.py, db.py, models.py, templates/, static/, "
-                "requirements.txt, Procfile). Run it with `python app.py`.\n\n" + answer
+                f"Scaffolded a runnable {adapter.display_name} project first "
+                f"({len(scaffolded)} files: {adapter.scaffold_summary}). Run it "
+                f"with `{adapter.start_hint}`.\n\n" + answer
             )
             answer += await self._restore_scaffold_invariants(workdir)
         if generated_data_layer:
@@ -3238,9 +3614,8 @@ class AgentCore:
             answer += "\n\n" + note
         return answer, trace
 
-    @staticmethod
-    def _write_python_if_valid(path: Path, source: str) -> bool:
-        """Write generated Python only if it still compiles. Returns success.
+    def _write_python_if_valid(self, path: Path, source: str) -> bool:
+        """Write generated backend source only if it still parses. Returns success.
 
         The deterministic passes (`restore_index_route`, `restore_page_routes`,
         the migration blocks) edit files by hand, outside `_verify_and_repair` —
@@ -3248,18 +3623,12 @@ class AgentCore:
         parse. Same discipline as the intent check: a rewrite that breaks
         `check_file` is reverted, because a pass may leave a file unimproved but
         must never leave one broken.
+
+        Phase N0: the parse gate is the adapter's, because "does this parse" has
+        no stack-independent answer — Python compiles in-process, JavaScript
+        does not. The name is kept so every existing caller reads the same.
         """
-        try:
-            compile(source, str(path), "exec")
-        except SyntaxError:
-            logger.warning("declined to write invalid Python to %s", path.name)
-            return False
-        try:
-            path.write_text(source, encoding="utf-8", newline="\n")
-            return True
-        except Exception:
-            logger.warning("could not write %s", path.name, exc_info=True)
-            return False
+        return self._adapter.write_source_if_valid(path, source)
 
     async def _restore_scaffold_invariants(self, workdir: Path) -> str:
         """Put back what generation broke in the skeleton it was editing.
@@ -3270,28 +3639,29 @@ class AgentCore:
         which deleted the `/` route, leaving the finished site 404ing on its own
         home page. Deterministic, no LLM, best-effort.
         """
+        adapter = self._adapter
         notes: list[str] = []
-        app_py = workdir / "app.py"
-        if app_py.is_file():
+        entry = workdir / adapter.entry_file
+        if entry.is_file():
             try:
-                source = app_py.read_text(encoding="utf-8", errors="replace")
-                restored_source, restored = restore_index_route(source)
-                if restored and self._write_python_if_valid(app_py, restored_source):
+                source = entry.read_text(encoding="utf-8", errors="replace")
+                restored_source, restored = adapter.restore_entry_route(source)
+                if restored and self._write_python_if_valid(entry, restored_source):
                     result = await self.executor.execute(
                         "write_file",
-                        {"path": str(app_py), "content": restored_source},
+                        {"path": str(entry), "content": restored_source},
                     )
                     if result.get("success"):
                         notes.append(
                             "\n\nRestored the home page: generation had removed the "
-                            "`/` route from app.py, so the site 404'd on its own "
-                            "front page."
+                            f"`/` route from {adapter.entry_file}, so the site 404'd "
+                            "on its own front page."
                         )
             except Exception:
                 logger.warning("could not restore the index route", exc_info=True)
 
         try:
-            orphans = templates_without_inheritance(workdir)
+            orphans = adapter.orphan_templates(workdir)
         except Exception:
             logger.warning("template inheritance check failed", exc_info=True)
             orphans = []
@@ -3301,7 +3671,7 @@ class AgentCore:
             path = workdir / rel
             try:
                 source = path.read_text(encoding="utf-8", errors="replace")
-                rewritten, ok = convert_to_child_template(source)
+                rewritten, ok = adapter.convert_template(source)
             except Exception:
                 logger.warning("template conversion failed for %s", rel, exc_info=True)
                 stubborn.append(rel)
@@ -3314,18 +3684,20 @@ class AgentCore:
             )
             (converted if result.get("success") else stubborn).append(rel)
 
+        layout = f"{adapter.template_dir}/{adapter.layout_file}"
         if converted:
             notes.append(
                 "\n\nRewrote "
                 + ", ".join(converted[:6])
-                + " to extend `base.html` — they were full HTML documents "
-                "carrying their own navigation, which is how pages drift apart."
+                + f" to extend `{adapter.layout_file}` — they were full HTML "
+                "documents carrying their own navigation, which is how pages "
+                "drift apart."
             )
         if stubborn:
             # Never claim a pass we didn't get.
             notes.append(
                 "\n\nmay not meet: these page(s) are full HTML documents instead "
-                'of `{% extends "base.html" %}` and could not be converted '
+                f"of fragments wrapped by `{layout}` and could not be converted "
                 "safely — " + ", ".join(stubborn[:6])
             )
 
@@ -3463,6 +3835,14 @@ class AgentCore:
         (weaknesses.md #2). On a startup crash it feeds the traceback back for up
         to `settings.max_smoke_repairs` regeneration passes, then re-tests. The
         subprocess work runs off the event loop via `asyncio.to_thread`.
+
+        It is also the one window in which a live server exists, so W5/W6 render
+        the pages here (`_browser_hook`) rather than starting a second one. Two
+        repair passes come out of that, deliberately separate: the loop below
+        rewrites the SERVER file for a crash or a failing endpoint, and
+        `_repair_browser_findings` rewrites a TEMPLATE for what the browser
+        measured. Feeding either set to the other's target is how a CSS problem
+        gets "fixed" in app.py.
         """
         workdir = Path(self._project_path or Path.cwd())
         entry = self._pick_backend_entry(blueprint, workdir)
@@ -3478,6 +3858,13 @@ class AgentCore:
         # a passing smoke test, because any HTTP status counted as alive.
         spec = self._spec or self._load_or_adopt_spec(workdir)
 
+        # W5/W6: the browser runs INSIDE this process window, not as a second
+        # server — two of them fight over :5000 and over app.db. `audits`
+        # collects what each run measured so the repair can be targeted at the
+        # file that actually owns the defect.
+        audits: list[SiteAudit] = []
+        hook = self._browser_hook(spec, audits)
+
         result = await asyncio.to_thread(
             run_smoke_test,
             entry,
@@ -3486,6 +3873,7 @@ class AgentCore:
             settings.smoke_test_timeout,
             1.5,
             spec,
+            hook,
         )
         repairs = 0
         while repairs < settings.max_smoke_repairs:
@@ -3504,6 +3892,7 @@ class AgentCore:
                 break
             finally:
                 self._last_write_path = prev
+            audits.clear()
             result = await asyncio.to_thread(
                 run_smoke_test,
                 entry,
@@ -3512,9 +3901,333 @@ class AgentCore:
                 settings.smoke_test_timeout,
                 1.5,
                 spec,
+                hook,
             )
 
-        return "\n" + result.note(), trace
+        # What the browser saw is a defect in a template or a stylesheet, never
+        # in the server file the loop above edits — hence its own pass, with its
+        # own target and its own budget. Both passes below are *guarded*: the
+        # page is measured again afterwards and the rewrite is undone if it made
+        # things worse, which is what keeps a repair from being a net negative.
+        rerun = (entry, workdir, endpoint_paths, spec, hook, audits)
+        browser_note, browser_trace, result = await self._guarded_repair(
+            "browser",
+            lambda audit: self._repair_browser_findings(audit, spec, workdir),
+            result,
+            *rerun,
+        )
+        trace.extend(browser_trace)
+
+        # W7 last of the three, deliberately: a 7B VL's opinion is only worth
+        # asking once the objective checks are already clean, or every visual
+        # complaint lands on code that is measurably fine.
+        visual_note, visual_trace, result = await self._guarded_repair(
+            "visual",
+            lambda audit: self._visual_review(audit, spec, workdir),
+            result,
+            *rerun,
+        )
+        trace.extend(visual_trace)
+
+        note = "\n" + result.note()
+        for extra in (
+            audits[-1].note() if audits else "",
+            browser_note,
+            visual_note,
+            self._browser_skip_note(),
+        ):
+            if extra:
+                note += "\n" + extra
+        return note, trace
+
+    async def _guarded_repair(
+        self,
+        kind: str,
+        repair,
+        result,
+        entry: Path,
+        workdir: Path,
+        endpoint_paths: list[str],
+        spec,
+        hook,
+        audits: list[SiteAudit],
+    ) -> tuple[str, list[dict], object]:
+        """Run one browser-driven repair, then check it actually helped.
+
+        ``repair`` is a coroutine taking the latest `SiteAudit` and returning
+        `(note, trace, snapshot)` — the snapshot being each file's content
+        *before* it was rewritten.
+
+        The rule is `_intent_repair`'s, one layer out: a pass may leave the page
+        unimproved, but it must never leave it worse. If the re-measurement
+        finds more errors than before, the files are restored byte-for-byte —
+        and because they are then identical to the ones that produced the
+        earlier audit, that audit's numbers are true again with no third server
+        start.
+        """
+        before_audit = audits[-1] if audits else None
+        before = len(before_audit.errors()) if before_audit else 0
+        try:
+            note, sub, snapshot = await repair(before_audit)
+        except Exception:
+            logger.warning("%s repair pass failed", kind, exc_info=True)
+            return "", [], result
+        if not sub:
+            return note, sub, result
+
+        before_result = result
+        audits.clear()
+        result = await asyncio.to_thread(
+            run_smoke_test,
+            entry,
+            workdir,
+            endpoint_paths,
+            settings.smoke_test_timeout,
+            1.5,
+            spec,
+            hook,
+        )
+        after = len(audits[-1].errors()) if audits else 0
+        if after > before and snapshot:
+            restored = self._restore_files(workdir, snapshot)
+            audits.clear()
+            if before_audit is not None:
+                audits.append(before_audit)
+            result = before_result
+            note += (
+                f"\n  undo the {kind} rewrite was reverted — it left {after} "
+                f"finding(s) where there were {before}: " + ", ".join(restored)
+            )
+        return note, sub, result
+
+    @staticmethod
+    def _snapshot_files(workdir: Path, paths) -> dict[str, str]:
+        """Each file's current content, so a repair can be undone exactly."""
+        out: dict[str, str] = {}
+        for rel in paths or ():
+            try:
+                out[rel] = (workdir / rel).read_text(encoding="utf-8")
+            except Exception:
+                logger.debug("could not snapshot %s", rel)
+        return out
+
+    @staticmethod
+    def _restore_files(workdir: Path, snapshot: dict[str, str]) -> list[str]:
+        """Put a snapshot back. Returns what was restored."""
+        done: list[str] = []
+        for rel, content in (snapshot or {}).items():
+            try:
+                (workdir / rel).write_text(content, encoding="utf-8", newline="\n")
+                done.append(rel)
+            except Exception:
+                logger.warning("could not restore %s", rel, exc_info=True)
+        return done
+
+    def _browser_hook(self, spec, sink: list[SiteAudit]):
+        """The `run_smoke_test(on_serving=…)` callback that renders the pages.
+
+        None when browser checks are off or no browser is installed — and that
+        is reported by `_browser_skip_note`, never left to look like a pass.
+        The audit lands in ``sink`` because the checks it returns are aggregates
+        (five honest lines beat forty) while the repair needs the individual
+        findings and their pages.
+        """
+        if not settings.browser_checks or not browser_available():
+            return None
+        routes = [
+            page.route
+            for page in (getattr(spec, "pages", ()) or ())
+            if (page.route or "").startswith("/")
+        ]
+
+        def hook(port: int) -> list[ProbeCheck]:
+            audit = audit_site(
+                f"http://127.0.0.1:{port}",
+                routes,
+                # W7's raw material, gathered here because this is the only
+                # moment a live server exists. Zero unless the critique is on:
+                # a screenshot nobody looks at is 200 KB of nothing.
+                screenshot_pages=(
+                    settings.visual_max_pages if settings.check_visual else 0
+                ),
+            )
+            sink.append(audit)
+            return [
+                ProbeCheck(check.label, check.ok, check.detail, owner="browser")
+                for check in audit.checks()
+            ]
+
+        return hook
+
+    @staticmethod
+    def _browser_skip_note() -> str:
+        """Say so when the browser checks were asked for and could not run.
+
+        Only when they were ASKED for: `browser_checks` ships off, and nagging
+        every build about an optional feature nobody enabled is noise. Turning
+        it on and getting silence is the case that misleads.
+        """
+        if not settings.browser_checks or browser_available():
+            return ""
+        return f"  skip {browser_install_hint()}"
+
+    def _browser_target(self, finding, spec, workdir: Path) -> str | None:
+        """The project file a browser finding should be repaired in, or None.
+
+        Strict on purpose, the same strictness `_resolve_target_from_spec` uses:
+        a finding whose page maps to no template on disk is REPORTED, because
+        rewriting a file picked by guesswork is how a measurement that was right
+        breaks a file that was fine.
+        """
+        if finding.kind == "console":
+            # A stack trace that names a script names its own file.
+            match = re.search(r"([\w./-]+\.js)\b", finding.detail or "")
+            if match:
+                candidate = match.group(1).lstrip("/")
+                for rel in (candidate, f"static/js/{Path(candidate).name}"):
+                    if (workdir / rel).is_file():
+                        return rel
+        route = (finding.page or "").split("?")[0]
+        for page in getattr(spec, "pages", ()) or ():
+            if (page.route or "") == route and page.template:
+                template = page.template.replace("\\", "/")
+                if (workdir / template).is_file():
+                    return template
+        home = self._adapter.home_template
+        if route == "/" and (workdir / home).is_file():
+            return home
+        return None
+
+    async def _repair_browser_findings(
+        self, audit: SiteAudit | None, spec, workdir: Path
+    ) -> tuple[str, list[dict], dict[str, str]]:
+        """Rewrite the files the browser measured a defect in. Bounded, targeted.
+
+        Capped at `settings.max_browser_repairs` FILES — the fan-out this could
+        reach is one rewrite per page, and every one of them costs an LLM call
+        against a file that already renders.
+
+        Returns the pre-rewrite content of every file it touched, so
+        `_guarded_repair` can undo the whole pass if the page got worse.
+        """
+        if audit is None or not audit.ran or settings.max_browser_repairs < 1:
+            return "", [], {}
+        plan = repair_plan(audit, lambda f: self._browser_target(f, spec, workdir))
+        if not plan:
+            return "", [], {}
+
+        notes: list[str] = []
+        trace: list[dict] = []
+        snapshot = self._snapshot_files(
+            workdir, [t for t, _ in plan[: settings.max_browser_repairs]]
+        )
+        for target, findings in plan[: settings.max_browser_repairs]:
+            prev = self._last_write_path
+            try:
+                _, sub = await self._file_op_flow(
+                    repair_instruction(target, findings),
+                    target=target,
+                    extra_context=self._adapter.ui_context(),
+                )
+                trace.extend(sub)
+                notes.append(
+                    f"  fix  rewrote {target} for {len(findings)} browser finding(s)"
+                )
+            except Exception:
+                logger.warning("browser repair failed for %s", target, exc_info=True)
+                notes.append(f"  skip {target}: the repair pass itself failed")
+            finally:
+                self._last_write_path = prev
+        # What the budget left alone, said out loud — a cap that reports is a
+        # budget, a cap that hides is a bug (`blueprint_max_files`' lesson).
+        over_budget = len(plan) - min(len(plan), settings.max_browser_repairs)
+        if over_budget > 0:
+            notes.append(
+                f"  skip {over_budget} more file(s) with browser findings were left "
+                f"alone (max_browser_repairs={settings.max_browser_repairs})"
+            )
+        return "\n".join(notes), trace, snapshot
+
+    async def _visual_review(
+        self, audit: SiteAudit | None, spec, workdir: Path
+    ) -> tuple[str, list[dict], dict[str, str]]:
+        """Show each screenshot to the vision model and act on what it sees (W7).
+
+        The least reliable stage in the pipeline, and every guard reflects that:
+        `check_visual` ships off, the prompt is a five-point checklist rather
+        than "critique this", an unparseable verdict is a PASS, complaints that
+        do not name a visible symptom are dropped without a call, and the caller
+        reverts the whole pass if W5's measurements got worse.
+
+        Costs one vision call per screenshot and swaps the loaded Ollama model,
+        so `visual_max_pages` bounds it hard.
+        """
+        if (
+            not settings.check_visual
+            or audit is None
+            or not audit.screenshots
+            or settings.max_visual_repairs < 1
+        ):
+            return "", [], {}
+
+        # page -> the complaints seen on it, at any width. A defect visible at
+        # both 1280 and 390 is one defect in one file.
+        by_page: dict[str, list[str]] = {}
+        for page, width, png in audit.screenshots:
+            self._status(f"[vision] Looking at {page} at {width}px ...")
+            raw = await asyncio.to_thread(
+                ask_about_image,
+                png,
+                build_visual_prompt(page, width),
+                ".png",
+                VISUAL_SYSTEM,
+            )
+            if not raw:
+                continue  # no model, no answer, no complaint — never a failure
+            found = filter_visual_complaints(parse_visual_verdict(raw))
+            for complaint in found:
+                seen = by_page.setdefault(page, [])
+                if complaint not in seen:
+                    seen.append(complaint)
+        if not by_page:
+            return "", [], {}
+
+        notes: list[str] = []
+        trace: list[dict] = []
+        snapshot: dict[str, str] = {}
+        repaired = 0
+        for page, complaints in by_page.items():
+            target = self._browser_target(
+                Finding(kind="visual", page=page, detail=""), spec, workdir
+            )
+            if not target:
+                # Same rule as everywhere else here: a file picked by guesswork
+                # is how a right measurement breaks a file that was fine.
+                notes.append(f"  note {page} looks wrong but no page file owns it")
+                continue
+            if repaired >= settings.max_visual_repairs:
+                notes.append(f"  skip {page}: over max_visual_repairs")
+                continue
+            snapshot.update(self._snapshot_files(workdir, [target]))
+            prev = self._last_write_path
+            try:
+                _, sub = await self._file_op_flow(
+                    build_visual_repair_prompt(target, page, complaints),
+                    target=target,
+                    extra_context=self._adapter.ui_context(),
+                )
+                trace.extend(sub)
+                repaired += 1
+                notes.append(
+                    f"  fix  {target}: "
+                    + "; ".join(complaints[:3])
+                    + " (seen, not measured)"
+                )
+            except Exception:
+                logger.warning("visual repair failed for %s", target, exc_info=True)
+            finally:
+                self._last_write_path = prev
+        return "\n".join(notes), trace, snapshot
 
     def _smoke_repair_instruction(self, entry: Path, result) -> str | None:
         """What to tell the model about a failing run, or None if nothing failed.
@@ -3531,7 +4244,16 @@ class AgentCore:
                 "and serves without error. Keep the same routes, fields and "
                 "behavior — change only what's needed to make it run."
             )
-        failures = result.failures() if hasattr(result, "failures") else ()
+        # Only what the SERVER file can fix. A browser finding (W5/W6) rides in
+        # the same check list and is repaired against its own template or
+        # stylesheet by `_repair_browser_findings`; sending "the products table
+        # scrolls sideways at 390px" here would have the model rewrite app.py
+        # for a CSS problem, and then report that it had fixed it.
+        failures = tuple(
+            c
+            for c in (result.failures() if hasattr(result, "failures") else ())
+            if getattr(c, "owner", "app") == "app"
+        )
         if not failures:
             return None
         listed = "\n".join(f"- {c.label}: {c.detail}" for c in failures[:6])
@@ -4075,6 +4797,10 @@ class AgentCore:
         # D1: falls back to reading the contract off the files, so a project
         # Coder did not build still gets memory on its very first turn.
         self._spec = self._load_or_adopt_spec(Path(self._project_path or Path.cwd()))
+        # Phase N0/N1: pin the stack for the whole turn, from the spec first.
+        # Must come straight after the spec load and before any routing — every
+        # flow below reads `self._adapter`.
+        self._select_stack(self._spec)
         self._update_skills_context(clean_message)
         await self.memory.add_human(user_message)
 
@@ -4256,13 +4982,28 @@ class AgentCore:
             and settings.blueprint_smoke_test
             and getattr(self._blueprint.stack, "runnable", True)
         ):
-            try:
-                smoke_note, smoke_trace = await self._smoke_test_backend(
-                    self._blueprint
+            # Phase N5's gate, in the cheap form N2 can carry: Node + Postgres
+            # has three ways to be un-runnable where Flask has one (no node, no
+            # `node_modules`, no database listening), and none of them is a
+            # defect in the generated code. Skipping is only honest if the skip
+            # is REPORTED — a skipped check that reads as a passing one is the
+            # single failure this codebase exists to prevent.
+            blocked = self._adapter.readiness(Path(self._project_path or Path.cwd()))
+            if blocked:
+                answer += (
+                    f"\n\nmay not meet: the smoke test did NOT run — {blocked}. "
+                    "The generated files were not executed, so nothing here says "
+                    "the app works."
                 )
-            except Exception:
-                logger.warning("blueprint smoke test failed", exc_info=True)
                 smoke_note, smoke_trace = "", []
+            else:
+                try:
+                    smoke_note, smoke_trace = await self._smoke_test_backend(
+                        self._blueprint
+                    )
+                except Exception:
+                    logger.warning("blueprint smoke test failed", exc_info=True)
+                    smoke_note, smoke_trace = "", []
             if smoke_note:
                 answer += smoke_note
             if smoke_trace:

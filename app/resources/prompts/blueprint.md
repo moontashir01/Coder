@@ -82,6 +82,7 @@ Rules:
   | `models.py`           | one query helper per operation, `?` parameters only |
   | `seed.py`             | a few demo rows per table                           |
   | `templates/base.html` | the nav and page shell — the ONLY place nav exists  |
+  | `templates/index.html` | the home page — `"action": "edit"`, it already exists |
   | `templates/<page>.html` | one per page, each `{% extends "base.html" %}`    |
   | `static/css/style.css`  | the one stylesheet                                |
   | `static/js/app.js`      | optional enhancement only                         |
@@ -95,6 +96,10 @@ Rules:
   - Routes call helpers in `models.py`; they never write SQL inline.
   - Do NOT plan `requirements.txt`, `Procfile` or `.gitignore` — they are
     already written for you.
+  - **Plan the home page.** `templates/index.html` exists but holds placeholder
+    text, so give it `"action": "edit"` and an instruction describing what this
+    site's front door shows and which pages it links to. A build that leaves it
+    alone ships a site whose first page says it was scaffolded.
 
 - **When you are given a data model, plan AROUND it.** The tables and columns
   above the request are already decided — they are what the app stores. Use

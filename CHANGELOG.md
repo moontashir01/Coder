@@ -7,6 +7,42 @@ All notable changes to Coder are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A second stack: Node + Express + EJS + PostgreSQL** (`docs/node-stack-plan.md`,
+  phases N0–N2). `/stack` shows which stack a build targets and switches it;
+  `/stack node` scaffolds a runnable Express app — routes, a connection pool,
+  the same component stylesheet and theme file the Flask stack ships, and a
+  layout every view is wrapped by — before a single line is generated. The
+  choice is remembered per project in `.coder/project.json`, and **a project's
+  own stack always beats the session default**, so opening a Node project on
+  turn 2 can no longer hand it Flask's Python migrations.
+  The data layer is generated on Node too, not prompted for: the tables,
+  `models.js`, `seed.js` and the password hashing come from the project's own
+  schema, with `$1` parameters and `RETURNING id`, and every entity gets a list
+  page and a create form. Both stacks emit from the same schema, so one project
+  description cannot produce two different databases.
+  `/stack` prints each stack's gaps as well as its guarantees, because they are
+  still not equals: Flask keeps `url_for` validation, import repair and
+  block-scoped template editing that Node does not have yet. Flask stays the
+  default. When Node, `npm install` or PostgreSQL is missing the smoke test is
+  **skipped and reported**, never quietly passed.
+- **Generated sites now come with a design system, and Coder can look at them**
+  (`docs/web-quality-plan.md`). Every build ships a real component stylesheet and
+  a Jinja macro library, and the style you ask for is *written* into
+  `static/css/theme.css` rather than described to the model and hoped for — so
+  the table on page one and the table on page three are the same table. A
+  misnamed `url_for` is repaired before it can 500 a page, and an edit to a page
+  now goes into that page's `{% block content %}` instead of across the whole
+  file, so it can no longer delete the layout it inherits from.
+  With a headless browser installed (`pip install playwright && python -m
+  playwright install chromium`, then `BROWSER_CHECKS=true`) Coder also *renders*
+  what it built: it reports pages that scroll sideways on a phone, JavaScript
+  errors, assets that 404, text below the AA contrast line, and buttons wired to
+  nothing — then fixes the file that owns the problem and re-measures, undoing
+  the fix if the page got worse. `CHECK_VISUAL=true` adds a screenshot critique
+  from the vision model on top. All of it is off by default and reported as
+  skipped when it cannot run, so a machine without a browser behaves exactly as
+  before. `BEST_OF_N=2` generates a page or module twice and keeps whichever
+  candidate the checks prefer, at roughly double the generation time.
 - **Project memory that can route an edit** — the spec now records what each
   file *defines* (its routes and handlers) and which data it shows, not just
   "this is a page". So "update the products page" finds `templates/products.html`

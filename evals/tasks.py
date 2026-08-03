@@ -12,9 +12,11 @@ from evals.checks import (
     any_file_matches,
     app_serves,
     backend_reads_fields,
+    contrast_ok,
     db_has_column,
     earlier_pages_still_work,
     entities_are_usable,
+    every_control_does_something,
     every_entity_has_a_table,
     file_contains,
     file_excludes,
@@ -22,8 +24,12 @@ from evals.checks import (
     has_backend_server,
     is_full_stack_app,
     min_files_written,
+    nav_on_every_page,
+    no_console_errors,
+    no_horizontal_overflow,
     spec_has_endpoint,
     spec_has_entity,
+    style_stable_across_turns,
 )
 from evals.harness import EvalTask
 
@@ -276,6 +282,46 @@ WEBAPP_TASKS: list[EvalTask] = [
             every_entity_has_a_table(),  # incl. the column turn 2 added
             earlier_pages_still_work(["/"]),
             entities_are_usable(),
+        ],
+    ),
+    # -----------------------------------------------------------------------
+    # Phase W10 (docs/web-quality-plan.md): does it LOOK right, and does it
+    # still look right three turns later. Kept as their own tasks rather than
+    # bolted onto the ones above, for two reasons: they need a headless browser
+    # that is a deliberate opt-in (`python -m playwright install chromium`), and
+    # a machine without one must not quietly drag the whole suite's score down —
+    # these tasks FAIL with the install command in the detail, which is the only
+    # honest report of a check that could not run.
+    #
+    # The checks name no selector and no route: they read the project's own spec
+    # and drive the same `browser.py` the agent uses.
+    # -----------------------------------------------------------------------
+    EvalTask(
+        id="web_quality_build",
+        prompt="build me an e-commerce site for selling books",
+        checks=[
+            no_horizontal_overflow(),
+            no_console_errors(),
+            every_control_does_something(),
+            nav_on_every_page(),
+            contrast_ok(),
+        ],
+    ),
+    EvalTask(
+        id="web_quality_stable",
+        prompts=[
+            "build me an e-commerce site for selling books",
+            "add an admin page where I can add a product with a picture",
+            "add a shopping cart",
+        ],
+        checks=[
+            # THE headline number for the web-quality plan: turn 3 must not
+            # restyle turn 1. The products table and the cart table have to be
+            # visibly the same table.
+            style_stable_across_turns(),
+            nav_on_every_page(),
+            no_horizontal_overflow(),
+            no_console_errors(),
         ],
     ),
 ]

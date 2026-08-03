@@ -19,7 +19,7 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 
 from config.settings import settings
@@ -184,26 +184,16 @@ def _describe_image(
         return None
 
     _say(on_status, f"[vision] Analyzing {p.name} ...")
-    data, subtype = _prepare_image(raw, p.suffix.lower())
-    b64 = base64.b64encode(data).decode("ascii")
-    message = HumanMessage(
-        content=[
-            {"type": "text", "text": _load_prompt()},
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/{subtype};base64,{b64}"},
-            },
-        ]
+    description = ask_about_image(
+        raw,
+        _load_prompt(),
+        suffix=p.suffix.lower(),
+        # The hint is the whole value of a failed call: "ollama pull qwen2.5vl"
+        # is actionable, "vision failed" is not.
+        on_error=lambda e: _say(on_status, _failure_hint(e)),
     )
-
-    try:
-        resp = _get_vision_llm().invoke([message])
-    except Exception as e:
-        logger.warning("vision call failed for %s: %s", p, e)
-        _say(on_status, _failure_hint(e))
+    if description is None:
         return None
-
-    description = _response_text(resp)
     if len(description) < _MIN_DESCRIPTION_CHARS:
         logger.warning("vision model returned nothing usable for %s", p)
         _say(on_status, f"[vision] {p.name} produced no usable description — skipping")
@@ -211,6 +201,49 @@ def _describe_image(
 
     _say(on_status, "[vision] Done — extracted layout description")
     return description
+
+
+def ask_about_image(
+    raw: bytes,
+    prompt: str,
+    suffix: str = ".png",
+    system: str = "",
+    on_error: Callable[[Exception], None] | None = None,
+) -> str | None:
+    """Ask the vision model one question about image BYTES. None on any failure.
+
+    The bytes-in variant `_describe_image` is built on, and what Phase W7 uses:
+    a screenshot lives in memory (`browser.Session.screenshot` returns PNG
+    bytes), and writing it into the user's project just to read it back would be
+    litter. Same non-fatal contract as everything else here — a missing model, a
+    connection error or a crash returns None and the caller proceeds as if the
+    stage did not exist.
+    """
+    if not settings.vision_enabled or not raw:
+        return None
+    data, subtype = _prepare_image(raw, suffix)
+    b64 = base64.b64encode(data).decode("ascii")
+    content = [
+        {"type": "text", "text": prompt},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/{subtype};base64,{b64}"},
+        },
+    ]
+    messages = [HumanMessage(content=content)]
+    if system:
+        messages.insert(0, SystemMessage(content=system))
+    try:
+        resp = _get_vision_llm().invoke(messages)
+    except Exception as e:
+        logger.warning("vision call failed: %s", e)
+        if on_error is not None:
+            try:
+                on_error(e)
+            except Exception:
+                logger.debug("vision error hook raised", exc_info=True)
+        return None
+    return _response_text(resp)
 
 
 def _failure_hint(error: Exception) -> str:

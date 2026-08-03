@@ -18,8 +18,15 @@ file's edit instruction, so the model is told *precisely* what to change and
 why — never handed the user's whole request again and asked to work it out. A
 narrow instruction is also what keeps `_surgical_edit` surgical.
 
+Phase W8 added a second source for the "which templates show this entity" half:
+a `templatedeps.TemplateGraph`, read off the templates themselves. `Page.reads`
+comes from blueprint prose and is routinely empty on the listing page that
+matters, so the two are **unioned** — the graph only ever adds edges, and a
+project it cannot read behaves exactly as it did before.
+
 Pure and offline (design rule 2): the caller supplies the set of files that
-exist, so nothing here touches the filesystem and it unit-tests completely.
+exist AND the graph, so nothing here touches the filesystem and it unit-tests
+completely.
 """
 
 from __future__ import annotations
@@ -29,12 +36,52 @@ from dataclasses import dataclass
 
 from app.agent.projectspec import ProjectSpec, SpecDelta
 
-# The canonical layout the scaffold guarantees (docs/fullstack-web-plan.md §1).
+# The canonical layout the FLASK scaffold guarantees
+# (docs/fullstack-web-plan.md §1). Kept as module constants because callers
+# import them; the stack-aware versions are `_layout(spec)`, which is what every
+# rule below actually reads.
 DB_FILE = "db.py"
 MODELS_FILE = "models.py"
 SEED_FILE = "seed.py"
 APP_FILE = "app.py"
 BASE_TEMPLATE = "templates/base.html"
+
+
+def _adapter(spec: ProjectSpec | None):
+    """The stack adapter for a remembered project (Phase N3).
+
+    Imported inside the function: `stacks.flask_adapter` -> `crud` ->
+    `projectspec` -> this module's neighbours, so a top-level import risks a
+    cycle. Falls back to Flask for a spec that names no stack, which is what
+    every pre-N0 `project.json` does.
+    """
+    from app.agent.stacks import get_adapter, key_for_stack
+
+    return get_adapter(
+        key_for_stack(getattr(spec, "language", ""), getattr(spec, "backend", ""))
+    )
+
+
+def _layout(spec: ProjectSpec | None) -> tuple[str, str, str, str, str]:
+    """``(db, models, seed, entry, layout template)`` for this project's stack.
+
+    Without this, an amendment to a Node project proposes editing `db.py`,
+    `models.py` and `app.py` — none of which exist there, so `present()` drops
+    them all and turn 2 silently edits no backend file at all. The rules below
+    are right; only the filenames were Flask's.
+    """
+    adapter = _adapter(spec)
+    if adapter.key == "flask":
+        return DB_FILE, MODELS_FILE, SEED_FILE, APP_FILE, BASE_TEMPLATE
+    stem = "js" if adapter.language == "node" else adapter.language
+    return (
+        adapter.db_module,
+        f"models.{stem}",
+        f"seed.{stem}",
+        adapter.entry_file,
+        f"{adapter.template_dir}/{adapter.layout_file}",
+    )
+
 
 # How many existing files one amendment will edit. An amendment that claims to
 # touch twenty files is a runaway, not a change.
@@ -70,20 +117,68 @@ def _add(
 
 
 def impacted_files(
-    spec: ProjectSpec, delta: SpecDelta, existing: set[str]
+    spec: ProjectSpec, delta: SpecDelta, existing: set[str], graph=None
 ) -> list[Edit]:
     """The existing files this delta breaks unless they are updated too.
 
     ``existing`` is the set of repo-relative paths actually on disk; a file that
     isn't there is a *new* file and belongs to the create path, not here.
     Returns at most `MAX_EDITS` edits, each with a merged reason.
+
+    ``graph`` is an optional `templatedeps.TemplateGraph` (Phase W8). Without
+    it the behaviour is exactly what it was, so every existing caller is
+    unaffected; with it, "which templates show this entity" is answered from the
+    templates themselves instead of from `Page.reads` — which is inferred from
+    blueprint prose and is routinely empty on the listing page that matters.
+    The two are **unioned**, never substituted: the graph adds edges, and a
+    template it cannot read simply contributes none.
     """
     out: list[Edit] = []
     seen: dict[str, list[str]] = {}
     have = {f.replace("\\", "/") for f in existing}
+    # Phase N3: the RULES below are stack-independent — a new column means the
+    # schema, the queries, the seed rows and every template that shows it. Only
+    # the filenames differ, and on Flask these are exactly the old constants.
+    db_file, models_file, seed_file, app_file, base_template = _layout(spec)
 
     def present(name: str) -> bool:
         return name in have
+
+    def reading(entity) -> list[str]:
+        """Templates that display this entity, from the spec AND the graph."""
+        if entity is None:
+            return []
+        found = [
+            page.template
+            for page in spec.pages
+            if entity.name in page.reads and page.template
+        ]
+        if graph is not None:
+            try:
+                found += graph.templates_reading(entity.name, entity.table)
+            except Exception:
+                pass  # best-effort: a graph that fails costs its own edges only
+        return [t for t in dict.fromkeys(found) if present(t)]
+
+    def writing(entity) -> list[str]:
+        """Templates carrying a form that writes this entity."""
+        if entity is None or graph is None:
+            return []
+        # Only a handler the spec actually recorded. Deriving a view name from
+        # the path would be a guess, and a guess here sends an edit to the wrong
+        # template — the failure mode `fix_endpoint_names` refuses for the same
+        # reason.
+        endpoints = [
+            e.handler
+            for e in spec.endpoints
+            if e.entity == entity.name
+            and e.handler
+            and e.method in ("POST", "PUT", "PATCH")
+        ]
+        try:
+            return [t for t in graph.forms_writing(*endpoints) if present(t)]
+        except Exception:
+            return []
 
     # --- new field on an existing entity ---------------------------------
     for entity_name, fld in delta.add_fields:
@@ -91,26 +186,27 @@ def impacted_files(
         table = entity.table if entity else entity_name
         col = f"{table}.{fld.name}"
 
-        if present(DB_FILE):
-            _add(out, seen, DB_FILE, f"add the {col} column migration")
-        if present(MODELS_FILE):
+        if present(db_file):
+            _add(out, seen, db_file, f"add the {col} column migration")
+        if present(models_file):
             _add(
                 out,
                 seen,
-                MODELS_FILE,
+                models_file,
                 f"include {fld.name} in the SELECT/INSERT/UPDATE column lists for {table}",
             )
-        if present(SEED_FILE):
-            _add(out, seen, SEED_FILE, f"give the demo rows a {fld.name} value")
+        if present(seed_file):
+            _add(out, seen, seed_file, f"give the demo rows a {fld.name} value")
 
-        for page in spec.pages:
-            if entity and entity.name in page.reads and present(page.template):
-                _add(
-                    out,
-                    seen,
-                    page.template,
-                    f"show {fld.name} for each {entity.name}",
-                )
+        for template in reading(entity):
+            _add(
+                out,
+                seen,
+                template,
+                f"show {fld.name} for each {entity.name}",
+            )
+        for template in writing(entity):
+            _add(out, seen, template, f"add a form input named {fld.name}")
         for endpoint in spec.endpoints:
             if not entity or endpoint.entity != entity.name:
                 continue
@@ -123,35 +219,35 @@ def impacted_files(
                     endpoint.template,
                     f"add a form input named {fld.name}",
                 )
-            if present(APP_FILE):
+            if present(app_file):
                 _add(
                     out,
                     seen,
-                    APP_FILE,
+                    app_file,
                     f"read {fld.name} from the request in {endpoint.method} {endpoint.path}",
                 )
 
     # --- new entity --------------------------------------------------------
     for entity in delta.add_entities:
-        if present(DB_FILE):
-            _add(out, seen, DB_FILE, f"create the {entity.table} table")
-        if present(MODELS_FILE):
+        if present(db_file):
+            _add(out, seen, db_file, f"create the {entity.table} table")
+        if present(models_file):
             _add(
                 out,
                 seen,
-                MODELS_FILE,
+                models_file,
                 f"add list/get/create query helpers for {entity.table}",
             )
-        if present(SEED_FILE):
-            _add(out, seen, SEED_FILE, f"seed a few demo {entity.table} rows")
+        if present(seed_file):
+            _add(out, seen, seed_file, f"seed a few demo {entity.table} rows")
 
     # --- new endpoint ------------------------------------------------------
     for endpoint in delta.add_endpoints:
-        if present(APP_FILE):
+        if present(app_file):
             _add(
                 out,
                 seen,
-                APP_FILE,
+                app_file,
                 f"define the {endpoint.method} {endpoint.path} route",
             )
         if endpoint.template and present(endpoint.template):
@@ -164,20 +260,20 @@ def impacted_files(
 
     # --- new page ----------------------------------------------------------
     for page in delta.add_pages:
-        if present(APP_FILE):
+        if present(app_file):
             _add(
                 out,
                 seen,
-                APP_FILE,
+                app_file,
                 f"add the view function that renders {page.template or page.route}",
             )
         # The nav lives in base.html and ONLY in base.html, so a new page always
         # touches it — this is the rule that keeps pages from drifting apart.
-        if page.nav_label and present(BASE_TEMPLATE):
+        if page.nav_label and present(base_template):
             _add(
                 out,
                 seen,
-                BASE_TEMPLATE,
+                base_template,
                 f'add a nav link "{page.nav_label}" to {page.route or page.template}',
             )
 
@@ -226,8 +322,15 @@ def vanished_routes(spec: ProjectSpec, app_source: str) -> list:
 
     Only routes from an EARLIER revision count: a route added this turn that the
     model hasn't written yet is the coverage check's business, not a regression.
+
+    Phase N3: the routes are read with the SPEC's stack parser. Reading a
+    `server.js` with the `@app.route` regex finds nothing, so every route the
+    project ever had comes back as "vanished" — a flood of false failures on
+    every Node amendment, and a false failure is worse than no check.
     """
-    live = {(m, p) for m, p, _v, _t in _routes_from(app_source)}
+    live = {
+        (m, p) for m, p, _v, _t in _adapter(spec).routes_from_source(app_source or "")
+    }
     return [
         e
         for e in spec.endpoints

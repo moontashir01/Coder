@@ -160,13 +160,20 @@ class Settings(BaseSettings):
     # would reach a real Ollama. Tests that want it opt back in explicitly.
     expand_requirements: bool = True
     # Which backend stack a build targets (docs/always-fullstack-plan.md Phase A).
-    # "flask" | "fastapi" | "stdlib" | "none" force that stack; "auto" restores
-    # the old probe-and-pick behaviour. Default "flask" because the whole
+    # "flask" | "node" | "fastapi" | "stdlib" | "none" force that stack; "auto"
+    # restores the old probe-and-pick behaviour. Default "flask" because the whole
     # full-stack direction promises Flask + Jinja2 + sqlite3 — leaving it on
     # "auto" made the promise depend on Flask happening to be importable, which
     # it is here only because Coder's own environment installs it.
     # A forced stack that ISN'T installed is reported (Stack.runnable=False +
     # install_hint), never swapped for another one — see runtime_probe.py.
+    # **This is a SESSION DEFAULT, and it loses to a project that remembers its
+    # own stack** (docs/node-stack-plan.md N1, `stacks.resolve_key`). Reading it
+    # first would send an amendment to a Node project down the Flask path, which
+    # writes Python `ensure_column` calls into a db.py that does not exist.
+    # `/stack` shows and switches it, and says so when a project overrides it.
+    # "node" is Express + EJS + PostgreSQL and is shallower than Flask on
+    # purpose — `/stack` prints each stack's gaps.
     web_stack: str = "flask"
     # Phase C: spend ONE extra temperature-0 call deciding what the app STORES
     # before planning what it looks like, so the layout is derived from a schema
@@ -214,6 +221,78 @@ class Settings(BaseSettings):
     blueprint_smoke_test: bool = True
     smoke_test_timeout: float = 8.0
     max_smoke_repairs: int = 1
+    # Phase W4 (docs/web-quality-plan.md): render generated pages in a real
+    # headless browser, so layout, CSS and JS can be observed at all — every
+    # check before this one reads bytes (`smoke.py` is urllib), which is why a
+    # table 900px wide inside a 390px viewport and a button wired to nothing
+    # were both invisible.
+    # OFF by default, and this default is not timidity: Playwright's Chromium
+    # download needs the network ONCE, which is a real exception to the offline
+    # rule. It is handled the way Phase A handles a missing Flask — a loud,
+    # separate install hint (`browser.install_hint()`), never a silent skip that
+    # reads as a pass. Someone who never installs it gets exactly the old
+    # behaviour. Turn on with BROWSER_CHECKS=true once
+    # `python -m playwright install chromium` has run.
+    browser_checks: bool = False
+    # Seconds for one navigation, and how long to keep collecting console/network
+    # events after load. Kept well under smoke_test_timeout: these probes run
+    # INSIDE the smoke test's process window (two servers would fight over :5000).
+    browser_timeout: float = 8.0
+    # Viewport widths every page is observed at. The narrow one is the point —
+    # horizontal overflow at phone width is the single most common responsive
+    # failure and cannot be seen at desktop width.
+    browser_widths: list[int] = [1280, 390]
+    # Cap on pages visited per turn, so an N-page site cannot turn one build into
+    # dozens of navigations. Like blueprint_max_files, what it drops is reported
+    # rather than silently truncated.
+    browser_max_pages: int = 12
+    # Phase W6: the dead-button probe reloads the page once per control, so N
+    # pages x M buttons is the real fan-out. Same rule as above — what the cap
+    # drops is reported, never hidden.
+    browser_max_controls: int = 8
+    # Phase W5/W6: how many FILES one turn may rewrite in response to what the
+    # browser measured (a template that scrolls sideways, a button wired to
+    # nothing). Separate from max_smoke_repairs because the target is different:
+    # a layout defect is fixed in the template or the stylesheet, never in the
+    # server file the smoke repair edits. 0 = report the findings, change
+    # nothing.
+    max_browser_repairs: int = 1
+    # Phase W7: screenshot the rendered pages and ask the VISION model whether
+    # they look broken. OFF by default and the least reliable stage in the
+    # pipeline — a 7B VL judging a 7B's markup — so it is built to be reverted:
+    # a rewrite that regresses W5's measurements is undone automatically.
+    # It needs browser_checks as well (there is no screenshot without a browser),
+    # costs one vision call per page per width, and swaps the loaded Ollama model.
+    # NB tests default it OFF (conftest.py::_no_blueprint): it fires inside the
+    # smoke stage and would reach a real Ollama.
+    check_visual: bool = False
+    # How many pages get screenshotted (× browser_widths vision calls each), and
+    # how many files one turn may rewrite on the strength of what the model saw.
+    visual_max_pages: int = 2
+    max_visual_repairs: int = 1
+    # Phase W9 (docs/web-quality-plan.md): generate a high-value file (a page
+    # template, a Python module) more than once and keep whichever candidate
+    # scores best on the DETERMINISTIC checks — parses, no dead CDN asset, every
+    # url_for resolves, extends the layout, no duplicate definition. Only sound
+    # because W2/W5/W6 made those checks objective; before them this would have
+    # been a coin flip dressed up as a measurement.
+    # DEFAULT 1 = off, and that default is the point: every request already
+    # costs minutes on a 7B, so N=2 means roughly double the generation time for
+    # the files it applies to. Ties go to the first candidate, so N>1 can never
+    # change a build without measurably improving it.
+    best_of_n: int = 1
+    # Sampling temperature for the EXTRA candidates. The first is generated
+    # exactly as it always was; identical samples would make the whole thing a
+    # waste of a call, so the rest are drawn hotter.
+    best_of_temperature: float = 0.4
+    # Roles per model. Planning, schema extraction and critique are *reasoning*
+    # calls, not codegen, and a general instruct model may well beat
+    # qwen2.5-coder at them — this makes that question measurable instead of
+    # assumed. Empty = use llm_model, i.e. exactly today's behaviour, and the
+    # role LLM is then the SAME OBJECT as the general one so `/model` and test
+    # patching keep working.
+    planner_model: str = ""
+    judge_model: str = ""
     retrieval_top_k: int = 5
     conversation_buffer_size: int = 20
     # U6: when history overflows max_context_tokens, summarize the dropped

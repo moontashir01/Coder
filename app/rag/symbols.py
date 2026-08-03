@@ -54,6 +54,11 @@ class FileSymbols:
     references: list[Reference] = field(default_factory=list)
     # Raw import records kept for dependency resolution: (module, level)
     _import_records: list[tuple[str, int]] = field(default_factory=list)
+    # Jinja edges (Phase W8): template names this file depends on, as written —
+    # `{% extends "base.html" %}` in a template, `render_template("x.html")` in
+    # a route. Resolved against the project's `templates/` dir at index time, so
+    # the dependency graph no longer stops at the file that renders the page.
+    template_deps: list[str] = field(default_factory=list)
 
 
 # ----------------------------------------------------------------------
@@ -119,10 +124,20 @@ class _Walker(ast.NodeVisitor):
 
     def visit_Call(self, node):  # noqa: N802
         func = node.func
+        name = ""
         if isinstance(func, ast.Name):
-            self.result.references.append(Reference(func.id, node.lineno))
+            name = func.id
         elif isinstance(func, ast.Attribute):
-            self.result.references.append(Reference(func.attr, node.lineno))
+            name = func.attr
+        if name:
+            self.result.references.append(Reference(name, node.lineno))
+        # W8: `render_template("products.html")` is a real dependency edge, and
+        # the only one that connects a route to the page it serves. A dynamic
+        # first argument yields no edge — never a wrong one.
+        if name == "render_template" and node.args:
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                self.result.template_deps.append(first.value)
         self.generic_visit(node)
 
 
@@ -299,17 +314,38 @@ def _extract_symbols_ts(source: str, language: str, file_path: str) -> FileSymbo
     return result
 
 
+def _extract_template_deps(file_path: Path) -> FileSymbols:
+    """A Jinja template contributes EDGES only — no symbols (Phase W8).
+
+    Its `{% block %}` names are not symbols worth indexing: every child template
+    defines `content`, so `find_symbol("content")` would return the whole site
+    and mean nothing. What is worth having is the graph — which layout a page
+    extends, and which partials it pulls in.
+    """
+    from app.agent.templatedeps import parse_template  # local: keeps import cheap
+
+    try:
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return FileSymbols()
+    info = parse_template(text, str(file_path))
+    deps = [n for n in ([info.extends] + list(info.includes)) if n]
+    return FileSymbols(template_deps=deps)
+
+
 def extract_symbols(file_path: str | Path) -> FileSymbols:
     """Parse a file into symbols, imports, and references.
 
-    Python uses stdlib `ast`; other supported languages use tree-sitter. Returns
-    an empty FileSymbols on syntax errors, unreadable files, or unsupported
-    languages — never raises.
+    Python uses stdlib `ast`; other supported languages use tree-sitter; Jinja
+    templates yield dependency edges only. Returns an empty FileSymbols on
+    syntax errors, unreadable files, or unsupported languages — never raises.
     """
     path = Path(file_path)
     suffix = path.suffix.lower()
     if suffix == ".py":
         return _extract_symbols_py(path)
+    if suffix in (".html", ".htm"):
+        return _extract_template_deps(path)
 
     language = LANGUAGE_MAP.get(suffix)
     if language and _TS_AVAILABLE and language in _TS_DEFS:
@@ -356,6 +392,31 @@ def _resolve_import(
     pkg_init = candidate_dir / last / "__init__.py"
     if pkg_init.exists():
         return str(pkg_init)
+    return None
+
+
+def _resolve_template(
+    name: str, project_root: Path | None, importing_file: Path
+) -> str | None:
+    """A template name as WRITTEN → the file it means, or None (Phase W8).
+
+    Jinja resolves against the loader's search path, which for a Flask app is
+    `<root>/templates`. Tried in the order that cannot be wrong: next to the
+    importing file first (a relative `{% include %}`), then the templates dir,
+    then the root. An unresolvable name records the edge with no target rather
+    than inventing one, per this module's "no symbols beats wrong symbols" rule.
+    """
+    if not name or ".." in name:
+        return None
+    candidates = [importing_file.parent / name]
+    if project_root is not None:
+        candidates += [project_root / "templates" / name, project_root / name]
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return str(candidate)
+        except OSError:
+            continue
     return None
 
 
@@ -432,6 +493,12 @@ class SymbolIndex:
                 else None
             )
             import_rows.append((fp, module, resolved))
+        # W8: Jinja edges ride in the same table, so `dependencies()` and
+        # `dependents()` answer for templates without a second graph.
+        for name in fs.template_deps:
+            import_rows.append(
+                (fp, name, _resolve_template(name, root, Path(file_path)))
+            )
 
         with self._lock:
             self.remove_file(fp)

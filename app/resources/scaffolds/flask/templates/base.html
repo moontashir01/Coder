@@ -4,9 +4,16 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{% block title %}{{PROJECT_NAME}}{% endblock %}</title>
+    <!-- style.css defines the components; theme.css re-declares the colour and
+         font variables they are written in terms of. theme.css MUST stay last:
+         it is the file that wins, and it is the only one a restyle touches. -->
     <link
       rel="stylesheet"
       href="{{ url_for('static', filename='css/style.css') }}"
+    />
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='css/theme.css') }}"
     />
   </head>
   <body>
@@ -28,6 +35,21 @@
     </header>
 
     <main class="site-main">
+      <!-- Flashed messages render here for EVERY page, so a route that calls
+           flash() needs no markup of its own. Don't repeat this in a child
+           template — the message would appear twice. -->
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+        <div class="flashes">
+          {% for category, message in messages %}
+          <div class="alert alert-{{ category or 'info' }}" role="status">
+            {{ message }}
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
+      {% endwith %}
+
       {% block content %}{% endblock %}
     </main>
 

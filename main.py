@@ -147,7 +147,9 @@ def main(
     mcp_manager = MCPManager()
     skill_loader = SkillLoader()
     skill_loader.load_all()
-    agent = AgentCore(session_id=session, mcp_manager=mcp_manager, skill_loader=skill_loader)
+    agent = AgentCore(
+        session_id=session, mcp_manager=mcp_manager, skill_loader=skill_loader
+    )
     repl = CoderREPL(agent=agent, mcp_manager=mcp_manager, skill_loader=skill_loader)
 
     startup_project = _startup_project(project, no_index)

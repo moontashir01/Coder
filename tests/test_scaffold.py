@@ -614,6 +614,9 @@ def test_converted_page_renders_through_the_real_scaffold(tmp_path):
         autoescape=True,
     )
     env.globals["url_for"] = lambda endpoint, **kw: "/" + kw.get("filename", "")
+    # base.html renders flashed messages for every page (Phase W1), so rendering
+    # it outside a Flask request needs this global stubbed just like url_for.
+    env.globals["get_flashed_messages"] = lambda **kw: []
     html = env.get_template("posts.html").render(posts=[{"title": "First"}])
 
     assert "All Posts" in html

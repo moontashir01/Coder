@@ -111,7 +111,10 @@ def _network_violation(command: str) -> str | None:
 
 def _truncate(text: str) -> str:
     if len(text) > MAX_OUTPUT:
-        return text[:MAX_OUTPUT] + f"\n... [truncated — {len(text) - MAX_OUTPUT} more chars]"
+        return (
+            text[:MAX_OUTPUT]
+            + f"\n... [truncated — {len(text) - MAX_OUTPUT} more chars]"
+        )
     return text
 
 
@@ -161,7 +164,11 @@ def run_command(
         combined = "\n".join(result_parts)
 
         if proc.returncode != 0:
-            return {"success": False, "result": combined, "error": f"Exit code {proc.returncode}"}
+            return {
+                "success": False,
+                "result": combined,
+                "error": f"Exit code {proc.returncode}",
+            }
         return _ok(combined)
 
     except subprocess.TimeoutExpired:

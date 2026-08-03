@@ -4,6 +4,7 @@ File tools reject paths that resolve outside settings.sandbox_root unless
 allow_outside_root is set. The jail is inert when sandbox_root is None, so all
 other tests (which never set it) keep passing.
 """
+
 import pytest
 
 from app.tools import filesystem as fs

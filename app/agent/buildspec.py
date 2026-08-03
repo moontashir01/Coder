@@ -164,6 +164,84 @@ _STYLE_PRESETS: list[tuple[re.Pattern[str], dict]] = [
             "decorative": "8px radii, soft shadows, blue accent, system-ui spacing scale",
         },
     ),
+    # The presets below close a silent gap: `_STYLE_WORD_RE` recognised all of
+    # these words, so `find_style_keywords` reported a styled request — but no
+    # pattern above matched them, `_preset_for` returned {}, and `resolve_theme`
+    # therefore wrote no theme at all. "warm and cozy", "professional", "neon"
+    # and "industrial" all shipped the scaffold's default look while reporting
+    # that the style had been understood.
+    (
+        re.compile(r"\b(warm|cozy|cosy|rustic|earthy)\b", re.I),
+        {
+            "fonts": ("Bitter", "Source Sans 3"),
+            "stacks": (_SYS_SERIF, _SYS_SANS),
+            "palette": ("#fdf8f3", "#f2e4d5", "#d9b48f", "#a4522d", "#3b2b21"),
+            "decorative": (
+                "terracotta accents on warm off-white, generous padding, soft "
+                "12px radii, no pure white and no pure black"
+            ),
+        },
+    ),
+    (
+        re.compile(r"\b(neon|cyberpunk|synthwave|glow)\b", re.I),
+        {
+            "fonts": ("Orbitron", "Rajdhani"),
+            "stacks": (_SYS_SANS, _SYS_SANS),
+            "palette": ("#0a0a12", "#141428", "#2a2a4a", "#00e5ff", "#f0f0ff"),
+            "decorative": (
+                "near-black surfaces, one saturated cyan accent used for every "
+                "border and link, thin 1px outlines instead of shadows"
+            ),
+        },
+    ),
+    (
+        re.compile(r"\b(industrial|brutalist|concrete|utilitarian)\b", re.I),
+        {
+            "fonts": ("Archivo", "Archivo"),
+            "stacks": (_SYS_SANS, _SYS_SANS),
+            "palette": ("#f4f4f2", "#e2e2df", "#9a9a95", "#c2410c", "#1c1c1a"),
+            "decorative": (
+                "square corners (0 radius), heavy 2px borders, flat fills, no "
+                "shadows, uppercase headings"
+            ),
+        },
+    ),
+    (
+        re.compile(r"\b(muted|monochrome|greyscale|grayscale|understated)\b", re.I),
+        {
+            "fonts": ("Inter", "Inter"),
+            "stacks": (_SYS_SANS, _SYS_SANS),
+            "palette": ("#fafafa", "#f0f0f0", "#d4d4d4", "#525252", "#171717"),
+            "decorative": (
+                "greyscale throughout, weight and spacing carry the hierarchy "
+                "instead of colour, hairline borders"
+            ),
+        },
+    ),
+    (
+        re.compile(r"\b(professional|corporate|business|formal)\b", re.I),
+        {
+            "fonts": ("Source Serif 4", "Source Sans 3"),
+            "stacks": (_SYS_SERIF, _SYS_SANS),
+            "palette": ("#ffffff", "#f5f7fa", "#dde3ea", "#14532d", "#111827"),
+            "decorative": (
+                "restrained palette, 4px radii, clear section rules, generous "
+                "line-height, no decorative flourishes"
+            ),
+        },
+    ),
+    (
+        re.compile(r"\b(airy|breezy|coastal|serene)\b", re.I),
+        {
+            "fonts": ("Quicksand", "Nunito Sans"),
+            "stacks": (_SYS_ROUNDED, _SYS_SANS),
+            "palette": ("#f7fbfd", "#e6f2f7", "#c2dde8", "#2b7a99", "#22333b"),
+            "decorative": (
+                "lots of whitespace, large 16px radii, soft diffuse shadows, "
+                "cool blue-green accent"
+            ),
+        },
+    ),
 ]
 
 # Style words worth recording even when the LLM call fails outright — the union
@@ -175,7 +253,9 @@ _STYLE_WORD_RE = re.compile(
     r"energetic|elegant|luxurious|luxury|sophisticated|refined|classy|"
     r"minimal|minimalist|clean|simple|understated|modern|sleek|contemporary|"
     r"warm|cool|muted|monochrome|rustic|industrial|brutalist|neon|"
-    r"professional|corporate|friendly|cozy|airy)\b",
+    r"professional|corporate|friendly|cozy|cosy|airy|earthy|breezy|coastal|"
+    r"serene|cyberpunk|synthwave|concrete|utilitarian|business|formal|"
+    r"greyscale|grayscale)\b",
     re.IGNORECASE,
 )
 
@@ -494,6 +574,431 @@ def palette_matches_style(palette: tuple[str, ...], message: str) -> bool:
         )
         return pastel * 2 >= len(measured)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Themes as data (Phase W1b, docs/web-quality-plan.md)
+# ---------------------------------------------------------------------------
+# `to_context_block` states the palette to the model as prose, and the model
+# obeys it at its own discretion — measured drift is routine. The tokens below
+# are written into `static/css/theme.css` instead, so the preset applies whether
+# or not the model cooperates. Every rule in the scaffold's style.css is written
+# in terms of these variables, which is what makes a whole-site restyle a
+# one-file change with no markup edit anywhere.
+#
+# Pure and deterministic: same message in, same CSS out, no LLM call.
+
+
+def _rgb(hex_color: str) -> tuple[float, float, float]:
+    """#rgb / #rrggbb -> three 0..1 channels."""
+    h = (hex_color or "").lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    return tuple(int(h[i : i + 2], 16) / 255 for i in (0, 2, 4))  # type: ignore[return-value]
+
+
+def _to_hex(channels: tuple[float, float, float]) -> str:
+    return "#" + "".join(f"{max(0, min(255, round(c * 255))):02x}" for c in channels)
+
+
+def relative_luminance(hex_color: str) -> float:
+    """WCAG relative luminance (0..1). Not the same as `chroma_lightness`'s
+    lightness — that one is a cheap ordering key, this one is the perceptual
+    quantity a contrast ratio is defined on."""
+    out = 0.0
+    for channel, weight in zip(_rgb(hex_color), (0.2126, 0.7152, 0.0722)):
+        linear = (
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
+        )
+        out += linear * weight
+    return out
+
+
+def contrast_ratio(a: str, b: str) -> float:
+    """WCAG contrast ratio between two colours, 1.0 (identical) to 21.0."""
+    la, lb = relative_luminance(a), relative_luminance(b)
+    hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _ensure_contrast(color: str, against: str, target: float = 4.5) -> str:
+    """Darken (or lighten) ``color`` until it is readable on ``against``.
+
+    A preset's most colourful shade is chosen as the accent because it carries
+    the requested mood — but mood says nothing about legibility, and a mid-tone
+    accent used for link text on a light background routinely lands near 3:1.
+    Rather than abandon the palette, move the accent along its own lightness
+    axis until it passes; the hue, and therefore the look, survives.
+
+    Returns ``color`` unchanged when it already passes or when no amount of
+    adjustment reaches the target (a grey on grey), because a mangled colour is
+    worse than a slightly weak one.
+    """
+    if contrast_ratio(color, against) >= target:
+        return color
+    lighten = relative_luminance(against) < 0.5
+    channels = _rgb(color)
+    for step in range(1, 20):
+        factor = 1 + step * 0.06 if lighten else 1 - step * 0.05
+        candidate = _to_hex(tuple(c * factor for c in channels))  # type: ignore[arg-type]
+        if contrast_ratio(candidate, against) >= target:
+            return candidate
+    return color
+
+
+# ---------------------------------------------------------------------------
+# Colours the request names outright
+# ---------------------------------------------------------------------------
+# The preset table answers "what does *pastel* look like". It has no answer for
+# the most direct way anyone asks for a look — naming the colours. "a dark blue
+# and gold colour scheme" and "a purple and white palette" reached the palette
+# code as nothing at all: no preset matched, `resolve_theme` returned {}, and
+# the scaffold's default theme shipped. This reads the colours off the message.
+
+_COLOR_NAMES: dict[str, str] = {
+    "red": "#dc2626",
+    "crimson": "#b91c1c",
+    "maroon": "#7f1d1d",
+    "burgundy": "#6b1f2e",
+    "orange": "#ea580c",
+    "amber": "#f59e0b",
+    "gold": "#c9a227",
+    "golden": "#c9a227",
+    "yellow": "#eab308",
+    "mustard": "#ca8a04",
+    "olive": "#4d7c0f",
+    "green": "#16a34a",
+    "emerald": "#059669",
+    "forest": "#166534",
+    "mint": "#34d399",
+    "lime": "#65a30d",
+    "sage": "#7a9a72",
+    "teal": "#0d9488",
+    "turquoise": "#06b6d4",
+    "cyan": "#06b6d4",
+    "aqua": "#06b6d4",
+    "blue": "#2563eb",
+    "navy": "#1e3a8a",
+    "azure": "#0284c7",
+    "sky": "#0ea5e9",
+    "cobalt": "#1d4ed8",
+    "indigo": "#4f46e5",
+    "purple": "#7c3aed",
+    "violet": "#8b5cf6",
+    "lavender": "#a78bfa",
+    "lilac": "#c4b5fd",
+    "plum": "#86198f",
+    "magenta": "#c026d3",
+    "fuchsia": "#c026d3",
+    "pink": "#db2777",
+    "rose": "#e11d48",
+    "coral": "#f43f5e",
+    "salmon": "#fb7185",
+    "peach": "#fb923c",
+    "brown": "#78350f",
+    "tan": "#b45309",
+    "beige": "#d6c6a8",
+    "cream": "#f5efe0",
+    "ivory": "#f8f4e8",
+    "charcoal": "#374151",
+    "slate": "#475569",
+    "grey": "#6b7280",
+    "gray": "#6b7280",
+    "silver": "#9ca3af",
+    "black": "#111111",
+    "white": "#ffffff",
+}
+
+# "dark blue" is navy and "pale green" is mint — a modifier changes which colour
+# was asked for, so it is read as part of the name rather than discarded.
+_COLOR_MODIFIERS = {
+    "dark": -0.35,
+    "deep": -0.35,
+    "rich": -0.2,
+    "light": 0.45,
+    "pale": 0.5,
+    "soft": 0.4,
+    "pastel": 0.55,
+    "bright": 0.0,
+    "vivid": 0.0,
+}
+
+_COLOR_WORD_RE = re.compile(
+    r"(?:\b(?P<mod>" + "|".join(_COLOR_MODIFIERS) + r")\s+)?"
+    r"\b(?P<name>" + "|".join(sorted(_COLOR_NAMES, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+_HEX_IN_TEXT_RE = re.compile(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b")
+
+# A colour word only counts as a *style* request in a styling context. Without
+# this, "a green energy company" and "a Black Friday deals page" would each
+# repaint the whole site — the `_clean_nav` failure (inventing what the user did
+# not ask for) wearing a different hat. A literal hex needs no such evidence:
+# nobody types #1e3a8a by accident.
+_COLOR_CONTEXT_RE = re.compile(
+    r"\b(colou?rs?|colou?r\s?scheme|palette|theme|themed|styled?|style|look|"
+    r"looks|accent|background|design|branding|vibe|aesthetic|tones?|shades?|"
+    r"paint)\b",
+    re.IGNORECASE,
+)
+
+# Wording that asks for the site's LOOK to change, as opposed to its content.
+# `wants_restyle` gates the one pass allowed to overwrite a theme the user may
+# have hand-tuned, so it is kept narrow: it must fire on a request to restyle
+# and on nothing else. It doubles as colour-request evidence, so "restyle it in
+# navy" needs no separate word naming what navy is.
+_RESTYLE_VERB_RE = re.compile(
+    r"\b(restyle|recolou?r|re-?theme|redesign|reskin|"
+    r"make\s+it|turn\s+it|style\s+it|"
+    r"change\s+(?:the\s+)?(?:colou?rs?|palette|theme|style|look|design)|"
+    r"switch\s+(?:it\s+)?to)\b",
+    re.IGNORECASE,
+)
+
+# Below this chroma a colour cannot carry the accent role — white, black and
+# grey are page and text, never the thing that stands out.
+_ACCENT_MIN_CHROMA = 0.12
+
+
+def _mix(color: str, toward: str, amount: float) -> str:
+    """Blend ``color`` ``amount`` of the way toward ``toward`` (0 = unchanged)."""
+    return _to_hex(
+        tuple(  # type: ignore[arg-type]
+            a + (b - a) * amount for a, b in zip(_rgb(color), _rgb(toward))
+        )
+    )
+
+
+def find_requested_colors(message: str) -> tuple[tuple[str, str], ...]:
+    """Colours the message actually names, as ``(label, hex)`` in the order used.
+
+    Returns () unless the message shows styling intent (`_COLOR_CONTEXT_RE`) or
+    contains a literal hex — a colour word in ordinary prose is a noun, not a
+    design decision.
+    """
+    text = message or ""
+    hexes = _HEX_IN_TEXT_RE.findall(text)
+    # A style word is itself evidence of styling intent: "a modern site in
+    # purple" names no palette/colour/theme, and without this the specific half
+    # of the request would be dropped in favour of the preset's own blue.
+    if not hexes and not (
+        _COLOR_CONTEXT_RE.search(text)
+        or _STYLE_WORD_RE.search(text)
+        or _RESTYLE_VERB_RE.search(text)
+    ):
+        return ()
+
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in hexes:
+        if raw.lower() not in seen:
+            seen.add(raw.lower())
+            out.append((raw.lower(), raw.lower()))
+    for match in _COLOR_WORD_RE.finditer(text):
+        name = match.group("name").lower()
+        mod = (match.group("mod") or "").lower()
+        color = _COLOR_NAMES[name]
+        shift = _COLOR_MODIFIERS.get(mod, 0.0)
+        if shift < 0:
+            color = _mix(color, "#000000", -shift)
+        elif shift > 0:
+            color = _mix(color, "#ffffff", shift)
+        label = f"{mod} {name}".strip()
+        if color.lower() in seen:
+            continue
+        seen.add(color.lower())
+        out.append((label, color))
+        if len(out) >= 4:
+            break
+    return tuple(out)
+
+
+def palette_from_colors(colors: tuple[str, ...], dark: bool) -> tuple[str, ...]:
+    """Build a full five-role palette around the colours the request named.
+
+    The named colours carry the hue; the surfaces and text are *derived* from
+    them so the result is a coherent theme rather than the two colours pasted
+    onto the default one. `theme_tokens` then assigns the roles as it does for
+    any preset, which is what keeps one code path for both.
+
+    **The page is light unless the request asked for dark.** "a dark blue and
+    gold site" most often means navy on white, not a navy background, and the
+    conservative reading is the one that cannot ruin the build — `dark mode`
+    still reaches its own preset, and `_DARK_STYLE_RE` is what sets ``dark``.
+    """
+    if not colors:
+        return ()
+    chromatic = [c for c in colors if chroma_lightness(c)[0] >= _ACCENT_MIN_CHROMA]
+    primary = chromatic[0] if chromatic else colors[0]
+    secondary = chromatic[1] if len(chromatic) > 1 else None
+
+    if dark:
+        return (
+            _mix(primary, "#000000", 0.88),
+            _mix(primary, "#000000", 0.80),
+            _mix(primary, "#000000", 0.62),
+            secondary or primary,
+            _mix(primary, "#ffffff", 0.92),
+        )
+    return (
+        "#ffffff",
+        _mix(primary, "#ffffff", 0.95),
+        _mix(primary, "#ffffff", 0.82),
+        primary if secondary is None else secondary,
+        _mix(primary, "#000000", 0.78),
+    )
+
+
+def theme_tokens(
+    palette: tuple[str, ...], stacks: tuple[str, ...] = ()
+) -> dict[str, str]:
+    """Map a palette onto the CSS custom properties style.css is written against.
+
+    Ordered by lightness rather than by the order the preset lists them, so the
+    role each colour plays is derived from what the colour *is*. A palette given
+    in a different order therefore produces the same theme.
+
+    **Which END is the page is decided first, by the palette's own weight.**
+    Reading the lightest colour as the background unconditionally looks right
+    until a dark palette arrives: the "dark mode" preset
+    (`#0f1115 #1a1d24 #272b34 #8ab4f8 #e8eaed`) is mostly dark, so its lightest
+    entry is the *text* — and assigning that to the page produced a light theme
+    with a blue surface from a request that said "dark mode". Caught by
+    `test_a_dark_palette_declares_a_dark_color_scheme`.
+    """
+    ordered = sorted(
+        (c for c in palette if _HEX_RE.match(c or "")),
+        key=lambda c: chroma_lightness(c)[1],
+    )
+    if len(ordered) < 3:
+        return {}
+
+    is_dark = sum(chroma_lightness(c)[1] for c in ordered) / len(ordered) < 0.5
+    page_end = list(ordered) if is_dark else list(reversed(ordered))
+    # page_end runs from the page outwards: background, then the surfaces layered
+    # on it, and the text colour at the far end.
+    bg, surface = page_end[0], page_end[1]
+    border = page_end[2] if len(page_end) >= 3 else surface
+    text = page_end[-1]
+
+    # Secondary text: the least colourful shade that is neither the page nor the
+    # body text, dragged into legibility below. A mid-tone from the palette
+    # would otherwise read as a third accent.
+    middle = [c for c in page_end[1:-1]] or [text]
+    muted = min(middle, key=lambda c: chroma_lightness(c)[0])
+
+    # The accent is the most chromatic shade that isn't the page itself, pulled
+    # into legibility against that page.
+    accent = max((c for c in ordered if c != bg), key=lambda c: chroma_lightness(c)[0])
+    accent = _ensure_contrast(accent, bg)
+    accent_text = max(
+        ("#ffffff", "#000000", text), key=lambda c: contrast_ratio(c, accent)
+    )
+
+    tokens = {
+        "--color-bg": bg,
+        "--color-surface": surface,
+        "--color-border": border,
+        "--color-text": text,
+        "--color-muted": _ensure_contrast(muted, bg, 4.5),
+        "--color-accent": accent,
+        "--color-accent-text": accent_text,
+    }
+    if len(stacks) >= 2:
+        tokens["--font-heading"] = stacks[0]
+        tokens["--font-body"] = stacks[1]
+    return tokens
+
+
+def resolve_theme(message: str) -> dict:
+    """The theme a request asks for, or {} when it names no style at all.
+
+    Deliberately LLM-free: it never consults the extraction call's palette,
+    because this runs *before* generation (beside the scaffold copy) and that
+    call happens later, inside the multi-file flow. A request with no style
+    words and no colours keeps the scaffold's default theme, which is the honest
+    answer — inventing a look nobody asked for is the failure `_clean_nav`
+    exists to prevent.
+
+    **Colours the user named beat the preset they also matched.** "a modern site
+    in purple" matches the modern preset, whose palette is blue; using it would
+    answer the vaguer half of the request and discard the specific half, which is
+    precisely the "not the style I asked for" complaint. The preset still supplies
+    the typography, so "an elegant site in navy and gold" keeps its serif pairing.
+    """
+    keywords = find_style_keywords(message)
+    colors = find_requested_colors(message)
+    if not keywords and not colors:
+        return {}
+
+    preset = _preset_for(keywords, message)
+    stacks = tuple(preset.get("stacks") or ())
+    if colors:
+        palette = _clean_palette(
+            palette_from_colors(
+                tuple(c for _label, c in colors),
+                dark=bool(_DARK_STYLE_RE.search(message or "")),
+            )
+        )
+        stacks = stacks or _DEFAULT_STACKS
+    else:
+        palette = _clean_palette(preset.get("palette") or ())
+
+    tokens = theme_tokens(palette, stacks)
+    if not tokens:
+        return {}
+    return {
+        "keywords": keywords + tuple(label for label, _c in colors),
+        "tokens": tokens,
+    }
+
+
+def wants_restyle(message: str) -> bool:
+    """Does this message ask for the look of an existing site to change?
+
+    Two conditions, both required. The wording must actually be a restyle
+    request, and it must resolve to a theme — so "make it responsive" and "make
+    it faster" match the first test, resolve to nothing, and are correctly not
+    treated as restyles.
+    """
+    if not _RESTYLE_VERB_RE.search(message or ""):
+        return False
+    return bool(resolve_theme(message))
+
+
+def theme_css(theme: dict) -> str:
+    """Render `resolve_theme`'s tokens as the generated `static/css/theme.css`.
+
+    Emits `:root` ONLY — no `prefers-color-scheme` block. A palette chosen for
+    "soft pastel" has no correct mechanical inverse, and deriving one by rule
+    produces colours nobody picked; the requested look is the look. The
+    scaffold's default theme, which was not chosen by anyone, keeps its dark
+    scheme for exactly the same reason.
+    """
+    tokens = (theme or {}).get("tokens") or {}
+    if not tokens:
+        return ""
+    keywords = ", ".join((theme or {}).get("keywords") or ()) or "the request"
+    dark = relative_luminance(tokens.get("--color-bg", "#ffffff")) < 0.4
+    lines = [
+        "/* Theme — generated from the style this project asked for:",
+        f" * {keywords}.",
+        " *",
+        " * Only custom properties live here; style.css is written entirely in",
+        " * terms of them, so editing a value below restyles every page and",
+        " * every component at once. Nothing regenerates this file after the",
+        " * first build — it is yours to tune.",
+        " */",
+        "",
+        ":root {",
+        f"  color-scheme: {'dark' if dark else 'light'};",
+    ]
+    for name, value in tokens.items():
+        lines.append(f"  {name}: {value};")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
 
 
 def build_spec_from_data(data: dict | None, message: str) -> BuildSpec:

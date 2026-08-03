@@ -4,6 +4,7 @@ write_file (over an existing file) and edit_file attach a "diff" key to the
 tool result. The model feedback path only ever reads result["result"], so the
 diff is REPL-display-only; _print_tool_step renders it under the tool status.
 """
+
 import io
 
 from rich.console import Console

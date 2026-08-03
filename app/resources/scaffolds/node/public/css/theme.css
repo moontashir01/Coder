@@ -1,0 +1,38 @@
+/* {{PROJECT_NAME}} — theme.
+ *
+ * GENERATED, and safe to regenerate: this file holds nothing but colour and
+ * typography custom properties. `style.css` defines every rule in terms of
+ * these variables, so restyling the whole site is a change to this file alone
+ * and touches no markup and no component rule.
+ *
+ * It is linked AFTER style.css, so what it declares wins. That is also why the
+ * dark scheme lives here rather than in style.css: a `@media` block there would
+ * lose to a plain `:root` block here, and the site would be stuck in light
+ * colours with no visible cause.
+ *
+ * This is the default theme. A build that asks for a particular look
+ * ("soft pastel", "dark and modern") has these values replaced with a resolved
+ * palette. Hand-edit it freely — nothing regenerates it after the first build.
+ */
+
+:root {
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #14171a;
+    --color-surface: #1c2126;
+    --color-border: #2c333a;
+    --color-text: #e9edf1;
+    --color-muted: #9aa6b2;
+    --color-accent: #5b9bff;
+    --color-accent-text: #0b1220;
+
+    --color-success: #4ade80;
+    --color-error: #f87171;
+    --color-warning: #fbbf24;
+
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.5);
+  }
+}

@@ -5,6 +5,7 @@ delete_file) must first copy the current content into settings.backups_dir.
 undo_write() restores the most recent backup (optionally for one path) and
 consumes it, so repeated undos walk back through history.
 """
+
 import pytest
 
 from app.agent.executor import Executor

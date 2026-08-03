@@ -184,7 +184,9 @@ async def test_repair_creates_missing_referenced_file(tmp_path, monkeypatch):
     assert trace and trace[0]["tool"] == "write_file"
 
 
-async def test_repair_reports_but_does_not_fabricate_binary_asset(tmp_path, monkeypatch):
+async def test_repair_reports_but_does_not_fabricate_binary_asset(
+    tmp_path, monkeypatch
+):
     monkeypatch.chdir(tmp_path)
     index = tmp_path / "index.html"
     index.write_text('<html><body><img src="logo.png"></body></html>', encoding="utf-8")
@@ -300,7 +302,7 @@ def test_find_broken_page_links_fixes_root_absolute_and_extensionless(tmp_path):
         "<nav>"
         '<a href="/about.html">About</a>'
         '<a href="blog">Blog</a>'
-        '<a href="contact.html">Contact</a>'          # already fine
+        '<a href="contact.html">Contact</a>'  # already fine
         '<a href="https://example.com/x.html">Ext</a>'  # external
         "</nav>",
         encoding="utf-8",

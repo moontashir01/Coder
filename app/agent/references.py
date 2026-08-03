@@ -107,6 +107,10 @@ REF_SCANNED_EXTS = {
     ".ts",
     ".jsx",
     ".tsx",
+    # EJS views are HTML with tags in it, so the href/src scan reads them the
+    # same way it reads a Jinja template (Phase N3). Without this a Node view's
+    # `<script src="missing.js">` dangles with nothing to notice.
+    ".ejs",
 }
 
 

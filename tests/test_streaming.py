@@ -4,6 +4,7 @@ The streaming LLM is faked with an object exposing .astream() as an async
 generator yielding langchain-style chunk objects (SimpleNamespace(content=str)).
 No Ollama needed.
 """
+
 import io
 from types import SimpleNamespace
 

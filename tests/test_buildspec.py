@@ -6,14 +6,21 @@ All offline: the extraction call uses a scripted LLM, everything else is pure.
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from app.agent.buildspec import (
     _CONCRETE_CSS_RE,
     BuildSpec,
     build_spec_from_data,
     chroma_lightness,
+    contrast_ratio,
+    find_requested_colors,
     find_style_keywords,
     mentions_shared_spec,
     palette_matches_style,
+    relative_luminance,
+    resolve_theme,
+    wants_restyle,
 )
 from app.agent.core import AgentCore
 
@@ -402,3 +409,114 @@ async def test_multi_file_flow_names_the_shared_assets_exactly(tmp_path, monkeyp
     await a._multi_file_flow("split the site into separate files", refs=[])
 
     assert "The shared script is `script.js`" in a._llm_direct.prompts[2]
+
+
+# ---------------------------------------------------------------------------
+# Colours the request names outright
+# ---------------------------------------------------------------------------
+# The preset table answers "what does *pastel* look like" and had no answer for
+# the most direct way anyone asks: naming the colours. "a dark blue and gold
+# colour scheme" resolved to no theme at all, so the scaffold's default shipped.
+
+
+def test_named_colours_reach_the_theme():
+    theme = resolve_theme("build a store with a dark blue and gold colour scheme")
+    tokens = theme["tokens"]
+    assert theme["keywords"] == ("dark blue", "gold")
+    # Gold is the accent, legible against the page it was placed on.
+    assert contrast_ratio(tokens["--color-accent"], tokens["--color-bg"]) >= 4.5
+    assert chroma_lightness(tokens["--color-accent"])[0] > 0.2
+
+
+def test_a_named_colour_beats_the_preset_it_also_matched():
+    """ "a modern site in purple" matches the modern preset, whose palette is
+    blue. Using it answers the vague half and discards the specific half."""
+    modern = resolve_theme("build a modern site")["tokens"]["--color-accent"]
+    purple = resolve_theme("build a modern site in purple")["tokens"]["--color-accent"]
+    assert modern.lower() == "#2563eb"
+    assert purple.lower() != modern.lower()
+    # A purple accent, i.e. more blue than red and more red than green.
+    r, g, b = (int(purple.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4))
+    assert b > r > g
+
+
+def test_a_colour_word_in_prose_does_not_repaint_the_site():
+    """The `_clean_nav` rule in another hat: never invent what wasn't asked for."""
+    assert resolve_theme("build a site for a green energy company") == {}
+    assert find_requested_colors("a Black Friday deals page") == ()
+
+
+def test_a_literal_hex_needs_no_styling_context():
+    colors = find_requested_colors("build a shop with #0d9488 everywhere")
+    assert colors and colors[0][1] == "#0d9488"
+
+
+def test_dark_and_light_modifiers_change_which_colour_was_asked_for():
+    dark = dict(find_requested_colors("a dark blue theme"))["dark blue"]
+    light = dict(find_requested_colors("a light blue theme"))["light blue"]
+    plain = dict(find_requested_colors("a blue theme"))["blue"]
+    assert chroma_lightness(dark)[1] < chroma_lightness(plain)[1]
+    assert chroma_lightness(light)[1] > chroma_lightness(plain)[1]
+
+
+def test_a_dark_request_with_named_colours_produces_a_dark_page():
+    tokens = resolve_theme("build a blog in dark mode with a teal accent")["tokens"]
+    assert relative_luminance(tokens["--color-bg"]) < 0.2
+    assert contrast_ratio(tokens["--color-text"], tokens["--color-bg"]) >= 4.5
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "build a portfolio, warm and cozy",
+        "make me a professional corporate dashboard",
+        "a recipe site with a neon cyberpunk aesthetic",
+        "an industrial brutalist landing page",
+        "a muted monochrome blog",
+        "an airy coastal site",
+    ],
+)
+def test_every_recognised_style_word_resolves_to_a_theme(message):
+    """`_STYLE_WORD_RE` used to recognise all of these while `_preset_for`
+    matched none, so `resolve_theme` reported a styled request and wrote
+    nothing — the scaffold default shipped while the style was 'understood'."""
+    theme = resolve_theme(message)
+    assert theme, f"{message!r} named a style but resolved to no theme"
+    tokens = theme["tokens"]
+    assert contrast_ratio(tokens["--color-text"], tokens["--color-bg"]) >= 4.5
+    assert contrast_ratio(tokens["--color-accent"], tokens["--color-bg"]) >= 4.5
+
+
+def test_a_request_with_no_style_at_all_still_writes_no_theme():
+    assert resolve_theme("build me an e-commerce website") == {}
+
+
+# ---------------------------------------------------------------------------
+# wants_restyle — the gate on the one pass allowed to overwrite theme.css
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "make it purple",
+        "restyle it in navy and gold",
+        "change the colours to green",
+        "now make it dark mode",
+    ],
+)
+def test_restyle_gate_fires_on_a_look_change(message):
+    assert wants_restyle(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "make it responsive",  # restyle wording, but resolves to no theme
+        "make it faster",
+        "add a login page",
+        "remove the cart",
+    ],
+)
+def test_restyle_gate_ignores_everything_else(message):
+    assert wants_restyle(message) is False

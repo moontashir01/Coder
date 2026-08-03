@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.agent.blueprint import (
+    HOME_TEMPLATE,
     TIER_CORE,
     TIER_OPTIONAL,
     TIER_REQUESTED,
@@ -1111,3 +1112,113 @@ async def test_tier_two_is_never_asked_when_tier_one_fires(tmp_path, monkeypatch
     await a.chat("build me a login page")  # tier 1 matches
 
     assert a._llm_blueprint.calls == 0  # no classifier call was made
+
+
+# ---------------------------------------------------------------------------
+# derive_home_page — the front door nothing used to write
+# ---------------------------------------------------------------------------
+# The scaffold ships templates/index.html and never overwrites it, the layout
+# call is not asked for a home page, and derive_pages_from_entities covers
+# entities — which the home page is not one of. So every build shipped the same
+# "This project was scaffolded by Coder" placeholder as its first page.
+
+_FLASK = Stack(language="python", backend="flask", runnable=True)
+
+
+def _shop_data():
+    return {
+        "summary": "A shop",
+        "files": [
+            {"filename": "app.py", "action": "edit", "role": "backend"},
+            {
+                "filename": "templates/products.html",
+                "action": "create",
+                "role": "frontend",
+                "reads": ["product"],
+            },
+            {
+                "filename": "templates/new_product.html",
+                "action": "create",
+                "role": "frontend",
+                "reads": ["product"],
+            },
+        ],
+        "contract": {
+            "endpoints": [
+                {
+                    "method": "GET",
+                    "path": "/products",
+                    "template": "templates/products.html",
+                },
+                {
+                    "method": "GET",
+                    "path": "/products/new",
+                    "template": "templates/new_product.html",
+                },
+                {
+                    "method": "POST",
+                    "path": "/products/new",
+                    "template": "templates/new_product.html",
+                },
+                {
+                    "method": "GET",
+                    "path": "/products/<int:pid>",
+                    "template": "templates/product.html",
+                },
+            ]
+        },
+    }
+
+
+def test_home_page_is_planned_as_an_edit():
+    bp = blueprint_from_data(_shop_data(), "build me a shop", _FLASK)
+    home = [f for f in bp.files if f.filename == HOME_TEMPLATE]
+    assert len(home) == 1
+    # The scaffold already wrote the file, so this is an edit — which is what
+    # the plan manifest should say and what `_file_op_flow` will really do.
+    assert home[0].action == "edit"
+    assert "placeholder" in home[0].instruction.lower()
+    assert any(f.name == "Home page" for f in bp.features)
+
+
+def test_home_page_links_the_listing_pages_but_not_the_forms():
+    bp = blueprint_from_data(_shop_data(), "build me a shop", _FLASK)
+    instruction = next(f.instruction for f in bp.files if f.filename == HOME_TEMPLATE)
+    assert "Products (/products)" in instruction
+    # "Add a product" is a button on the products page, not a section of the
+    # site; a parameterised route has no fixed URL to link at all.
+    assert "/products/new" not in instruction
+    assert "<int:pid>" not in instruction
+
+
+def test_home_page_planned_by_the_model_wins():
+    """Planning it twice would put one file through two generation passes, the
+    second overwriting the first."""
+    data = _shop_data()
+    data["files"].append(
+        {
+            "filename": "templates/index.html",
+            "action": "edit",
+            "instruction": "the model's own home page",
+            "role": "frontend",
+        }
+    )
+    bp = blueprint_from_data(data, "build me a shop", _FLASK)
+    homes = [f for f in bp.files if f.filename == HOME_TEMPLATE]
+    assert len(homes) == 1
+    assert homes[0].instruction == "the model's own home page"
+
+
+def test_home_page_is_flask_only():
+    """On another stack the file layout is the model's own, so `templates/`
+    would name a path nothing serves — derive_pages_from_entities' rule."""
+    node = Stack(language="node", backend="express", runnable=True)
+    bp = blueprint_from_data(_shop_data(), "build me a shop", node)
+    assert not any(f.filename == HOME_TEMPLATE for f in bp.files)
+
+
+def test_home_page_without_routes_still_gets_an_instruction():
+    data = {"summary": "x", "files": [{"filename": "app.py", "action": "edit"}]}
+    bp = blueprint_from_data(data, "build me a page", _FLASK)
+    home = next(f for f in bp.files if f.filename == HOME_TEMPLATE)
+    assert "what a visitor can do here" in home.instruction

@@ -28,11 +28,16 @@ from __future__ import annotations
 import atexit
 import logging
 import subprocess
-import sys
 import time
 from pathlib import Path
 
-from app.agent.smoke import _IS_WIN, _kill_tree, _port_open, detect_ports
+from app.agent.smoke import (
+    _IS_WIN,
+    _kill_tree,
+    _port_open,
+    _runtime_command,
+    detect_ports,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +89,13 @@ class AppRunner:
         if not target.is_file():
             return False, f"no {entry} in {workdir} — build something first"
 
+        # Phase N0: `python <entry>` is not universal. `_runtime_command` is the
+        # same one-line mapping the smoke test uses, so `/run` and the smoke
+        # test can never disagree about how to start the same file.
+        command = _runtime_command(target)
+        if command is None:
+            return False, f"don't know how to run {entry}"
+
         try:
             source = target.read_text(encoding="utf-8", errors="ignore")
         except Exception:
@@ -102,7 +114,7 @@ class AppRunner:
             popen_kwargs["start_new_session"] = True
 
         try:
-            proc = subprocess.Popen([sys.executable, entry], **popen_kwargs)
+            proc = subprocess.Popen(command, **popen_kwargs)
         except Exception as e:
             return False, f"could not start {entry}: {e}"
 

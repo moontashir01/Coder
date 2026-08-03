@@ -435,9 +435,7 @@ def test_sibling_context_states_the_nav_once(tmp_path, monkeypatch):
     assert "index.html" in ctx  # attributed to the page it came from
 
 
-def test_sibling_context_finds_nav_past_the_old_2500_char_cutoff(
-    tmp_path, monkeypatch
-):
+def test_sibling_context_finds_nav_past_the_old_2500_char_cutoff(tmp_path, monkeypatch):
     """The nav used to be lost behind a long <head>: the per-file excerpt was
     cut at a fixed 2500 chars, so later pages never saw it."""
     monkeypatch.chdir(tmp_path)

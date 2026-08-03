@@ -1,0 +1,23 @@
+<%# Every view is a FRAGMENT. layout.ejs owns the <html> document, the <head>,
+    the navigation and the footer — never write those here, and never copy the
+    nav into a view: it renders twice.
+
+    `ui` is the component library in ui.js and is available in every view.
+    Call it with the unescaped output tag, e.g. ui.table(rows, columns),
+    because the helpers return HTML and already escape their values. %>
+
+<% if (typeof notFound !== "undefined" && notFound) { %>
+<section class="hero">
+  <h1>Page not found</h1>
+  <p class="lede">Nothing is served at <%= notFound %>.</p>
+  <a class="button" href="/">Back to the home page</a>
+</section>
+<% } else { %>
+<section class="hero">
+  <h1><%= projectName %></h1>
+  <p class="lede">
+    This project was scaffolded by Coder and is already running. Replace this
+    block with the real home page.
+  </p>
+</section>
+<% } %>

@@ -542,6 +542,307 @@ def every_entity_has_a_table() -> Check:
     return check
 
 
+# ---------------------------------------------------------------------------
+# Does it LOOK right (Phase W10, docs/web-quality-plan.md)
+#
+# Everything above this line measures whether the app WORKS. None of it renders
+# a page, so a table 900px wide inside a 390px viewport, a button wired to
+# nothing and a console full of ReferenceErrors all scored a clean pass.
+#
+# These checks name no selector the task author had to guess: they read the
+# project's own spec for its routes, drive the same `browser.py` the agent uses,
+# and assert on measurements W5/W6 already define. A machine with no browser
+# gets a FAILURE naming the install command, not a silent pass — a suite that
+# scores 100% without having looked at anything is exactly what this phase
+# exists to stop.
+# ---------------------------------------------------------------------------
+
+# One page's style fingerprint. Not a screenshot hash — a pixel diff fails when
+# the seeded data changes and would be pure noise. What matters is whether the
+# pages still share one design system: the same computed body typography and
+# background, the vocabulary from `style.css`, and no page-local <style> block
+# that has quietly opted out of the theme.
+_STYLE_SCRIPT = """
+() => {
+  const body = getComputedStyle(document.body);
+  const classes = new Set();
+  for (const el of document.querySelectorAll('[class]')) {
+    for (const c of String(el.className || '').trim().split(/\\s+/)) {
+      if (c) classes.add(c);
+    }
+  }
+  return {
+    font_family: body.fontFamily,
+    background: body.backgroundColor,
+    color: body.color,
+    local_styles: document.querySelectorAll('style').length,
+    has_nav: !!document.querySelector('nav'),
+    nav_links: Array.from(document.querySelectorAll('nav a')).map(
+      (a) => (a.textContent || '').trim()
+    ).slice(0, 12),
+    classes: Array.from(classes).sort().slice(0, 60),
+  };
+}
+"""
+
+# Classes the shipped component sheet defines (Phase W1). A page built from the
+# design system uses some of them; one that invented its own uses none.
+_COMPONENT_CLASSES = {
+    "card",
+    "grid",
+    "stack",
+    "cluster",
+    "table",
+    "table-wrap",
+    "field",
+    "button",
+    "badge",
+    "empty",
+    "alert",
+    "page-header",
+    "hero",
+    "lede",
+    "form-narrow",
+    "breadcrumb",
+    "pagination",
+}
+
+
+def _spec_routes(ctx: "CheckContext") -> list[str]:
+    """Every GET page route the project remembers, always including `/`."""
+    spec = _spec(ctx)
+    routes: list[str] = ["/"]
+    for page in getattr(spec, "pages", ()) or ():
+        route = (page.route or "").strip()
+        if route.startswith("/") and "<" not in route and route not in routes:
+            routes.append(route)
+    return routes
+
+
+class _BrowserReport:
+    """What one browser pass saw. Built once per task, shared by every check."""
+
+    def __init__(self, audit=None, styles=None, error: str = "") -> None:
+        self.audit = audit
+        self.styles: dict[str, dict] = styles or {}
+        self.error = error
+
+
+def _browser_report(ctx: "CheckContext") -> _BrowserReport:
+    """Start the app once, render every page once, and remember what was seen."""
+    if isinstance(getattr(ctx, "browser", None), _BrowserReport):
+        return ctx.browser  # type: ignore[return-value]
+
+    from app.agent import browser as browser_layer
+    from app.agent.apprunner import AppRunner
+    from app.agent.browser import probe_pages
+    from app.agent.pageaudit import audit_site, page_of, probe_urls
+
+    report = _BrowserReport()
+    if not browser_layer.available():
+        report.error = browser_layer.install_hint()
+    elif not (Path(ctx.workdir) / "app.py").is_file():
+        report.error = "no app.py to run"
+    else:
+        runner = AppRunner()
+        try:
+            ok, message = runner.start(ctx.workdir)
+            if not ok:
+                report.error = f"app did not start: {message}"
+            else:
+                base = f"http://127.0.0.1:{runner._port}"
+                routes = _spec_routes(ctx)
+                report.audit = audit_site(base, routes)
+                for probe in probe_pages(
+                    probe_urls(base, routes),
+                    widths=[1280],
+                    scripts={"style": _STYLE_SCRIPT},
+                ):
+                    style = (probe.data or {}).get("style")
+                    if probe.ok and isinstance(style, dict):
+                        report.styles[page_of(probe.url)] = style
+        except Exception as e:  # noqa: BLE001 — an eval never crashes the suite
+            report.error = f"browser pass failed: {type(e).__name__}: {e}"
+        finally:
+            runner.stop()
+    ctx.browser = report
+    return report
+
+
+def _audit_or_fail(ctx: "CheckContext"):
+    """`(audit, failure_detail)` — the shared preamble of every W10 check."""
+    report = _browser_report(ctx)
+    if report.error:
+        return None, report.error
+    if report.audit is None or not report.audit.ran:
+        return None, "the browser never opened a page"
+    if not report.audit.observations:
+        return None, "the browser opened, but no page loaded"
+    return report.audit, ""
+
+
+def no_horizontal_overflow() -> Check:
+    """No page scrolls sideways — measured at every configured width.
+
+    The single most common responsive bug and the one that embarrasses a demo
+    on a phone. `browser_widths` includes 390px precisely so this can be asked.
+    """
+
+    def check(ctx: "CheckContext") -> tuple[bool, str]:
+        audit, failure = _audit_or_fail(ctx)
+        if audit is None:
+            return False, f"no_horizontal_overflow: {failure}"
+        found = audit.of_kind("overflow")
+        if found:
+            return False, "; ".join(f.line() for f in found[:4])
+        return True, (
+            f"no sideways scroll on {len(audit.pages)} page(s) at "
+            f"{', '.join(str(w) for w in audit.widths)}px"
+        )
+
+    return check
+
+
+def no_console_errors() -> Check:
+    """No uncaught JavaScript and no failed asset request, on any page."""
+
+    def check(ctx: "CheckContext") -> tuple[bool, str]:
+        audit, failure = _audit_or_fail(ctx)
+        if audit is None:
+            return False, f"no_console_errors: {failure}"
+        found = audit.of_kind("console", "network")
+        if found:
+            return False, "; ".join(f.line() for f in found[:4])
+        return True, f"console clean on {len(audit.pages)} page(s)"
+
+    return check
+
+
+def every_control_does_something() -> Check:
+    """Every button that was clicked changed something.
+
+    W6's probe as an assertion, including its skips: a control that was not
+    clicked (destructive, or a POST form the functional probe owns) is reported
+    as skipped, never counted as a pass.
+    """
+
+    def check(ctx: "CheckContext") -> tuple[bool, str]:
+        audit, failure = _audit_or_fail(ctx)
+        if audit is None:
+            return False, f"every_control_does_something: {failure}"
+        dead = [f for f in audit.of_kind("dead-control") if f.severity == "error"]
+        if dead:
+            return False, "; ".join(f.line() for f in dead[:4])
+        detail = f"{audit.controls_clicked} control(s) clicked, all did something"
+        if audit.controls_skipped:
+            detail += f"; {len(audit.controls_skipped)} skipped"
+        return True, detail
+
+    return check
+
+
+def contrast_ok() -> Check:
+    """Every text node clears WCAG AA against its computed background."""
+
+    def check(ctx: "CheckContext") -> tuple[bool, str]:
+        audit, failure = _audit_or_fail(ctx)
+        if audit is None:
+            return False, f"contrast_ok: {failure}"
+        found = audit.of_kind("contrast")
+        if found:
+            return False, "; ".join(f.line() for f in found[:4])
+        return True, f"contrast AA on {len(audit.pages)} page(s)"
+
+    return check
+
+
+def nav_on_every_page() -> Check:
+    """Every page carries the SAME navigation — the base.html guarantee.
+
+    `_repair_nav_consistency` fixes this for static builds and `base.html` makes
+    it structural for Flask ones; this is the check that says whether either
+    actually held.
+    """
+
+    def check(ctx: "CheckContext") -> tuple[bool, str]:
+        report = _browser_report(ctx)
+        if report.error:
+            return False, f"nav_on_every_page: {report.error}"
+        if not report.styles:
+            return False, "nav_on_every_page: no page could be inspected"
+        missing = [page for page, s in report.styles.items() if not s.get("has_nav")]
+        if missing:
+            return False, "no <nav> on " + ", ".join(missing[:4])
+        signatures = {
+            page: tuple(s.get("nav_links") or ()) for page, s in report.styles.items()
+        }
+        distinct = set(signatures.values())
+        if len(distinct) > 1:
+            listed = "; ".join(
+                f"{page}: {', '.join(links) or '(empty)'}"
+                for page, links in list(signatures.items())[:3]
+            )
+            return False, f"the nav differs between pages — {listed}"
+        return True, f"the same nav on all {len(signatures)} page(s)"
+
+    return check
+
+
+def style_stable_across_turns() -> Check:
+    """Turn 3 did not restyle turn 1 — the visual sibling of
+    `earlier_pages_still_work`, and the headline number for `web-quality-plan`.
+
+    Compares the computed token values and the components in use, **not** a
+    screenshot: a pixel diff fails whenever the seeded data changes, which would
+    make it noise rather than a measurement. Three questions:
+
+      * do all pages still compute the same body typography and background
+        (i.e. is one theme still in force);
+      * has any page opted out with its own `<style>` block;
+      * is every page still built from the shipped component vocabulary.
+
+    A page added on turn 3 that styled itself fails all three.
+    """
+
+    def check(ctx: "CheckContext") -> tuple[bool, str]:
+        report = _browser_report(ctx)
+        if report.error:
+            return False, f"style_stable_across_turns: {report.error}"
+        if len(report.styles) < 2:
+            return False, "style_stable_across_turns: fewer than two pages to compare"
+
+        problems: list[str] = []
+        fonts = {s.get("font_family") for s in report.styles.values()}
+        backgrounds = {s.get("background") for s in report.styles.values()}
+        if len(fonts) > 1:
+            problems.append(f"{len(fonts)} different body fonts: {sorted(fonts)}")
+        if len(backgrounds) > 1:
+            problems.append(f"{len(backgrounds)} different page backgrounds")
+
+        opted_out = [p for p, s in report.styles.items() if s.get("local_styles")]
+        if opted_out:
+            problems.append("page-local <style> on " + ", ".join(opted_out[:3]))
+
+        no_components = [
+            page
+            for page, s in report.styles.items()
+            if not (_COMPONENT_CLASSES & set(s.get("classes") or ()))
+        ]
+        if no_components:
+            problems.append(
+                "no shipped component class on " + ", ".join(no_components[:3])
+            )
+
+        if problems:
+            return False, "; ".join(problems)
+        return True, (
+            f"all {len(report.styles)} page(s) share one theme and the shipped "
+            "components"
+        )
+
+    return check
+
+
 def _entity_routes(spec, entity) -> tuple[str, str]:
     """`(list route, create route)` for an entity.
 

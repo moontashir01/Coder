@@ -116,7 +116,15 @@ def detect_stack(
     if prefer == "fastapi":
         return _fastapi(runnable=_has_module("fastapi"))
     if prefer == "node":
-        return _node(allow_network, runnable=bool(_which("node")))
+        # A FORCED node stack is the named "node" stack of docs/node-stack-plan.md:
+        # Express + EJS + PostgreSQL, always. The probe-path `_node()` below
+        # degrades to Node's built-in `http` when the network is off, which is
+        # right when we are guessing and wrong when the user asked for this
+        # stack by name — the scaffold on disk requires express, so a note
+        # telling the model to avoid it would contradict the files it is
+        # editing. `npm install` needing the network is reported in
+        # `install_hint`, never folded into `note`.
+        return _node_express(runnable=bool(_which("node")))
 
     # auto: richest present option wins, else stdlib.
     if _has_module("flask"):
@@ -191,6 +199,55 @@ def _node_dep_present(_has_module) -> bool:
     # allows install (checked separately) — so with the network off and no way to
     # confirm express is vendored, prefer the stdlib Python stack instead.
     return False
+
+
+def _node_express(runnable: bool = True) -> Stack:
+    """The named Node stack: Express + EJS + PostgreSQL (`web_stack="node"`).
+
+    `install_hint` is non-empty even when Node IS present, and that is
+    deliberate: unlike sqlite, this stack has a package install and a database
+    daemon between "the files are correct" and "the app runs". Reporting them
+    every time is the honest read; folding them into `note` would make
+    `prompts/blueprint.md`'s "don't use what isn't installed" rule fire and
+    quietly produce something else — the downgrade this module exists to
+    prevent.
+    """
+    missing_node = (
+        ""
+        if runnable
+        else "Node.js was not found on PATH — install it (nodejs.org) first. Then "
+    )
+    return Stack(
+        language="node",
+        backend="express",
+        runnable=runnable,
+        install_hint=(
+            f"{missing_node}run `npm install` in the project (it needs the "
+            "network once) and make sure PostgreSQL is running with the "
+            "project's database created — the generated app exits on startup "
+            "rather than serving pages it cannot back with data."
+        ),
+        note=(
+            "The stack for this build is server-rendered Express + EJS views + "
+            "PostgreSQL via the `pg` package. One process serves pages, static "
+            "files and uploads; no separate frontend server, no build step, no "
+            "React.\n"
+            "Use EXACTLY this layout:\n"
+            "  server.js        routes only (app.get/app.post), no SQL\n"
+            "  db.js            getPool(), initDb(), ensureColumn() migrations\n"
+            "  models.js        one query helper per operation, $1 parameters only\n"
+            "  seed.js          a few demo rows per table\n"
+            "  views/           EJS pages; layout.ejs holds the nav and shell\n"
+            "  public/css|js|uploads\n"
+            "Every view is a FRAGMENT wrapped by layout.ejs — never write a full "
+            "<html> document in a view, and never copy the nav into one. Route "
+            "handlers are `async` and `await` the model helpers. Values are "
+            "bound as $1, $2, … parameters, never concatenated into the SQL, and "
+            "an INSERT that needs the new id ends with RETURNING id. Prefer a "
+            'plain <form method="post" action="/route"> over fetch(): it works '
+            "with no JavaScript at all, so the button cannot silently do nothing."
+        ),
+    )
 
 
 def _node(allow_network: bool, runnable: bool = True) -> Stack:

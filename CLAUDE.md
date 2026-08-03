@@ -440,6 +440,14 @@ that feeds changes into `retriever.index_file`/`delete_file`. Its filtering (suf
 it. Best-effort throughout: watcher failures never break project loading, and it silently no-ops if
 watchdog is unavailable.
 
+**Jinja edges (Phase W8):** `.html` files are indexed as **edges only** — `{% extends %}` /
+`{% include %}` from the template, and `render_template("x.html")` from a route — resolved
+against `<root>/templates` by `_resolve_template`. So `dependencies("templates/products.html")`
+returns its layout and `dependents("templates/base.html")` returns its children. A template
+contributes **no symbols**: every page defines `{% block content %}`, so indexing block names
+would make `find_symbol("content")` return the whole site and mean nothing. A dynamic
+`render_template(name + ".html")` yields no edge rather than a wrong one.
+
 **Stale-index prevention (Step 1 / C1):** every successful mutating write — in `_file_op_flow`,
 `_surgical_edit`, and the native tool loop (`write_file`/`edit_file`/`create_file`) — calls
 `AgentCore._reindex_after_write` (→ `retriever.index_file`), and `delete_file` calls
@@ -584,6 +592,92 @@ sharper version of the `check_intent` trap: it runs *before* `_expand_requiremen
 test that opts back into the blueprint stage and patches only that method would still reach a
 real ChatOllama.
 
+### Two stacks behind one seam (`app/agent/stacks/`, Phases N0–N2)
+
+`docs/node-stack-plan.md`. There are two named stacks — `flask` (Python / Flask /
+Jinja2 / sqlite3, the default) and `node` (Node / Express / EJS / PostgreSQL) —
+and **nothing outside `app/agent/stacks/` decides between them**. `core.py` used
+to write `workdir / "app.py"` at four call sites, `workdir.glob("*.py")` at a
+fifth and `[sys.executable, "seed.py"]` at a sixth; those all read
+`self._adapter` now.
+
+- **`FlaskAdapter` is delegation only.** Every method forwards to the function
+  that already did the job (`scaffold_flask`, `crud.models_source`,
+  `impact.migration_block`, `projectspec.routes_from_source`). That is what makes
+  N0's exit criterion checkable — the whole suite passes **unmodified**. A method
+  in `flask_adapter.py` that grows a branch of its own has become a rewrite, and
+  the guarantee stops being provable.
+- **`get_adapter()` is total.** `""`, `None`, `"auto"` and a typo all return the
+  Flask adapter. Specs written before the seam have no stack key, and a KeyError
+  there would turn a missing field in an old `project.json` into a dead turn.
+- **The spec outranks the setting** (`stacks.resolve_key`, pinned once per turn
+  in `chat()` via `_select_stack`). Opening a Node project with `web_stack` left
+  at `flask` would otherwise send `_amend_project` to write Python
+  `ensure_column` calls into a `db.py` that does not exist — a silent, total
+  failure on turn 2. `spec.language` is checked before `spec.backend`, because
+  `runtime_probe._node()` reports `backend="stdlib"` with the network off and
+  that collides with the *Python* stdlib stack.
+- **`resolve_key` and `probe_prefer` are different questions and must stay
+  apart.** The first answers "which adapter" (closed set, Flask default, so
+  `stdlib` → Flask). The second answers "what to pass `detect_stack(prefer=…)`"
+  and must preserve `stdlib`/`fastapi`/`auto`/`none`. Conflating them silently
+  rebuilds a stdlib project as a Flask one.
+- **Two named stacks, never two axes.** Database and framework are not
+  independent; four combinations would mean four scaffolds and a test matrix
+  nobody maintains.
+- **`style.css` and `theme.css` are byte-identical copies**, and `write_theme`
+  takes the stack's relative path. They are pure custom properties, so all of
+  W1's design-system work transfers for free — fork them and the two stacks stop
+  looking like one product. `ui.js` carries the **same helper names** as
+  `_macros.html` for the same reason: `ui_context()` has to say the same thing on
+  both stacks. It is a `.js` module rather than the plan's `views/_macros.ejs`
+  because EJS has no macro construct — an included partial cannot export
+  callables — and the call site is identical either way
+  (`{{ ui.table(...) }}` / `<%- ui.table(...) %>`).
+- **The Node adapter states its gaps, and `/stack` prints them.** They are real
+  and they are printed verbatim (no route validation, no import repair, no `.ejs`
+  syntax check, no spec adoption for a repo Coder didn't build). A menu that
+  listed the two stacks as equals is how a demo gets built on the weaker one by
+  accident.
+- **One entity model, two dialects** (`projectspec.Dialect`, `SQLITE` /
+  `POSTGRES`, Phase N3). `crud.py` and `crud_node.py` emit from the SAME `Entity`
+  objects; the only things allowed to differ are the five in that table
+  (placeholder `?` vs `$1`, `INTEGER PRIMARY KEY AUTOINCREMENT` vs
+  `SERIAL PRIMARY KEY`, the type map, `lastrowid` vs `RETURNING id`, and the
+  migration call). Two DDL writers would be two schemas wearing one spec.
+  `SQLITE` is the default on every method, so Flask's output is byte-identical.
+  - **`REAL` maps to `NUMERIC`, not to PostgreSQL's `REAL`.** The latter is a
+    4-byte float, and `REAL` in a generated schema is overwhelmingly a price.
+  - **`crud_node.js_strings` closes the `_creates_table` trap for JavaScript.**
+    `db.js` ships a *commented* `CREATE TABLE ... widgets` example exactly as
+    `db.py` does, and counting one as real already cost the Flask side a live
+    build. There is no Python-side JS parser, so it strips comments and reads
+    string literals, erring toward reporting FEWER literals — writing a
+    `CREATE TABLE IF NOT EXISTS` twice is a no-op, skipping one is a dead app.
+  - **`passwords.js` is generated, not prompted.** Node has no
+    `werkzeug.security`, and `bcrypt` means a native build on a machine whose
+    point is that it works offline. `crypto.scrypt` needs nothing installed, is
+    salted per password, and compares with `timingSafeEqual`.
+  - **`derive_pages_from_entities` / `derive_home_page` run for any stack with a
+    SCAFFOLD**, not just Flask — a fixed `templates/`+`@app.route` or
+    `views/`+`app.get` layout is what makes a synthesized path correct. stdlib
+    and fastapi still derive nothing, because there the file layout is the
+    model's own and a guessed filename is a file nothing serves.
+- **`adapter.readiness(root)` skips the smoke test rather than failing it.**
+  Node + Postgres has three ways to be un-runnable where Flask has one (no node,
+  no `node_modules`, nothing listening on 5432), and none of them is a defect in
+  the generated code — without this, `_smoke_repair_instruction` sends the model
+  to rewrite correct code because `npm install` was never run. **The skip is
+  reported as `may not meet:`, never as a pass.** Flask returns `""` always, so
+  no check that used to run is now gated. The `SELECT 1` half (does the *database*
+  exist, do the credentials work) is still Phase N5's.
+- **The generated Express app exits non-zero when `initDb()` fails.** Starting
+  anyway would serve `/` with a 200 while every data page 500s — a build that
+  reports success and is broken, which is the one failure this codebase exists to
+  prevent.
+- Scaffold dotfiles follow the existing packaging rule: stored as
+  `gitignore`/`gitkeep`, dot restored on write.
+
 ### Forcing the stack (`app/agent/runtime_probe.py`, `settings.web_stack`)
 
 Phase A of `docs/always-fullstack-plan.md`. `detect_stack()` used to *probe* — richest
@@ -627,6 +721,19 @@ Three properties are load-bearing:
   top of the working skeleton — `_file_op_flow` routes an existing file to `_surgical_edit`, so the
   model adds this project's routes to a running `app.py`. Freezing them all would ship the
   placeholder home page as the finished site.
+- **The home page is planned deterministically** (`blueprint.derive_home_page`). Staying out of
+  `_FROZEN` was necessary but not sufficient: a file is only edited if something *plans* it, and
+  nothing planned `templates/index.html`. The layout call is not asked for a home page (the Flask
+  layout table named `templates/<page>.html`, and no prompt said "home page"), and
+  `derive_pages_from_entities` covers entities — which the home page is not one of. So the scaffold
+  wrote it once, `scaffold_flask` declined to overwrite it, and **every build shipped the identical
+  "This project was scaffolded by Coder" hero as its front door.** `derive_home_page` runs after
+  `derive_pages_from_entities` so it can link the routes that pass just added; it plans an **edit**,
+  it links listing pages but not form or parameterised routes ("add a product" is a button on the
+  products page, not a section of the site), and **whatever the layout call planned wins** —
+  planning the file twice would put it through two generation passes, the second overwriting the
+  first. Flask only, for `derive_pages_from_entities`' reason. `blueprint.md` also asks for the file
+  now, and `scaffold_context` no longer calls the placeholder "the home page", which read as done.
 - **Placeholder substitution is exact-literal**, not a template engine: `{{PROJECT_NAME}}` /
   `{{SECRET_KEY}}` share Jinja's delimiters, and `{{ url_for(...) }}` must survive into the
   generated project untouched.
@@ -646,6 +753,264 @@ full `<html>` document into `{% extends "base.html" %}` + `{% block content %}`,
 is worse than the drift the layout exists to prevent. Related: `base.html` links home with a literal
 `/` rather than `url_for('index')` **on purpose** — a BuildError there fires on every page, so one
 deleted route would 500 the entire site instead of 404ing one page.
+
+### The design system — components shipped, not generated (Phase W1)
+
+`docs/web-quality-plan.md`. The scaffold made the app *run* before generation; this makes it
+*look* finished. Same principle one layer up: a table, an alert and an empty state contain no
+decisions, and a 7B asked to invent them writes a different one on every page.
+
+- **`static/css/style.css` is the component sheet** (~480 lines): `.table-wrap` + `.table`,
+  `.alert-*`, `.empty`, `.badge`, `.card-media`, `.grid`/`.stack`/`.cluster`,
+  `.sidebar-layout`, `.breadcrumb`, `.pagination`, focus rings, reduced-motion. Every rule is
+  written in **custom properties**, never a literal — `test_component_sheet_is_written_in_variables_not_literals`
+  fails the build otherwise, because a rule naming `#2563eb` is a rule a restyle cannot reach.
+- **`templates/_macros.html` is the markup library** — `page_header`, `table`, `card`,
+  `field`, `badge`, `empty_state`, `flash_messages`. `_FROZEN`, like `requirements.txt`.
+- **`static/css/theme.css` holds every colour/font token and is linked LAST**, so it wins.
+  That is also why the **dark scheme lives there and not in style.css**: a `@media` block in
+  the earlier sheet loses to a plain `:root` in the later one, and the site would be stranded
+  in light colours with no visible cause.
+- **A requested style is written, not described.** `buildspec.resolve_theme(message)` →
+  `theme_tokens` → `theme_css` → `scaffold.write_theme`, all deterministic, called from
+  `_run_blueprint` beside the scaffold copy. `to_context_block` still *states* the palette so
+  the model knows which variables exist, but the look no longer depends on it complying.
+  A message with **no style words and no colours yields no theme** — inventing a look nobody
+  asked for is the failure `_clean_nav` exists to prevent.
+- **Colours the request names outright beat the preset it also matched**
+  (`buildspec.find_requested_colors` / `palette_from_colors`). The preset table answers "what
+  does *pastel* look like" and had no answer for the most direct way anyone asks — naming the
+  colours. "a dark blue and gold colour scheme" and "a purple and white palette" matched no
+  preset, so `resolve_theme` returned `{}` and the *default* theme shipped; "a modern site in
+  purple" matched the modern preset and came out blue. Named colours now supply the palette and
+  the preset keeps supplying the typography, so "an elegant site in navy and gold" stays serif.
+  Three rules: a colour word only counts **in a styling context** (a style word, a restyle verb,
+  or a colour/palette/theme word — otherwise "a green energy company" repaints the site, which is
+  `_clean_nav`'s failure in another hat); a **literal hex needs no such evidence**; and the page
+  stays **light unless the request asked for dark**, because "a dark blue and gold site" usually
+  means navy on white and the conservative reading is the one that cannot ruin the build.
+- **Six presets were added for style words that already parsed but matched nothing.**
+  `_STYLE_WORD_RE` recognised `warm/cozy/rustic`, `professional/corporate`, `neon`,
+  `industrial/brutalist`, `muted/monochrome` and `airy` — so `find_style_keywords` reported a
+  styled request — while no `_STYLE_PRESETS` pattern matched them and `_preset_for` returned
+  `{}`. The style was "understood" and the default look shipped.
+- **A restyle works on later turns** (`buildspec.wants_restyle` → `core._restyle_project`).
+  `write_theme`'s only caller sat beside the scaffold copy, and `scaffold_flask` returns nothing
+  once the files exist — so from turn 2 on, every restyle was deterministically a no-op, on a
+  demo that is built in parts. `_amend_project` now runs the restyle **before** the delta call,
+  because a pure restyle produces an empty delta and would otherwise return None and defer to
+  routing that rewrites no theme; `should_amend` accepts restyle wording (yielding to
+  `should_blueprint`, so a greenfield request naming a look still builds); and `_run_blueprint`'s
+  theme write is no longer gated on `scaffolded`. The guard that keeps a hand-tuned theme safe is
+  now `wants_restyle` — it needs restyle wording **and** a theme that resolves, so "make it
+  responsive" matches the first test and is correctly not a restyle.
+- **`theme_tokens` decides which END of the palette is the page before assigning roles.**
+  Reading "lightest = background" is right until a dark palette arrives: the `dark mode`
+  preset is mostly dark, so its lightest entry is the *text*, and assigning that to the page
+  turned "build me a dark mode dashboard" into a light theme with a blue surface.
+- **`_ensure_contrast` moves the accent along its own lightness axis until it clears WCAG AA**
+  against the page, keeping the hue. `test_every_preset_is_legible` asserts text-on-page,
+  accent-on-page and label-on-accent all clear 4.5:1 for all 17 presets.
+- **`scaffold.ui_context()` is not optional** — the `crud.api_context()` rule again. Shipping
+  components without telling the model they exist does not stop it writing its own
+  `.product-card`; it just means the site now has two design systems. Two drift tests keep the
+  block honest: every macro on disk is advertised, nothing that isn't a macro is, and every
+  class it names is really defined in style.css. A block that drifts is worse than none — it
+  names a macro that doesn't exist and the page 500s on render.
+
+### Endpoint and form-method validation (Phase W2, `verify.py` + `core._check_endpoints`)
+
+`{{ url_for('product') }}` against a view named `products` is a Jinja `BuildError` — a 500 on
+that page, from a file that parses, renders in isolation and passed every check that existed:
+`references.py` deliberately skips `url_for` (it cannot tell a route from a file path), the
+syntax check only balances tags, and the functional probe sees the 500 without ever being able
+to name the endpoint as the cause. Runs as a **stage-0 deterministic fix** in
+`_verify_and_repair`, `.html` only.
+
+- **Known routes are read off `app.py` on disk** (`routes_from_source`), never off the
+  ProjectSpec: the spec is additive by design (`reconcile_with_disk` never deletes), so it can
+  name a route this turn's edit removed, and a check that trusted it would go quiet on exactly
+  the page that just broke.
+- **A near miss is repaired, anything else is reported.** The key rule is inherited from
+  `references._name_key` — punctuation dropped, one trailing plural collapsed — so
+  `product`→`products` and `addproduct`→`add_product` are naming slips, while
+  `edit_product`→`add_product` and `product_list`→`products` are **different handlers** and
+  are left alone. Rewriting only happens when **exactly one** candidate matches. Sending a
+  form to the wrong handler is worse than the 500 it replaces.
+- **`form_method_mismatches` reports, never fixes**: a `<form method="post">` whose action
+  route is GET-only is a 405 that every other check passes, but the repair is
+  `methods=["GET","POST"]` in app.py — a Python edit, and this pass runs per HTML file. A form
+  with **no** action is not judged: which route it posts to cannot be known from the template,
+  and a false failure here would send the repair loop to rewrite working code.
+
+### The browser layer (`app/agent/browser.py`, Phase W4)
+
+Every check before this one reads **bytes** — `verify.py` parses a file, `references.py` scans
+hrefs, `smoke.py` fetches with `urllib`. None lays out CSS or executes JavaScript, so a table
+900px wide inside a 390px viewport, a `<button onclick="addToCart(1)">` with no `addToCart`,
+and a `<script src>` that 404s at runtime were all structurally invisible.
+
+`browser_session()` yields a `Session` (`probe` / `screenshot` / `click`) or **None**, so
+every caller degrades with one `if session is None` — the shape `vision.py` uses for a missing
+model. `PageProbe` carries facts and **no verdicts**: thresholds belong to W5/W6 as pure
+functions over a probe, which is what lets them unit-test with no browser.
+
+- **Playwright's Chromium download needs the network once.** This is a real, deliberate
+  exception to the offline rule — no pure-Python renderer does modern CSS layout. Handled like
+  a missing Flask: `settings.browser_checks` ships **off**, `install_hint()` is loud and
+  separate from any generation instruction, and a machine without a browser behaves exactly as
+  it did before. **A skipped check must never read as a passing one.**
+- **Sync API on purpose**, like `smoke.py`, called with `asyncio.to_thread`. Playwright's sync
+  API refuses to run in a thread owning a live event loop, and the `to_thread` worker doesn't
+  own one. Don't "fix" it to the async API without moving every call site.
+- **Localhost only, checked before launch.** This renders pages and runs their JS; pointed at
+  an arbitrary URL it is a web client executing untrusted script.
+- The two tests that drive a real browser are gated on `importorskip("playwright")` and skip
+  here, so **nothing in this stack has ever run against a real DOM on this machine.**
+
+### Layout audit + the dead-button probe (`app/agent/pageaudit.py`, Phases W5/W6)
+
+`browser.py` reports facts; this turns them into findings. Every decision is a **pure
+function over a `PageProbe`** (`horizontal_overflow`, `low_contrast`, `console_findings`,
+`triage_controls`, `click_findings`), which is what lets 65 tests run with no browser.
+`audit_site()` is the only part that drives one: one session, one navigation per page per
+width, then one per control. It runs through `run_smoke_test(on_serving=…)` — inside the
+server window the smoke test already opened, because two servers fight over :5000 and
+`app.db`.
+
+**A false failure is worse than no check** — `functional_probe` step 3's lesson, and it cost
+three checks their obvious form:
+- **An element past the viewport's right edge is not a defect; a page that SCROLLS is.**
+  `.table-wrap` is a horizontal scroll container by design, so the obvious check would fail
+  every page that uses the component W1 shipped. Overflow is judged on `document.scrollWidth`
+  and the offending elements are named as the culprit, because a measurement with no culprit
+  is unactionable.
+- **Contrast applies WCAG's large-text allowance (3:1 at ≥24px, or ≥18.66px bold)** and is
+  *skipped* whenever the backdrop is unknowable — a background image, any translucent layer.
+  The ratio, size and weight come from the page; the threshold lives in Python, per W4's rule
+  that no verdict lives in JavaScript.
+- **`Finding.severity`**: an image with no intrinsic size is a `warning` (an image that hasn't
+  decoded measures the same as one that never will), and warnings never reach the repair loop.
+  `empty` fires only when `<main>` has no text, no media *and* no element children — an empty
+  listing table is a page that rendered.
+
+**Forms are never submitted by the browser, and the skip is reported.** Native validation
+blocks a submit with an empty required field, so "nothing changed" would fail a *correct*
+form; and a POST that went through would insert a second row behind the checks asserting
+against seeded data. `functional_probe` already posts to every write endpoint with real
+values and requires the value to come back — what the browser adds is the *control*, so that
+is what it probes. A GET form with no empty required field is submitted (that is the demo's
+search box). `Session.click` reports `innerHTML` length as well as `innerText`: a handler that
+only toggles a class moves neither the URL nor the text, and a check on the text alone would
+call a working tab switch dead.
+
+**`ProbeCheck.owner` is why browser findings don't corrupt the smoke repair.** They ride in
+the smoke result's check list (which is how they reach the answer for free), but
+`_smoke_repair_instruction` rewrites **app.py** — so "the products table scrolls sideways" would
+have sent the model to fix a CSS problem in the server file and then report success. Only
+`owner == "app"` failures go there. The rest go to `_repair_browser_findings`, targeted at the
+page's own template via the ProjectSpec and **only when that file exists on disk**
+(`_resolve_target_from_spec`'s strictness: a missing path reads as "create this", which would
+turn a measurement into a new empty file). Bounded by `settings.max_browser_repairs` (1), and
+what it leaves alone it says. `contrast` and `network` findings are **reported, never
+repaired**: the palette lives in the frozen, deterministically written `theme.css`, and a
+reference to a missing file is `_repair_dead_references`' job — that pass creates the file
+rather than rewriting the page that asked for it.
+
+**`node --check` on `AUDIT_SCRIPT`/`CONTROLS_SCRIPT` is not ceremony.** A syntax error there
+fails silently and in the worst direction: `Session.probe` swallows the `evaluate` failure,
+the key is absent from `probe.data`, and every check then reports a clean page.
+
+### The vision critique on the rendered page (`app/agent/visualcheck.py`, Phase W7)
+
+W5 measures the page and W6 exercises it. This is what is left: it fits, the console is clean,
+every button works — and it still looks wrong. **The least reliable stage in the pipeline, and
+built to be reverted.** It is `intent.py`'s shape one layer up (a 7B judging a 7B), with the
+same four rules:
+- **A five-point checklist, never "critique this."** An open prompt on a 7B VL returns "the page
+  has a clean and modern feel", then "consider adding testimonials".
+- **`intent.parse_verdict` is reused verbatim** — which is why the prompt asks for the literal
+  `MISSING:` marker. A second parser is a second thing that can read noise as a defect;
+  "unparseable = PASS" is what protects a page that is fine.
+- **A complaint must name a visible SYMPTOM and must not ask for new content.** "Add a hero
+  image" is a feature request — the same tension `buildspec._clean_nav` resolves.
+- **`_guarded_repair` reverts a pass that made things worse.** It snapshots the files a repair
+  is about to rewrite, re-measures, and restores them byte-for-byte if the error count rose;
+  the restored files are identical to the ones that produced the earlier audit, so that audit's
+  numbers are true again with no third server start. This wraps the **W5/W6** repair too.
+
+Screenshots are taken by `audit_site(screenshot_pages=…)` inside the smoke window (the only
+moment a live server exists), **viewport not full-page** — a 4000px-tall PNG is downscaled to
+illegibility by `vision._prepare_image`'s 1536px cap. `vision.ask_about_image` sends bytes, so
+nothing is written to disk. Gated by `check_visual` (off, **and defaulted off in conftest** —
+the same trap as `check_intent`/`schema_first`, a third time), `visual_max_pages`,
+`max_visual_repairs`.
+
+### The template dependency graph (`app/agent/templatedeps.py`, Phase W8)
+
+`symbols.py` resolved imports for Python only, so the graph stopped at `app.py` and everything
+downstream had to answer "which template shows a product?" from `Page.reads` — inferred from
+blueprint prose and routinely empty on the listing page that matters. `build_graph(root)` reads
+the real edges off disk: `extends`/`include`, route→template, `url_for` targets, form actions,
+static assets, and the **entities a template displays**. `impacted_files(…, graph=…)` unions
+them with `Page.reads` (never substitutes), and `_resolve_target_from_spec` falls back to them
+when no page matches by name.
+
+- **The entity hint takes identifiers ONLY from Jinja expressions, strings stripped first.**
+  Otherwise `base.html` — whose nav says "Products" and whose href is
+  `{{ url_for('products') }}` — becomes a reader of every entity, and an amendment rewrites the
+  site layout to "show price for each product". Layout templates are excluded outright.
+- **Matching uses word segments**: a template writes `{% for product in products %}` while the
+  view behind a generically-named page writes `models.get_all_products()`. Whole-identifier
+  matching finds the first and misses the second.
+- **`view_bodies` stops at the next decorator**, not the next `def` — `@app.route("/products")`
+  sits between two functions and made `index` look like a page that displays products.
+- **Additive and best-effort**: a template the parser cannot read yields no edges, never a wrong
+  one. `symbols.py` stores the same edges (`.html` files and `render_template("x.html")`) as
+  `imports` rows, so `dependencies`/`dependents` work for templates; a template contributes **no
+  symbols** — every page defines `{% block content %}`, so indexing block names would make
+  `find_symbol("content")` return the whole site.
+
+### Best-of-N and roles per model (`app/agent/candidates.py`, Phase W9)
+
+Offline on a 7B, sampling is the only lever left: generate a high-value file twice at
+`best_of_temperature`, score both with the **deterministic** checks, keep the winner. Sound only
+because W2/W5/W6 made those checks objective. `verify.check_file` was split into `check_text`
+(tooling-free, takes a string) plus the node/tsc step, so a candidate can be scored before
+anything is written.
+- **Default `best_of_n=1` — off.** Every request already costs minutes; doubling that is the
+  user's choice, and the answer says what it cost.
+- **Ties go to the first candidate.** N>1 must never make a build merely *different*.
+- **Nothing while streaming** (the user is watching #1's tokens), and nothing for a file where a
+  defect is cheap (`is_high_value`: `.html`/`.py` only).
+- **The `url_for` score is skipped, not guessed, when `app.py` is absent** — an unknown endpoint
+  set makes every candidate look broken. **`unresolved_local_calls` is not scored at all**:
+  `app.py` legitimately calls a `models.py` helper the build writes two files later.
+- **`_llm_planner` / `_llm_judge` are properties**, returning `_llm_blueprint` / `_llm_edit`
+  until `planner_model` / `judge_model` name something. An attribute captured at construction
+  would silently hold the pre-`set_model` instance and defeat every test that patches those.
+- **`_extract_schema` is cached per session** — temperature 0, and `/plan` previews an amendment
+  with the message the build then uses. A failed call is never cached.
+
+### Editing a child template one block at a time (Phase W3)
+
+`_surgical_edit` ran SEARCH/REPLACE across the whole file, and a 7B asked to add something to
+a page answers with *just that block* — so its edit deleted `{% extends %}` and the title, which
+is exactly why `_restore_scaffold_invariants` / `convert_to_child_template` exist. Repairing it
+afterwards is strictly worse than not causing it.
+
+`scaffold.template_edit_region(filename, text)` returns the `{% block %}` an edit belongs in
+(pure, no LLM); `_surgical_edit(region=…)` shows the model *only* that body, matches its blocks
+*only* against that body, and `BlockRegion.splice` puts it back — so everything outside the
+block is copied through byte-for-byte and cannot be lost.
+- **It declines on everything ambiguous**: not a `.html` under `templates/`, no `{% extends %}`
+  (that is `convert_to_child_template`'s file, not this one), unbalanced tags, a nested block,
+  an empty body, or two equally plausible blocks. `title`/`nav`/`head`/`scripts`/`styles` are
+  never edited alone — a one-line block gives SEARCH nothing to match.
+- **The fallback is the whole-file SEARCH/REPLACE path, then the rewrite** — in that order. A
+  block attempt that matches nothing (a request about the title, say) re-runs `_surgical_edit`
+  with no region; falling straight to a regeneration would make every title edit cost a full
+  file rewrite. A non-template edit still spends exactly one `_llm_edit` call.
 
 ### ProjectSpec — memory between turns (`app/agent/projectspec.py`)
 
@@ -922,6 +1287,19 @@ below; `scaffolds_dir` locates the runnable project skeletons; `blueprint_max_fi
 `may not meet:` rather than truncating silently — `_run_blueprint` and `_verify_blueprint_coverage`
 apply the same slice, so a hidden truncation was invisible to the check that exists to catch missing
 files. `allow_network` additionally decides whether generated pages may reference CDN fonts/scripts.
+Browser knobs (Phase W4, `docs/web-quality-plan.md`): **`browser_checks` ships OFF** — it is
+the one feature whose install step needs the network (`python -m playwright install
+chromium`), so it is opt-in and its absence is *reported* via `browser.install_hint()` rather
+than silently skipped; `browser_timeout`, `browser_widths` (`[1280, 390]` — the narrow one is
+the point, horizontal overflow cannot be seen at desktop width), `browser_max_pages` and
+`browser_max_controls` bound one turn's navigations (the W6 dead-button probe reloads the page
+once per control). `max_browser_repairs` (1) caps how many FILES one turn may rewrite over what
+the browser measured; 0 reports the findings and changes nothing. W7's `check_visual` ships
+**off** and needs a browser as well (there is no screenshot without one); `visual_max_pages` (2)
+bounds the vision calls and `max_visual_repairs` (1) the rewrites.
+W9 knobs: `best_of_n` (**1** = off) and `best_of_temperature` (0.4) — generate a high-value file
+N times and keep the best-scoring candidate; `planner_model` / `judge_model` (both empty = use
+`llm_model`, i.e. exactly today's behaviour) put a different model on the reasoning calls.
 `max_context_tokens` is the per-prompt token budget enforced by `app/agent/context_budget.py`
 (oldest history dropped first in `_build_messages`); `max_repair_attempts` caps the
 verify-and-repair loop; `backups_dir` / `max_write_backups` configure safe-write snapshots. RAG
@@ -968,6 +1346,20 @@ The checks assert the app WORKS, not that plausibly-named files appeared:
 - **`earlier_pages_still_work` is the headline number.** Not "did turn 3 work" but *"did turn 3
   break turn 1"* — the regression Phase 3 caught live, where an amendment deleted turn 1's
   `/products` route while reporting success.
+
+**Phase W10 added the checks that LOOK at the page** (`no_horizontal_overflow`,
+`no_console_errors`, `every_control_does_something`, `nav_on_every_page`, `contrast_ok`,
+`style_stable_across_turns`), driving `browser.py` against an `AppRunner`. They name no route
+and no selector — they read the project's own spec — and the browser pass is **memoized on the
+`CheckContext`** so five checks cost one server launch and one Chromium start.
+- **No browser is a FAILURE naming the install command**, never a skip and never a pass: a check
+  that rendered nothing has verified nothing. They live on their own tasks (`web_quality_*`) so
+  a machine without Chromium loses those two rather than dragging every existing task down.
+- **`style_stable_across_turns` compares the pages to EACH OTHER at the end** — one computed
+  body font and background across all of them, no page-local `<style>`, every page still using
+  the shipped component classes. Not a screenshot hash: a pixel diff fails whenever the seeded
+  data changes, which is noise, not a measurement. Fewer than two pages fails rather than
+  passing vacuously.
 
 `--webapp` turns `blueprint_smoke_test` off: the checks start the app themselves and the two would
 fight for port 5000. Expect a lower score than `--blueprint` — it asks harder questions, and the

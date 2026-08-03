@@ -2,6 +2,7 @@
 
 Offline: ChatOllama is constructed but never invoked, so no Ollama is needed.
 """
+
 import io
 
 import pytest

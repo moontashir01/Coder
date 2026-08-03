@@ -1,4 +1,5 @@
 """Step 9 / C2 — best-effort failures are logged, not silently swallowed."""
+
 import logging
 
 from app.rag.retriever import Retriever

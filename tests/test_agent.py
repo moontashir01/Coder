@@ -10,8 +10,7 @@ import pytest
 from app.agent import planner as planner_mod
 from app.agent.executor import Executor
 from app.agent.planner import Planner, _extract_json
-from app.agent.tool_registry import (ToolDefinition, ToolRegistry,
-                                     create_registry)
+from app.agent.tool_registry import ToolDefinition, ToolRegistry, create_registry
 
 # ---------------------------------------------------------------------------
 # Helpers

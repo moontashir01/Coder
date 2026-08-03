@@ -4,12 +4,12 @@ Builtins carry real permission tags; the Executor refuses any tool whose
 permissions intersect settings.denied_permissions. Default deny list is empty,
 so out-of-the-box behavior is unchanged.
 """
+
 import pytest
 
 from app.agent.executor import Executor
 from app.agent.tool_registry import create_registry
 from config.settings import settings
-
 
 # ---------------------------------------------------------------------------
 # Builtin tools carry permission tags

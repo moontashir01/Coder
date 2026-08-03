@@ -5,6 +5,7 @@ permissions intersect settings.approval_gated_permissions. Reads are never
 gated; --yolo (auto_approve) bypasses; with no hook the default is allow,
 except --safe denies shell/deletes.
 """
+
 import pytest
 
 from app.agent.executor import Executor

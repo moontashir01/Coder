@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import textwrap
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -11,6 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from app.agent.stacks import describe_stacks, get_adapter, resolve_key, stack_keys
 from config.settings import settings
 
 if TYPE_CHECKING:
@@ -27,6 +29,8 @@ HELP_TEXT = """
   /index                Re-index the current project
   /spec                 Show what the agent remembers about this project
                         (tables, routes, pages — from .coder/project.json)
+  /stack [flask|node]   Show or choose the stack a build targets. A project
+                        that already has a spec keeps ITS stack regardless
   /run [restart|stop|status]  Start the generated app and keep it up across
                         turns; prints the URL to open
 
@@ -143,8 +147,13 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
             )
             return True
 
+        # Which file to run is the stack's answer, not a constant: `app.py` on
+        # Flask, `server.js` on Node. Read from the project's own spec, so
+        # opening a Node project and typing `/run` does not look for an app.py
+        # that was never written.
         workdir = repl.agent.project_path or str(Path.cwd())
-        ok, message = runner.start(workdir)
+        adapter = get_adapter(resolve_key(repl.agent.get_spec(), settings.web_stack))
+        ok, message = runner.start(workdir, adapter.entry_file)
         if ok:
             console.print(f"[green]App {message}[/green]")
             console.print(
@@ -281,6 +290,62 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
             for h in spec.history:
                 added = ", ".join(h.added) if h.added else "-"
                 console.print(f"  [cyan]rev {h.revision}[/cyan] {h.request} → {added}")
+        return True
+
+    # ── /stack ─────────────────────────────────────────────────────────
+    # Phase N1 of docs/node-stack-plan.md. Two jobs: choose the stack a NEW
+    # build targets, and show honestly what each one guarantees. The gaps are
+    # printed, not hidden — Flask has endpoint validation, deterministic
+    # migrations and import repair that Node does not, and a menu listing two
+    # stacks as equals is how a demo gets built on the weaker one by accident.
+    if cmd == "stack":
+        spec = repl.agent.get_spec()
+        pinned = spec is not None and (spec.language or spec.backend)
+        current = resolve_key(spec, settings.web_stack)
+
+        if args:
+            wanted = args[0].strip().lower()
+            if wanted not in stack_keys():
+                console.print(
+                    f"[red]Unknown stack: {wanted}[/red] — "
+                    f"choose one of {', '.join(stack_keys())}."
+                )
+                return True
+            settings.web_stack = wanted
+            console.print(
+                f"[green]New builds will target:[/green] "
+                f"{get_adapter(wanted).label}"
+            )
+            if pinned and current != wanted:
+                # The setting is a default for the NEXT project, not a
+                # conversion of this one. Saying otherwise would be the
+                # single most damaging thing this command could do: an
+                # amendment run against the wrong stack writes Python
+                # migrations into a JavaScript project.
+                console.print(
+                    f"[yellow]This project stays on {current}[/yellow] — its "
+                    "stack is recorded in .coder/project.json and an amendment "
+                    "always follows that, not this setting. The change applies "
+                    "to the next project you build."
+                )
+            return True
+
+        console.print(
+            f"[bold]Current:[/bold] {get_adapter(current).label}"
+            + (
+                "  [dim](from this project's spec)[/dim]"
+                if pinned
+                else "  [dim](session default)[/dim]"
+            )
+        )
+        for row in describe_stacks():
+            marker = "[green]*[/green]" if row["key"] == current else " "
+            console.print(f"{marker} [cyan]{row['key']}[/cyan]  {row['label']}")
+            for line in row["guarantees"]:
+                _bullet("[green]+[/green]", line)
+            for line in row["gaps"]:
+                _bullet("[yellow]-[/yellow]", line)
+        console.print("[dim]Switch with: /stack node[/dim]")
         return True
 
     # ── /model ─────────────────────────────────────────────────────────
@@ -429,6 +494,22 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
         return True
 
     return False  # unknown command
+
+
+def _bullet(marker: str, text: str, indent: int = 6) -> None:
+    """One wrapped bullet with a hanging indent.
+
+    Rich wraps to the console width but does not re-indent the continuation, so
+    a two-line guarantee runs back to column 0 and stops looking like a list.
+    The marker carries Rich markup and the text does not, so the width is
+    computed on the text alone.
+    """
+    pad = " " * indent
+    width = max(40, console.width - indent - 2)
+    lines = textwrap.wrap(text, width=width) or [""]
+    console.print(f"{pad}{marker} {lines[0]}")
+    for line in lines[1:]:
+        console.print(f"{pad}  {line}")
 
 
 def _get_mcp_manager(repl: CoderREPL):

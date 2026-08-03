@@ -1,0 +1,122 @@
+{# {{PROJECT_NAME}} — the component macros every page is built from.
+
+   Import once at the top of a page:
+
+       {% import "_macros.html" as ui %}
+
+   then call them: {{ ui.page_header("Products") }}, {{ ui.table(rows, ...) }}.
+
+   These exist for the same reason db.py and models.py are generated rather
+   than written: a table, a form field and an empty state contain no decisions,
+   and hand-writing them per page is how six pages end up with six different
+   tables. Add a macro here rather than pasting markup into a page.
+
+   Every macro emits only classes that style.css already defines. #}
+
+
+{# An empty list is a finished page, not a broken one. Always render this
+   instead of nothing when a query comes back with no rows. #}
+{% macro empty_state(message="Nothing here yet.", action_url="", action_label="") -%}
+<div class="empty">
+  <p>{{ message }}</p>
+  {% if action_url and action_label %}
+  <a class="button" href="{{ action_url }}">{{ action_label }}</a>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+
+{# Page title, with an optional primary action on the right. #}
+{% macro page_header(title, action_url="", action_label="", subtitle="") -%}
+<div class="page-header">
+  <div>
+    <h1>{{ title }}</h1>
+    {% if subtitle %}<p class="lede">{{ subtitle }}</p>{% endif %}
+  </div>
+  {% if action_url and action_label %}
+  <a class="button" href="{{ action_url }}">{{ action_label }}</a>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+
+{# A list of rows as a table. `columns` are the column names to show, in order;
+   each is looked up on the row, so they must be real column names.
+
+   The .table-wrap is not optional — it is what stops a wide table from making
+   the whole page scroll sideways on a phone. #}
+{% macro table(rows, columns, empty="Nothing here yet.") -%}
+{% if rows %}
+<div class="table-wrap">
+  <table class="table">
+    <thead>
+      <tr>
+        {% for col in columns %}<th scope="col">{{ col.replace("_", " ")|title }}</th>{% endfor %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        {% for col in columns %}<td>{{ row[col] }}</td>{% endfor %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ empty_state(empty) }}
+{% endif %}
+{%- endmacro %}
+
+
+{# One item in a grid. `image` is a path already resolved with url_for. #}
+{% macro card(title, body="", href="", image="", meta="") -%}
+{% if href %}<a class="card card-link" href="{{ href }}">{% else %}<div class="card">{% endif %}
+  {% if image %}
+  <div class="card-media"><img src="{{ image }}" alt="{{ title }}" /></div>
+  {% endif %}
+  <h3>{{ title }}</h3>
+  {% if meta %}<p class="card-meta">{{ meta }}</p>{% endif %}
+  {% if body %}<p>{{ body }}</p>{% endif %}
+{% if href %}</a>{% else %}</div>{% endif %}
+{%- endmacro %}
+
+
+{# One labelled form control. `type="textarea"` renders a textarea.
+
+   The label is tied to the input with for/id: without that, clicking the label
+   does nothing and a screen reader announces the field unnamed. #}
+{% macro field(name, label="", type="text", value="", required=false, placeholder="", hint="") -%}
+<div class="field">
+  <label for="{{ name }}">{{ label or name.replace("_", " ")|title }}</label>
+  {% if type == "textarea" %}
+  <textarea id="{{ name }}" name="{{ name }}" placeholder="{{ placeholder }}"
+            {% if required %}required{% endif %}>{{ value }}</textarea>
+  {% else %}
+  <input id="{{ name }}" name="{{ name }}" type="{{ type }}" value="{{ value }}"
+         placeholder="{{ placeholder }}" {% if required %}required{% endif %} />
+  {% endif %}
+  {% if hint %}<span class="hint">{{ hint }}</span>{% endif %}
+</div>
+{%- endmacro %}
+
+
+{# A small coloured label — a status, a category, a count. #}
+{% macro badge(text, kind="") -%}
+<span class="badge {% if kind %}badge-{{ kind }}{% endif %}">{{ text }}</span>
+{%- endmacro %}
+
+
+{# base.html already renders flashed messages on every page. This is here for a
+   page that needs them somewhere other than the top of <main>. #}
+{% macro flash_messages() -%}
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+  <div class="flashes">
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category or 'info' }}" role="status">{{ message }}</div>
+    {% endfor %}
+  </div>
+  {% endif %}
+{% endwith %}
+{%- endmacro %}
