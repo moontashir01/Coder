@@ -90,22 +90,26 @@ CONTEXT_BUDGET_CHARS = 1200
 
 # SQLite storage classes we will emit. Anything else is normalised into one of
 # these, so `ddl()` can never produce a type SQLite rejects.
-_SQL_TYPES = ("INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC")
+# `BOOLEAN` and `TIMESTAMP` are canonical rather than aliases of INTEGER/TEXT
+# because on PostgreSQL they are real types with real semantics, and the app
+# needs them: an auction is decided by `auction_end_time > NOW()`, which does
+# not work on a string. They still SPELL as INTEGER and TEXT on SQLite via
+# `SQLITE.type_map`, so nothing about a Flask build changes.
+_SQL_TYPES = ("INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC", "BOOLEAN", "TIMESTAMP")
 _TYPE_ALIASES = {
     "INT": "INTEGER",
     "BIGINT": "INTEGER",
     "SMALLINT": "INTEGER",
     "TINYINT": "INTEGER",
     "SERIAL": "INTEGER",
-    "BOOL": "INTEGER",
-    "BOOLEAN": "INTEGER",
+    "BOOL": "BOOLEAN",
     "VARCHAR": "TEXT",
     "CHAR": "TEXT",
     "STRING": "TEXT",
     "UUID": "TEXT",
-    "DATE": "TEXT",
-    "DATETIME": "TEXT",
-    "TIMESTAMP": "TEXT",
+    "DATE": "TIMESTAMP",
+    "DATETIME": "TIMESTAMP",
+    "TIMESTAMPTZ": "TIMESTAMP",
     "JSON": "TEXT",
     "FLOAT": "REAL",
     "DOUBLE": "REAL",
@@ -161,6 +165,10 @@ class Dialect:
     positional: bool
     # How a generated migration is written in the target language.
     migration_template: str
+    # The full declaration for a TEXT/UUID primary key that the DATABASE fills
+    # in, minus the name. Empty means this server has no such thing, and such a
+    # key stays a value the caller must supply.
+    generated_text_pk: str = ""
 
     def column_type(self, canonical: str) -> str:
         return self.type_map.get(canonical, canonical)
@@ -172,27 +180,111 @@ class Dialect:
     def placeholders(self, count: int) -> str:
         return ", ".join(self.placeholder(i) for i in range(1, count + 1))
 
-    def column_ddl(self, name: str, canonical: str, pk: bool, required: bool) -> str:
-        """One column of a CREATE TABLE."""
+    def generates_pk(self, canonical: str, pk: bool) -> bool:
+        """Does the DATABASE fill this primary key in on its own?
+
+        The question the insert helpers have to ask. An INTEGER key is
+        autoincrement everywhere; a TEXT/UUID one is only generated where
+        `generated_text_pk` says so. Where it is not, the key stays a caller
+        argument — which is correct, not a fallback.
+        """
+        if not pk:
+            return False
+        return canonical == "INTEGER" or bool(self.generated_text_pk)
+
+    def sized_type(self, canonical: str, max_length: int = 0) -> str:
+        """`VARCHAR(100)` where a length was declared and the type is textual.
+
+        Both servers accept it; PostgreSQL enforces it and SQLite treats it as
+        TEXT affinity, which is exactly the pre-existing behaviour. A length is
+        only ever attached to TEXT — `INTEGER(5)` is meaningless and `NUMERIC`
+        precision is a different question this does not try to answer.
+        """
+        base = self.column_type(canonical)
+        if canonical == "TEXT" and base == "TEXT" and 0 < int(max_length) <= 65535:
+            return f"VARCHAR({int(max_length)})"
+        return base
+
+    def column_ddl(
+        self,
+        name: str,
+        canonical: str,
+        pk: bool,
+        required: bool,
+        *,
+        unique: bool = False,
+        default: str = "",
+        references: str = "",
+        check: tuple[str, ...] = (),
+        max_length: int = 0,
+    ) -> str:
+        """One column of a CREATE TABLE.
+
+        The keyword arguments all default to "absent", so every caller written
+        before constraints existed emits byte-for-byte the DDL it emitted then.
+
+        A primary key short-circuits, as it always did: `SERIAL PRIMARY KEY` and
+        `TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text` are complete
+        declarations, and a UNIQUE or a DEFAULT bolted onto either is at best
+        redundant and at worst a conflict with the one already there.
+        """
         if pk and canonical == "INTEGER":
             return f"{name} {self.serial_pk}"
-        parts = [name, self.column_type(canonical)]
+        if pk and self.generated_text_pk:
+            return f"{name} {self.generated_text_pk}"
+        parts = [name, self.sized_type(canonical, max_length)]
         if pk:
             parts.append("PRIMARY KEY")
-        elif required:
+            return " ".join(parts)
+        if required:
             parts.append("NOT NULL")
+        if unique:
+            parts.append("UNIQUE")
+        if default:
+            parts.append(f"DEFAULT {default}")
+        if check:
+            values = ", ".join(f"'{v}'" for v in check)
+            parts.append(f"CHECK ({name} IN ({values}))")
+        if references:
+            parts.append(f"REFERENCES {references}")
         return " ".join(parts)
 
-    def migration_call(self, table: str, column: str, canonical: str) -> str:
-        return self.migration_template.format(
-            table=table, column=column, decl=self.column_type(canonical)
-        )
+    def migration_call(
+        self,
+        table: str,
+        column: str,
+        canonical: str,
+        *,
+        default: str = "",
+        references: str = "",
+        max_length: int = 0,
+    ) -> str:
+        """The `ensure_column` call that adds one column to a live table.
+
+        Deliberately narrower than `column_ddl`: NOT NULL, UNIQUE and CHECK are
+        never emitted here. All three can be true of a new column and false of
+        the rows already in the table, so adding one raises against real data —
+        and a migration that fails on startup takes the whole app down, which is
+        worse than a column that is merely less constrained than the spec says.
+        A DEFAULT and a foreign key are safe: both apply going forward.
+        """
+        decl = self.sized_type(canonical, max_length)
+        if default:
+            decl = f"{decl} DEFAULT {default}"
+        if references:
+            decl = f"{decl} REFERENCES {references}"
+        return self.migration_template.format(table=table, column=column, decl=decl)
 
 
 SQLITE = Dialect(
     key="sqlite",
     serial_pk="INTEGER PRIMARY KEY AUTOINCREMENT",
-    type_map={},  # the canonical names ARE the SQLite storage classes
+    # The canonical names ARE the SQLite storage classes, with two exceptions:
+    # SQLite has neither a boolean nor a date type, which is exactly what the
+    # schema prompt has always told the model. Spelling them out here rather
+    # than aliasing them away keeps the DISTINCTION available to PostgreSQL
+    # while emitting byte-for-byte the DDL a Flask build emitted before.
+    type_map={"BOOLEAN": "INTEGER", "TIMESTAMP": "TEXT"},
     positional=False,
     # `db.ensure_column` (shipped by the Flask scaffold) is the primitive: a
     # PRAGMA check then an ALTER, because SQLite has no `IF NOT EXISTS` here.
@@ -202,9 +294,21 @@ SQLITE = Dialect(
 POSTGRES = Dialect(
     key="postgres",
     serial_pk="SERIAL PRIMARY KEY",
+    # A schema taken from a document that prints `UUID PRIMARY KEY DEFAULT
+    # uuid_generate_v4()` normalises to canonical TEXT, and a bare `TEXT PRIMARY
+    # KEY` has no default — so the generated insert took the id as its FIRST
+    # argument and the generated route called `const id = await
+    # models.createUser(id, …)`, a ReferenceError on every create. `pgcrypto`'s
+    # `gen_random_uuid()` is built into PostgreSQL 13+, so no extension is
+    # needed. SQLite has no equivalent expression default, which is why this
+    # sits in the dialect rather than in the DDL writer.
+    generated_text_pk="TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text",
     # REAL exists in PostgreSQL but is a 4-byte float — wrong for a price, which
     # is what REAL overwhelmingly means in a generated schema. NUMERIC is exact.
-    type_map={"REAL": "NUMERIC", "BLOB": "BYTEA"},
+    # TIMESTAMPTZ, not TIMESTAMP: the PRDs this is built from say "TIMESTAMP
+    # WITH TIME ZONE", and an auction that ends at a wall-clock time with no
+    # zone ends at a different moment for every reader.
+    type_map={"REAL": "NUMERIC", "BLOB": "BYTEA", "TIMESTAMP": "TIMESTAMPTZ"},
     positional=True,
     # PostgreSQL HAS `ADD COLUMN IF NOT EXISTS`, so `ensureColumn` is a one-liner
     # rather than sqlite's read-then-alter. It is still DDL against a live
@@ -232,16 +336,72 @@ def get_dialect(key: str | None) -> Dialect:
 @dataclass(frozen=True)
 class Field:
     """One column. `added_in` records the revision that introduced it, which is
-    what `migrations(since=…)` diffs on."""
+    what `migrations(since=…)` diffs on.
+
+    The five constraint attributes exist because the schema pipeline could not
+    represent them, and what a model cannot represent it silently discards.
+    Measured against a 12.5 KB PRD whose DDL was written out in full: every
+    `UNIQUE`, every `REFERENCES`, every `CHECK (status IN (…))` and every
+    `DEFAULT CURRENT_TIMESTAMP` was dropped between the document and `db.js`,
+    because `Field` carried only name/type/pk/required. The build was not
+    ignoring the requirements — there was nowhere to put them.
+
+    Every one of them reaches DDL as text with no binding, so every one is
+    validated at construction rather than trusted (`_safe_default`,
+    `_safe_reference`, `_safe_check_values`). `_ident`'s rule, applied to the
+    parts of a schema that are not identifiers.
+    """
 
     name: str
     type: str = "TEXT"
     pk: bool = False
     required: bool = False
     added_in: int = 1
+    # No two rows may share this value.
+    unique: bool = False
+    # A validated SQL literal or allowlisted expression, e.g. `100.00`,
+    # `'PENDING'`, `CURRENT_TIMESTAMP`. Empty means no default.
+    default: str = ""
+    # `table` or `table(column)` — the row this column points at.
+    references: str = ""
+    # The complete set of values this column may hold, as a `CHECK (col IN …)`.
+    # A value list rather than free SQL on purpose: a `CHECK` clause written by
+    # a model and interpolated into DDL is an injection surface, and an
+    # enumeration is what a PRD's CHECK constraints overwhelmingly are.
+    check: tuple[str, ...] = ()
+    # `VARCHAR(n)` for a textual column. 0 means unbounded TEXT.
+    max_length: int = 0
 
     def to_ddl(self, dialect: Dialect = SQLITE) -> str:
-        return dialect.column_ddl(self.name, self.type, self.pk, self.required)
+        return dialect.column_ddl(
+            self.name,
+            self.type,
+            self.pk,
+            self.required,
+            unique=self.unique,
+            default=self.default,
+            references=self.references,
+            check=self.check,
+            max_length=self.max_length,
+        )
+
+    def constraint_summary(self) -> str:
+        """The constraints, for `Entity.summary` and the context block.
+
+        The prompt's copy of the schema has to say the same thing the DDL says.
+        A model told `status TEXT` invents its own status words; told
+        `status TEXT in ACTIVE|SOLD|EXPIRED` it uses those.
+        """
+        bits: list[str] = []
+        if self.unique:
+            bits.append("unique")
+        if self.references:
+            bits.append(f"-> {self.references}")
+        if self.check:
+            bits.append("in " + "|".join(self.check))
+        if self.default:
+            bits.append(f"default {self.default}")
+        return " ".join(bits)
 
     def is_upload(self) -> bool:
         return self.name.endswith(("_path", "_image", "_file")) or self.type in (
@@ -274,7 +434,15 @@ class Entity:
         return f"CREATE TABLE IF NOT EXISTS {self.table} (\n    {cols}\n)"
 
     def summary(self) -> str:
-        return f"{self.table}({', '.join(f'{f.name} {f.type}' for f in self.fields)})"
+        """`table(col TYPE constraints, …)` — the one-line schema every prompt
+        sees. Constraints are included because the DDL includes them: told only
+        `status TEXT`, a model invents its own status words and the CHECK
+        rejects every insert the app makes."""
+        cols = []
+        for f in self.fields:
+            extra = f.constraint_summary()
+            cols.append(f"{f.name} {f.type}" + (f" {extra}" if extra else ""))
+        return f"{self.table}({', '.join(cols)})"
 
 
 @dataclass(frozen=True)
@@ -383,6 +551,106 @@ def _norm_type(raw) -> str:
     return _TYPE_ALIASES.get(text, "TEXT")
 
 
+# Expression defaults that are safe to emit verbatim on both servers. Anything
+# outside this list and outside "a literal" is DROPPED rather than passed
+# through: a DEFAULT clause is interpolated into DDL with no binding, so an
+# allowlist is the only version of this that is not an injection surface.
+# `_ident`'s rule, one level down.
+_SAFE_DEFAULT_KEYWORDS = frozenset(
+    {
+        "NULL",
+        "TRUE",
+        "FALSE",
+        "CURRENT_TIMESTAMP",
+        "CURRENT_DATE",
+        "CURRENT_TIME",
+        "NOW()",
+        "GEN_RANDOM_UUID()",
+    }
+)
+_NUMERIC_DEFAULT_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+# A single-quoted literal with no quote of its own inside it — so there is
+# nothing to escape and nothing that can end the literal early.
+_STRING_DEFAULT_RE = re.compile(r"^'[^'\\\r\n]{0,120}'$")
+# What a CHECK value may contain. Deliberately narrow: these are enum members
+# ('PENDING_OTP', 'Like New'), not free text.
+_CHECK_VALUE_RE = re.compile(r"^[A-Za-z0-9_ .\-/+]{1,40}$")
+MAX_CHECK_VALUES = 24
+
+
+def _safe_default(raw) -> str:
+    """A DEFAULT expression that is safe to write into DDL, or ''."""
+    text = str(raw if raw is not None else "").strip().rstrip(";").strip()
+    if not text:
+        return ""
+    if text.upper() in _SAFE_DEFAULT_KEYWORDS:
+        return text.upper()
+    if _NUMERIC_DEFAULT_RE.match(text):
+        return text
+    if _STRING_DEFAULT_RE.match(text):
+        return text
+    # A bare word is how a model writes a string default it forgot to quote.
+    if _IDENT_RE.match(text) and len(text) <= 40:
+        return f"'{text}'"
+    return ""
+
+
+def _safe_reference(raw) -> str:
+    """`table` or `table(column)` from model output, or ''.
+
+    Both halves go through `_ident`, so a foreign key can only ever name
+    something spellable as an identifier.
+    """
+    text = str(raw or "").strip().rstrip(",;").strip()
+    if not text:
+        return ""
+    # `table.column` is the other way people write it, and it has to be tried
+    # first: a dot is not an identifier character, so the parenthesised pattern
+    # below rejects the whole string rather than falling through to here.
+    if "." in text and "(" not in text:
+        head, _, tail = text.partition(".")
+        table, column = _ident(head), _ident(tail)
+        return f"{table}({column})" if table and column else ""
+    match = re.match(r"^([\w\"'`\[\] -]+?)\s*(?:\(\s*([\w\"'`\[\] -]+?)\s*\))?$", text)
+    if not match:
+        return ""
+    table = _ident(match.group(1))
+    if not table:
+        return ""
+    column = _ident(match.group(2)) if match.group(2) else ""
+    return f"{table}({column})" if column else table
+
+
+def _safe_check_values(raw) -> tuple[str, ...]:
+    """The allowed values of an enum-style column, validated and de-duplicated."""
+    if isinstance(raw, str):
+        items = re.split(r"[|,]", raw)
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return ()
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        value = str(item if item is not None else "").strip().strip("\"'")
+        if not value or value in seen or not _CHECK_VALUE_RE.match(value):
+            continue
+        seen.add(value)
+        out.append(value)
+        if len(out) >= MAX_CHECK_VALUES:
+            break
+    # One allowed value is not a constraint, it is a mistake in the answer.
+    return tuple(out) if len(out) > 1 else ()
+
+
+def _safe_length(raw) -> int:
+    try:
+        value = int(str(raw or "0").strip())
+    except (TypeError, ValueError):
+        return 0
+    return value if 0 < value <= 65535 else 0
+
+
 def _norm_filename(raw) -> str:
     """A safe relative path, or '' — mirrors `blueprint._norm_filename`."""
     name = str(raw or "").strip().strip("'\"").replace("\\", "/").lstrip("/")
@@ -442,6 +710,60 @@ _NON_COLUMN_RE = re.compile(
 )
 
 
+# Column-level clauses that carry a constraint. Matched against the ORIGINAL
+# case (values inside a CHECK or a DEFAULT are case-sensitive), which is why
+# these are separate patterns rather than substring tests on an upper-cased
+# copy.
+_COL_DEFAULT_RE = re.compile(
+    r"\bDEFAULT\s+('(?:[^']*)'|[A-Za-z_][\w]*\s*\(\s*\)|[\w.+-]+)", re.IGNORECASE
+)
+_COL_REFERENCES_RE = re.compile(
+    r"\bREFERENCES\s+([\w\"'`]+(?:\s*\(\s*[\w\"'`]+\s*\))?)", re.IGNORECASE
+)
+_COL_CHECK_IN_RE = re.compile(
+    r"\bCHECK\s*\(\s*[\w\"'`.]*\s+IN\s*\(([^)]*)\)", re.IGNORECASE
+)
+_COL_LENGTH_RE = re.compile(r"^\s*(?:VARCHAR|CHAR|CHARACTER\s+VARYING)\s*\(\s*(\d+)")
+
+
+def _parse_column_constraints(chunk: str, name: str) -> dict:
+    """The constraint keywords of one column declaration.
+
+    Reads what a PRD's own DDL actually writes — `UNIQUE`, `DEFAULT 100.00`,
+    `REFERENCES users(user_id)`, `CHECK (status IN ('DRAFT','ACTIVE'))`,
+    `VARCHAR(150)`. Every value still goes through the `_safe_*` validators, so
+    a clause this recognises but cannot vouch for is dropped rather than
+    forwarded.
+    """
+    upper = chunk.upper()
+    # `UNIQUE` is a keyword here and a substring of nothing else that appears in
+    # a column declaration; a PRIMARY KEY is already unique, so it does not
+    # double up.
+    unique = bool(re.search(r"\bUNIQUE\b", upper)) and "PRIMARY KEY" not in upper
+
+    default_match = _COL_DEFAULT_RE.search(chunk)
+    default = _safe_default(default_match.group(1)) if default_match else ""
+
+    reference_match = _COL_REFERENCES_RE.search(chunk)
+    references = _safe_reference(reference_match.group(1)) if reference_match else ""
+
+    check_match = _COL_CHECK_IN_RE.search(chunk)
+    check = _safe_check_values(check_match.group(1)) if check_match else ()
+
+    # The length rides on the type, which is the token after the name.
+    tail = chunk.strip()[len(chunk.strip().split()[0]) :] if chunk.strip() else ""
+    length_match = _COL_LENGTH_RE.match(tail)
+    max_length = _safe_length(length_match.group(1)) if length_match else 0
+
+    return {
+        "unique": unique,
+        "default": default,
+        "references": references,
+        "check": check,
+        "max_length": max_length,
+    }
+
+
 def _parse_columns(blob: str, added_in: int = 1) -> tuple[Field, ...]:
     fields: list[Field] = []
     seen: set[str] = set()
@@ -463,6 +785,7 @@ def _parse_columns(blob: str, added_in: int = 1) -> tuple[Field, ...]:
                 pk="PRIMARY KEY" in rest,
                 required="NOT NULL" in rest or "PRIMARY KEY" in rest,
                 added_in=added_in,
+                **_parse_column_constraints(chunk, name),
             )
         )
         seen.add(name.lower())
@@ -510,14 +833,34 @@ def _fields_from_data(raw_fields, added_in: int = 1) -> list[Field]:
             rest = " ".join(bits[1:]).upper()
             pk = "PRIMARY KEY" in rest
             required = pk or "NOT NULL" in rest
+            # A string field is a column declaration, so it can carry the same
+            # clauses `_parse_columns` reads out of one.
+            extra = _parse_column_constraints(item, name)
         elif isinstance(item, dict):
             name = _ident(item.get("name"))
             raw_type = str(item.get("type") or "TEXT")
             pk = bool(item.get("pk") or item.get("primary_key"))
             required = pk or bool(item.get("required") or item.get("not_null"))
+            extra = {
+                "unique": bool(item.get("unique")),
+                "default": _safe_default(item.get("default")),
+                "references": _safe_reference(
+                    item.get("references") or item.get("foreign_key")
+                ),
+                "check": _safe_check_values(
+                    item.get("check") or item.get("choices") or item.get("enum")
+                ),
+                "max_length": _safe_length(
+                    item.get("max_length") or item.get("maxlength")
+                ),
+            }
         else:
             continue
         ftype = _norm_type(raw_type)
+        # A length only means something on a textual column; carrying it on an
+        # INTEGER would emit `VARCHAR(5)` for a number.
+        if ftype != "TEXT":
+            extra["max_length"] = 0
         if not name or name.lower() in seen:
             continue
         # `IMAGE`/`FILE` normalise to TEXT — they are not SQLite types — which
@@ -533,7 +876,14 @@ def _fields_from_data(raw_fields, added_in: int = 1) -> list[Field]:
                 continue
         seen.add(name.lower())
         out.append(
-            Field(name=name, type=ftype, pk=pk, required=required, added_in=added_in)
+            Field(
+                name=name,
+                type=ftype,
+                pk=pk,
+                required=required,
+                added_in=added_in,
+                **extra,
+            )
         )
         if len(out) >= MAX_FIELDS:
             break
@@ -934,7 +1284,16 @@ class ProjectSpec:
         for entity in self.entities:
             for f in entity.fields:
                 if f.added_in > since and not f.pk:
-                    out.append(dialect.migration_call(entity.table, f.name, f.type))
+                    out.append(
+                        dialect.migration_call(
+                            entity.table,
+                            f.name,
+                            f.type,
+                            default=f.default,
+                            references=f.references,
+                            max_length=f.max_length,
+                        )
+                    )
         return out
 
     # -- prompt threading -------------------------------------------------
@@ -1949,6 +2308,16 @@ def _load_entities(raw) -> tuple[Entity, ...]:
                     pk=bool(f.get("pk")),
                     required=bool(f.get("required")),
                     added_in=max(1, int(f.get("added_in") or 1)),
+                    # Re-validated on the way back in, not trusted because it
+                    # once passed: `project.json` lives in the user's repo and is
+                    # hand-editable, and these five reach DDL as raw text. A spec
+                    # written before constraints existed has none of these keys
+                    # and loads exactly as it did.
+                    unique=bool(f.get("unique")),
+                    default=_safe_default(f.get("default")),
+                    references=_safe_reference(f.get("references")),
+                    check=_safe_check_values(f.get("check")),
+                    max_length=_safe_length(f.get("max_length")),
                 )
             )
             if len(fields) >= MAX_FIELDS:

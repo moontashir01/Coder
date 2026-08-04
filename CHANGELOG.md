@@ -6,7 +6,184 @@ All notable changes to Coder are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A filename in the message was never resolved against the project.**
+  `_extract_filename` recognised `users.ejs` and stopped there; nothing checked
+  the project actually had one at its root, and a Node build keeps its views in
+  `views/`. Measured: "fix the files inside users.ejs" resolved to a path that
+  does not exist, so `_file_op_flow` read an empty string, took this for a NEW
+  file, and wrote the model's "I need more information about the specific
+  issues" reply to disk as a second, junk `users.ejs` beside the real view. Both
+  guards that should have caught it — the spec lookup that matches by template
+  stem, and the tool-loop escalation whose own comment describes this exact
+  outcome — were gated on `filename is None`, and a WRONG name is not a MISSING
+  one. `_locate_named_file` now resolves the name against the tree (exactly one
+  match or none, backups and `node_modules` pruned), and drops it only for a
+  request that CHANGES something, so creation is untouched.
+- **Nothing checked the JavaScript inside an `.ejs` view.** `strip_ejs` takes
+  the code OUT so the markup can be balanced, and the code is where views really
+  break. Measured on one build: `views/users.ejs` shipped
+  `<%- users.forEach(user => { %>` — an output tag around a statement, so EJS
+  emits `__append(users.forEach(u => {)` — and `views/items.ejs` had a sentence
+  of prose welded into a call's argument list. Both were structurally perfect
+  markup, both passed every check, and the finished site answered 500 on its
+  home page, `/users` and `/items`. `verify.ejs_script` now reassembles the view
+  as the program EJS compiles it to and runs `node --check` over it; a missing
+  `node` is a skip, exactly as for `.js`.
+- **Prose passed as a view.** `.ejs` deliberately has no "looks like prose"
+  guard — a hero paragraph is a legitimate fragment — but a file with neither a
+  tag nor an EJS delimiter renders literally nothing and can only be the model
+  answering in the file instead of writing one. That case is now rejected.
+- **The Node stack had no undefined-name or password check.** Both were Python-
+  shaped down to the `.py` suffix gate and the `werkzeug.security` advice, so
+  `node --check` passed a file full of names nothing binds. Measured: one
+  `server.js` called `bcrypt.compareSync(...)` with `bcrypt` never required,
+  assigned `req.session.userId` with no session middleware mounted, and stored
+  the raw `password_hash` form field while the project's own generated
+  `passwords.js` sat unused — three runtime-fatal defects in one file, none
+  visible to anything. `app/agent/jsimports.py` adds all three checks behind
+  `adapter.repair_runtime_names`; Flask's behaviour is unchanged. Only Node
+  builtins and this project's own modules are required in — an npm package is
+  reported, because requiring something absent from `node_modules` turns one
+  broken route into an app that will not boot.
+- **A schema could not carry its own constraints, so they were silently
+  dropped.** Measured against a 12.5 KB PRD that printed its PostgreSQL DDL in
+  full: every `UNIQUE`, every `REFERENCES`, every `CHECK (status IN (…))` and
+  every `DEFAULT` was gone from the generated `db.js` — not because the schema
+  call ignored them, but because `Field` was name/type/pk/required and there was
+  nowhere to put them. `Field` now carries `unique`, `default`, `references`,
+  `check` and `max_length`, read by all three parsers and emitted by both
+  dialects. Each reaches DDL as text with no binding, so each is validated at
+  construction and dropped rather than escaped when it cannot be vouched for;
+  `check` is a value list rather than free SQL for the same reason. Migrations
+  deliberately emit neither NOT NULL, UNIQUE nor CHECK: all three can be false
+  of the rows already stored, and a migration that fails on startup takes the
+  whole app down. Indices, composite keys and `ON DELETE` are still not
+  modelled.
+- **A deterministic pass could break `server.js` and ship it.**
+  `_write_python_if_valid` compiles the Python it is about to write, so a repair
+  that breaks `app.py` is refused; the Node side ran only a content guard ("is
+  this HTML in a .js file?"). Measured: `reinstate_routes` put back handlers
+  captured from a file where the routes were nested inside a callback, the
+  re-inserted text carried one closing brace too many, and the build died with
+  `SyntaxError: Unexpected token '}'` — everything downstream green, because
+  nothing between that pass and the user ever parsed the file. It now runs
+  `node --check` and RESTORES the previous contents on failure. Two guards were
+  added upstream of it as well: the block slicer declines outright when the
+  routes are not at the top level, and a slice whose brackets do not balance is
+  never recorded.
+- **A route collision that could not be repaired was reported as no collision.**
+  `order_routes` returned an empty list both when the order was fine and when
+  the file's shape defeated the slicer, so `/bids/new` went on being served by
+  `/bids/:id` — 500 on every request, with the build saying nothing. Collisions
+  are now read off `routes_from_source`, which works on any shape, and a decline
+  is stated: `order_routes` returns `(text, moved, problems)`.
+- **The amendment path had no route protection at all.** The record of what the
+  entry file held was filled only inside `_run_blueprint`, so on a follow-up
+  turn — the one where a user actually types "keep every other route exactly as
+  it is" — nothing was recorded and nothing could be put back. Measured: a turn
+  asked to MOVE `GET /bids/:id` deleted it, and the detail page 404'd from then
+  on. The record is now filled at the top of every turn, and on an amendment it
+  restores only routes the project's own spec still declares, so a page the user
+  really did ask to drop stays dropped.
+- **A code token in a sentence became a file on disk.** "move the
+  `app.get("/bids/:id")` route below…" created a file literally named
+  `app.get`. The defence was a blocklist of prose abbreviations, grown from an
+  earlier junk `e.g` file — and no such list can ever hold `res.render`,
+  `req.body` or `db.initDb`. The test is now positive: a token is a filename
+  when its extension is one this project writes, or when the file already
+  exists.
+- **`no CREATE TABLE for 'a'`, `for 'the'`.** `searchable_sql` falls back to the
+  whole raw file when `ast.parse` fails — which every `.js` file does — so the
+  missing-table check read the prose in JavaScript comments as SQL.
+  `missing_tables` now takes the stack's own literal extractor.
+- **`/run` reported `server.js exited on startup: no output` and left the file
+  broken.** Two defects behind one useless sentence. The runner read *stderr*
+  only and never the exit code, so an entry file that had lost its `app.listen`
+  — which runs to the end and exits **0** in silence — read exactly like a
+  crash whose output went elsewhere, and an app that reported its own failure
+  with `console.log` had that line thrown away. The exit code is now always
+  stated, stdout is read as well, and a silent 0 says what a silent 0 means.
+  And `/run` is the one path that launches a project with no turn around it, so
+  the startup invariants — the boot block, and a startup call naming something
+  the data layer does not export — are now re-asserted there too, on both
+  `/run` and `/run restart`, rather than only at the build seam. A project
+  broken on turn 3 stayed broken through every `/run` until another build turn
+  happened to run the same passes again.
+- **A generated Express app could not start, and every check said it was fine.**
+  Measured against a real 12.5 KB PRD on the Node stack. The pass that adds
+  missing routes rewrites `server.js` wholesale, and its edit ended the file at
+  the last handler: no `db.initDb()`, no `app.listen()`, no 404 handler, no
+  exports. `node --check` accepts a file of route registrations, the `/`-route
+  restore anchors on the very lines that had been deleted so it declined
+  silently, and the smoke test was skipped for want of `node_modules` — so the
+  build reported "verified OK" on an app that exits without ever serving. The
+  startup block is now an invariant, restored piece by piece on both stacks,
+  and re-asserted wherever the entry file stops being rewritten.
+- **Routes a build wrote were deleted by the pass meant to add to them**, and the
+  loss was reported rather than repaired. Every route the entry file holds is now
+  recorded with its source during the build, and one deleted later is put back
+  verbatim — including a `POST` whose body is domain logic, which the existing
+  restore structurally could not rebuild.
+- **`/items/:id` above `/items/new` swallowed the create form.** Express matches
+  in registration order, and both restore passes insert at the bottom of the
+  route section, which is the wrong end. A parameterised route that shadows a
+  literal sibling is now moved below it, and only ever that.
+- **Every create form threw `ReferenceError` before reaching the database.** A
+  PRD that prints `UUID PRIMARY KEY` normalises to a canonical TEXT key, which
+  had no database-side default — so the insert helper took the id as its first
+  argument and the route beside it read `const id = await models.createUser(id,
+  …)`. PostgreSQL keys are now generated with `gen_random_uuid()` and are never
+  a caller's argument.
+- **A rejected `async` handler took the whole site down.** Express 4 does not
+  forward it to the error middleware, so Node exits the process — one form
+  posted with an empty optional number field was a total outage. The scaffold
+  now wraps the routing methods once, before any route is defined.
+- **An empty optional form field was stored as `""`.** PostgreSQL rejects it
+  outright (`invalid input syntax for type integer: ""`); SQLite's type affinity
+  accepts it and stores the empty string in an INTEGER column, so the Flask
+  stack had the same defect invisibly. Both now bind `NULL` for a blank
+  non-text column.
+- **The cross-module call check returned nothing on Node** — honestly
+  documented, and still a check that reads exactly like one that passed. A
+  `server.js` calling `db.setup()` against a `db.js` exporting `initDb` shipped
+  green. `app/agent/jsdeps.py` now does the CommonJS equivalent, and the one
+  unambiguous case (the startup call) is repaired rather than only reported.
+- **Endpoint coverage compared paths, not methods**, so a build with
+  `POST /users/new` but no `GET /users/new` was reported as fully wired while
+  the form page it had just written could not be opened.
+
 ### Added
+- **A view is checked against what its route actually passes** (Node).
+  EJS compiles to `with (locals)`, so a free identifier is a ReferenceError at
+  render time — invisible to every check that reads bytes. Measured: all five
+  listing pages of a generated marketplace answered 500 on `empty_state is not
+  defined`, the model having passed one `ui` helper's NAME as another's
+  argument. An undefined name used as a `ui.*()` argument is blanked so the
+  helper's own default applies; anything else is reported, because rewriting an
+  expression whose intent is unknown is generation. `typeof`-guarded names are
+  exempt — that is how the scaffold's own layout handles an optional local.
+- **Every entity gets a page for ONE of it**, not just a list and a form. The
+  PRD this was measured against builds half its product on the detail page — the
+  carousel, the countdown, the bid buttons, the Buy Now CTA — and a build that
+  derived only "list" and "new" had nowhere to put any of it.
+- **The planning calls are told about the stack they are planning for.** The file
+  layout and the column types were hard-coded to Flask in the prompts, so an
+  Express build was planned as `app.py` + `templates/*.html`, and a PostgreSQL
+  schema was told to flatten every timestamp to `TEXT` — which makes an auction
+  decided by `auction_end_time > NOW()` unwritable. Each adapter now supplies
+  both blocks; SQLite's wording is unchanged.
+- **`settings.postgres_server`** — this machine's PostgreSQL, stated once and
+  stamped into every generated project instead of the hard-coded
+  `postgres://postgres:postgres@localhost:5432` no one actually had.
+  `DATABASE_URL` still wins at runtime.
+- **A capability a requirements document asks for is no longer tiered
+  `optional`.** "Responsive Web Design" — a whole section of the measured PRD,
+  with numeric budgets — came back optional and was reported as not built. A
+  feature whose every significant word appears in the document is promoted to
+  core; one the document never mentions is left alone, so the tier still means
+  something.
+
 - **A second stack: Node + Express + EJS + PostgreSQL** (`docs/node-stack-plan.md`,
   phases N0–N6). `/stack` shows which stack a build targets and switches it;
   `/stack node` scaffolds a runnable Express app — routes, a connection pool,

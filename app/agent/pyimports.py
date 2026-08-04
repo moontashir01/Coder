@@ -239,8 +239,15 @@ def sql_strings(source: str) -> list[str]:
     ]
 
 
-def missing_tables(sources: dict[str, str]) -> list[str]:
+def missing_tables(sources: dict[str, str], extract=None) -> list[str]:
     """Tables the project queries but never creates.
+
+    ``extract(source) -> [literal, …]`` says where SQL may live in THIS
+    language; it defaults to Python's. That parameter is not decoration:
+    `searchable_sql` falls back to the whole raw file when `ast.parse` fails,
+    which every `.js` file does — so running this on a Node project read the
+    prose in its comments and reported tables called `a` and `the`. Measured on
+    a real build, and a confident wrong complaint is worse than a missed one.
 
     Measured on a live build: `db.py`'s `init_db()` kept the scaffold's *commented
     example* and added no real `CREATE TABLE`, while `app.py` ran
@@ -251,10 +258,11 @@ def missing_tables(sources: dict[str, str]) -> list[str]:
     which is exactly what the ProjectSpec entities in Phase 2 exist to make
     deterministic. Case-insensitive, since SQLite is.
     """
+    extract = extract or searchable_sql
     created: set[str] = set()
     queried: set[str] = set()
     for text in sources.values():
-        for literal in searchable_sql(text):
+        for literal in extract(text):
             # Prose is not SQL. A docstring reading "printed from the same
             # definition" matched `FROM <table>` and reported a table called
             # "the" on a live build.

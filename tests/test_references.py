@@ -347,6 +347,31 @@ async def test_repair_page_links_rewrites_the_file(tmp_path, monkeypatch):
     assert "index.html" in note
 
 
+async def test_repair_page_links_leaves_server_templates_alone(tmp_path, monkeypatch):
+    """The safety rule inverts inside `templates/`, so the pass must skip it.
+
+    "The corrected target exists as a sibling file" is what makes this repair
+    safe on a static build. In a template directory EVERY route's page exists as
+    a sibling — that is what a template directory is. Live Flask build: the
+    scaffold's `<a href="/users">` became `href="users.html"` in base.html, so
+    every page of the finished site linked at a URL Flask does not serve.
+    """
+    monkeypatch.chdir(tmp_path)
+    templates = tmp_path / "templates"
+    templates.mkdir()
+    (templates / "users.html").write_text("<html></html>", encoding="utf-8")
+    base = templates / "base.html"
+    original = '<nav><a href="/users">Users</a></nav>'
+    base.write_text(original, encoding="utf-8")
+
+    a = AgentCore(session_id="pytest_links_templates")
+    note, trace = await a._repair_page_links(_write_trace(base))
+
+    assert base.read_text(encoding="utf-8") == original
+    assert note == ""
+    assert trace == []
+
+
 async def test_repair_page_links_noop_when_links_are_fine(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "about.html").write_text("<html></html>", encoding="utf-8")

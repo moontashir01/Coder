@@ -71,35 +71,19 @@ Rules:
   network to install one. Build on the named stack even if you would have
   reached for something else.
 
-- **On the Flask stack, use this exact layout.** Filenames are fixed, so every
-  later change knows where things live. Plan files with these names and no
-  others:
+- **Use the exact file layout given with the request.** A "File layout" section
+  above the request lists this stack's filenames and what each one holds. Those
+  names are fixed, so every later change knows where things live: plan files
+  with those names and no others, and obey the rules stated alongside them. If
+  no layout is given, the filenames are yours to choose — keep them conventional.
 
-  | File                  | Holds                                              |
-  | --------------------- | -------------------------------------------------- |
-  | `app.py`              | routes only — one `@app.route` per URL, no SQL      |
-  | `db.py`               | `get_db()`, `init_db()`, `ensure_column()`          |
-  | `models.py`           | one query helper per operation, `?` parameters only |
-  | `seed.py`             | a few demo rows per table                           |
-  | `templates/base.html` | the nav and page shell — the ONLY place nav exists  |
-  | `templates/index.html` | the home page — `"action": "edit"`, it already exists |
-  | `templates/<page>.html` | one per page, each `{% extends "base.html" %}`    |
-  | `static/css/style.css`  | the one stylesheet                                |
-  | `static/js/app.js`      | optional enhancement only                         |
-
-  Rules that follow from it:
-  - A page template contains ONLY `{% extends %}` plus its blocks — never a
-    full `<html>` document, never its own copy of the nav.
-  - Prefer a real `<form method="post" action="/route">` posting to a Flask
-    route over `fetch()`. It works with JavaScript disabled, which is what makes
-    "the button does nothing" impossible rather than merely unlikely.
-  - Routes call helpers in `models.py`; they never write SQL inline.
-  - Do NOT plan `requirements.txt`, `Procfile` or `.gitignore` — they are
-    already written for you.
-  - **Plan the home page.** `templates/index.html` exists but holds placeholder
-    text, so give it `"action": "edit"` and an instruction describing what this
-    site's front door shows and which pages it links to. A build that leaves it
-    alone ships a site whose first page says it was scaffolded.
+- **When you are given a requirements document, it IS the request.** A
+  "Requirements document" section above the request means the user's sentence is
+  only a pointer to it. Every capability it describes is `requested`, not
+  `optional` — tier them by what the DOCUMENT asks for, not by what the sentence
+  says. Plan a page for each thing it says a user does, and an endpoint for each
+  action it says a user takes. A feature the document specifies and your `files`
+  array omits is a feature the build will not have.
 
 - **When you are given a data model, plan AROUND it.** The tables and columns
   above the request are already decided — they are what the app stores. Use

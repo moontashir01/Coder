@@ -228,6 +228,36 @@ async def test_file_op_flow_untargeted_repair_escalates_to_tool_loop(
     assert not (tmp_path / "output.txt").exists()
 
 
+async def test_file_op_flow_repairs_the_file_the_name_really_points_at(
+    tmp_path, monkeypatch
+):
+    """ "fix the files inside users.ejs" must edit `views/users.ejs`.
+
+    The measured failure on a live Node build. `_extract_filename` recognised
+    `users.ejs` and returned it; nothing checked the project actually had one at
+    its root, so `_file_op_flow` read an empty string, took this for a NEW file,
+    and wrote the model's "I need more information" reply to disk as a second,
+    junk `users.ejs` beside the real view. Both guards that should have caught
+    it — the spec lookup and the tool-loop escalation above — were gated on
+    `filename is None`, and a WRONG name is not a MISSING one.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "views").mkdir()
+    view = tmp_path / "views" / "users.ejs"
+    view.write_text("<p>old</p>\n", encoding="utf-8")
+
+    a = AgentCore(session_id="pytest_locate")
+    a._llm_edit = ScriptedLLM(
+        ["<<<<<<< SEARCH\n<p>old</p>\n=======\n<p>new</p>\n>>>>>>> REPLACE"]
+    )
+    a._llm_direct = ScriptedLLM(["FILENAME: users.ejs\nprose that must never land"])
+
+    answer, _trace = await a._file_op_flow("fix the files inside users.ejs")
+
+    assert "<p>new</p>" in view.read_text(encoding="utf-8")
+    assert not (tmp_path / "users.ejs").exists(), "no junk file at the root"
+
+
 async def test_file_op_flow_untargeted_creation_still_infers_name(
     tmp_path, monkeypatch
 ):

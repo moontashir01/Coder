@@ -18,7 +18,7 @@ node server.js
 Then open <http://127.0.0.1:3000>.
 
 The connection string is `DATABASE_URL` if it is set, otherwise
-`postgres://postgres:postgres@localhost:5432/{{PROJECT_SLUG}}`. If the database
+`{{DATABASE_URL}}`. If the database
 is unreachable the server **exits with an error instead of starting** — an app
 that answers 200 while its tables are missing looks healthy and 500s on every
 page that shows data.

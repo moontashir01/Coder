@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+from pathlib import Path
 import textwrap
 
 import pytest
@@ -343,12 +344,20 @@ def test_a_url_literal_is_not_shredded_by_comment_stripping():
     assert crud_node.creates_table(source, "products") is True
 
 
-def test_the_shipped_db_js_reads_correctly():
-    """The file this actually runs against, not a sketch of it."""
+def test_the_shipped_db_js_reads_correctly(tmp_path):
+    """The file this actually runs against, not a sketch of it.
+
+    Scaffolded rather than read from the template tree: the connection string is
+    a `{{DATABASE_URL}}` placeholder there, filled from
+    `settings.postgres_server` at copy time, so the template holds no URL to
+    find. What matters is that the file a project RECEIVES parses this way.
+    """
     from app.agent.stacks.node_adapter import NODE
 
-    source = (NODE.scaffold_dir() / "db.js").read_text(encoding="utf-8")
-    assert any("localhost:5432" in lit for lit in crud_node.js_strings(source))
+    NODE.scaffold(tmp_path, "shop")
+    source = (tmp_path / "db.js").read_text(encoding="utf-8")
+    assert any("postgres://" in lit for lit in crud_node.js_strings(source))
+    assert "{{" not in source  # every placeholder was substituted
     assert crud_node.creates_table(source, "widgets") is False
     assert crud_node.adds_column(source, "widgets", "colour") is False
 
@@ -516,24 +525,174 @@ def test_a_missing_database_really_reports_sqlstate_3d000():
     when the database is absent. That assumption is the one thing only a live
     server can settle, and getting it wrong would leave the "create it with
     `createdb x`" message permanently unreachable while every test passed.
+
+    Asked through **node-pg**, because that is the library the production probe
+    uses (`NodeAdapter.database_reason` runs `node -e` against the project's own
+    `pg` and reads `err.code`). The first version of this asked psycopg instead
+    and failed the first time it was ever run: psycopg 3.3.4 populates neither
+    `.sqlstate` nor `.diag.sqlstate` for a failure raised while CONNECTING, so
+    the assertion could never have held — the proxy was wrong, not the product.
+    Measured 2026-08-04 against PostgreSQL 18.4: node-pg reports
+    `code=3D000`.
     """
-    psycopg = pytest.importorskip("psycopg", reason="psycopg is not installed")
+    if shutil.which("node") is None:
+        pytest.skip("node is not on PATH")
     dsn = os.environ.get("CODER_TEST_DATABASE_URL")
     if not dsn:
         pytest.skip(
             "set CODER_TEST_DATABASE_URL to confirm the SQLSTATE Phase N5 keys "
             "its 'database does not exist' message off"
         )
-    # Same server, a database nobody has created.
+    project = os.environ.get("CODER_TEST_PG_PROJECT_DIR")
+    if not project or not (Path(project) / "node_modules" / "pg").is_dir():
+        pytest.skip(
+            "set CODER_TEST_PG_PROJECT_DIR to a project whose node_modules has "
+            "`pg` — the production probe reads node-pg's err.code, and psycopg "
+            "cannot answer this question (it exposes no sqlstate on connect)"
+        )
     absent = re.sub(
-        r"/[^/?]*(\?|$)", "/coder_definitely_not_a_database\\1", dsn, count=1
+        r"/[^/?]*(\?|$)", "/coder_definitely_not_a_database\1", dsn, count=1
+    )
+    script = (
+        "const { Client } = require('pg');"
+        f"const c = new Client({{ connectionString: {absent!r} }});"
+        "c.connect().then(() => { console.log('CONNECTED'); process.exit(0); })"
+        ".catch(e => { console.log(String(e.code)); process.exit(0); });"
+    ).replace("'", '"', 0)
+    result = subprocess.run(
+        ["node", "-e", script],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    output = (result.stdout or "").strip()
+    if output == "CONNECTED":  # pragma: no cover - only if it really exists
+        pytest.skip("coder_definitely_not_a_database exists on this server")
+    assert output == "3D000", (
+        f"expected invalid_catalog_name from node-pg, got {output!r}; "
+        f"stderr: {result.stderr}"
+    )
+
+
+def test_psycopg_cannot_answer_the_sqlstate_question(monkeypatch):
+    """Pins WHY the test above goes through node — so nobody 'simplifies' it
+    back to psycopg and gets a failure that looks like a product defect."""
+    psycopg = pytest.importorskip("psycopg", reason="psycopg is not installed")
+    dsn = os.environ.get("CODER_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("set CODER_TEST_DATABASE_URL")
+    absent = re.sub(
+        r"/[^/?]*(\?|$)", "/coder_definitely_not_a_database\1", dsn, count=1
     )
     try:
         psycopg.connect(absent, connect_timeout=3).close()
     except psycopg.OperationalError as exc:
-        assert getattr(exc, "sqlstate", None) == "3D000", (
-            f"expected invalid_catalog_name, got {getattr(exc, 'sqlstate', None)!r}: "
-            f"{exc}"
-        )
-    else:  # pragma: no cover - only if that database really exists
+        assert getattr(exc, "sqlstate", None) is None
+        # It still NAMES the database, which is all this driver can prove here.
+        assert "coder_definitely_not_a_database" in str(exc)
+    else:  # pragma: no cover
         pytest.skip("coder_definitely_not_a_database exists on this server")
+
+
+# ---------------------------------------------------------------------------
+# Defects found by the first real-PostgreSQL run of a generated project
+# (2026-08-04). Both were invisible on SQLite.
+# ---------------------------------------------------------------------------
+
+
+def test_numeric_and_blob_samples_are_not_strings():
+    """`invalid input syntax for type numeric: "Demo cod_reliability_score 1"`.
+
+    SQLite has type AFFINITY and accepts a string into a NUMERIC column, so the
+    seed looked fine on Flask for as long as nobody ran the Node one against a
+    real database. PostgreSQL refuses outright and takes the whole seed with it.
+    """
+    from app.agent.crud import _sample as py_sample
+    from app.agent.crud_node import _sample as js_sample
+    from app.agent.projectspec import Field
+
+    numeric = Field(name="cod_reliability_score", type="NUMERIC")
+    assert float(js_sample(numeric, 1)) > 0
+    assert float(py_sample(numeric, 1)) > 0
+
+    blob = Field(name="payload", type="BLOB")
+    assert js_sample(blob, 1) == "null"  # BYTEA; a text literal is not one
+    assert py_sample(blob, 1) == "None"
+
+
+def test_scaffold_server_requires_models():
+    """`{"error":"models is not defined"}` on every data page of a live build.
+
+    The scaffold ships `models.js`, its own header says "every query lives in
+    models.js", and generation writes routes that call `models.x()` — but
+    `server.js` never required it. Flask survives the same omission only because
+    `_repair_missing_imports` adds it, and that pass is Python-only; Node's lack
+    of import repair is a stated gap in `NodeAdapter.gaps`, so the scaffold has
+    to be right on its own.
+    """
+    from pathlib import Path
+
+    from config.settings import settings
+
+    scaffold = Path(settings.scaffolds_dir) / "node"
+    server = (scaffold / "server.js").read_text(encoding="utf-8")
+    assert 'require("./models")' in server
+    assert (scaffold / "models.js").is_file()  # ...and the require can't throw
+
+
+# ---------------------------------------------------------------------------
+# An empty optional form field is NULL, not ""
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_text_bind_is_nulled_when_the_field_is_left_blank():
+    """Measured against a live PostgreSQL: posting the create form with an
+    empty optional number field returned `invalid input syntax for type
+    integer: ""` and, because Express 4 does not catch a rejected async
+    handler, took the whole server down with it."""
+    entity = Entity(
+        name="category",
+        table="categories",
+        fields=(
+            Field("id", "INTEGER", pk=True),
+            Field("parent_id", "INTEGER"),
+            Field("name", "TEXT", required=True),
+        ),
+    )
+    source = crud_node.entity_helpers(entity)
+
+    assert "[nullIfBlank(parentId), name]" in source
+    # A TEXT column keeps "" — it is a valid value there, and nulling it loses
+    # the difference between "left blank" and "cleared".
+    assert "nullIfBlank(name)" not in source
+
+
+def test_models_js_defines_the_helper_it_uses(tmp_path):
+    spec = ProjectSpec(
+        name="shop",
+        entities=(
+            Entity(
+                name="item",
+                table="items",
+                fields=(Field("id", "INTEGER", pk=True), Field("qty", "INTEGER")),
+            ),
+        ),
+    )
+    source = crud_node.models_source(spec)
+
+    assert "function nullIfBlank(value)" in source
+    assert "nullIfBlank(qty)" in source
+
+
+def test_the_scaffold_turns_a_rejected_async_handler_into_a_500(tmp_path):
+    """Express 4 leaves the rejection unhandled and Node 15+ exits the process,
+    so one bad form post is a total outage rather than one failed request."""
+    from app.agent.stacks.node_adapter import NODE
+
+    NODE.scaffold(tmp_path, "shop")
+    source = (tmp_path / "server.js").read_text(encoding="utf-8")
+
+    assert ".catch(next)" in source
+    # Wrapped BEFORE any route is defined, or the routes below are not covered.
+    assert source.index(".catch(next)") < source.index('app.get("/"')

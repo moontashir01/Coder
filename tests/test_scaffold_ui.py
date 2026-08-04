@@ -300,3 +300,78 @@ def test_write_theme_declines_empty_css(tmp_path):
     before = target.read_text(encoding="utf-8")
     assert write_theme(tmp_path, theme_css(resolve_theme("build me a blog"))) is False
     assert target.read_text(encoding="utf-8") == before
+
+
+# ---------------------------------------------------------------------------
+# The macro import is per-template — Jinja does not inherit it
+# ---------------------------------------------------------------------------
+
+
+async def test_macro_import_added_to_a_page_that_calls_ui(tmp_path, monkeypatch):
+    """`base.html` importing the macros does nothing for a child, so a page that
+    calls `ui.field(...)` without its own import is `UndefinedError: 'ui' is
+    undefined` — a 500 on a file that parses, balances and passes the intent
+    judge. Measured on a live build, on one page of fourteen."""
+    monkeypatch.chdir(tmp_path)
+    from app.agent.core import AgentCore
+
+    templates = tmp_path / "templates"
+    templates.mkdir()
+    page = templates / "new_item.html"
+    page.write_text(
+        '{% extends "base.html" %}\n'
+        "{% block content %}{{ ui.field('title') }}{% endblock %}\n",
+        encoding="utf-8",
+    )
+    a = AgentCore(session_id="pytest_macro_import")
+
+    note = await a._fix_macro_import(page, "templates/new_item.html")
+
+    text = page.read_text(encoding="utf-8")
+    assert '{% import "_macros.html" as ui %}' in text
+    # After {% extends %}: a statement above it is outside every block, so the
+    # import would parse and still not bind.
+    assert text.index("extends") < text.index("_macros.html")
+    assert note
+
+
+async def test_macro_import_not_added_twice(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    from app.agent.core import AgentCore
+
+    templates = tmp_path / "templates"
+    templates.mkdir()
+    page = templates / "items.html"
+    original = (
+        '{% extends "base.html" %}\n'
+        '{% import "_macros.html" as ui %}\n'
+        "{% block content %}{{ ui.table([], []) }}{% endblock %}\n"
+    )
+    page.write_text(original, encoding="utf-8")
+    a = AgentCore(session_id="pytest_macro_import_twice")
+
+    note = await a._fix_macro_import(page, "templates/items.html")
+
+    assert page.read_text(encoding="utf-8") == original
+    assert note == ""
+
+
+async def test_macro_import_not_added_to_a_page_that_never_calls_ui(
+    tmp_path, monkeypatch
+):
+    """Narrow like `_repair_missing_imports`: it fires only when the file USES
+    the name. Injecting an import nobody needs is markup nobody asked for."""
+    monkeypatch.chdir(tmp_path)
+    from app.agent.core import AgentCore
+
+    templates = tmp_path / "templates"
+    templates.mkdir()
+    page = templates / "about.html"
+    original = '{% extends "base.html" %}\n{% block content %}<p>hi</p>{% endblock %}\n'
+    page.write_text(original, encoding="utf-8")
+    a = AgentCore(session_id="pytest_macro_import_unused")
+
+    note = await a._fix_macro_import(page, "templates/about.html")
+
+    assert page.read_text(encoding="utf-8") == original
+    assert note == ""

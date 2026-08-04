@@ -21,9 +21,11 @@ from app.agent.blueprint import (
     Feature,
     PlannedFile,
     blueprint_from_data,
+    derive_pages_from_entities,
     should_blueprint,
 )
 from app.agent.core import AgentCore
+from app.agent.projectspec import Entity, Field
 from app.agent.runtime_probe import STDLIB_STACK, Stack, detect_stack
 from config.settings import settings
 
@@ -565,6 +567,318 @@ async def test_coverage_reports_unwired_endpoint(tmp_path, monkeypatch):
     assert "/api/reset" in note
 
 
+async def test_coverage_creates_a_template_a_route_renders(tmp_path, monkeypatch):
+    """Check 1 covers the files the blueprint PLANNED; nothing covered the ones
+    generation invented. Live build: the model added `/signup` to app.py and
+    rendered `signup.html`, which no pass had planned or written — a
+    TemplateNotFound 500 on a link in the site's own nav."""
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_cov_template")
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "app.py").write_text(
+        '@app.route("/signup")\n'
+        "def signup():\n"
+        '    return render_template("signup.html")\n',
+        encoding="utf-8",
+    )
+    a._llm_direct = ScriptedLLM(
+        [
+            "FILENAME: templates/signup.html\n"
+            '{% extends "base.html" %}{% block content %}<form></form>{% endblock %}\n'
+        ]
+    )
+    bp = _bp_with(["app.py"])
+
+    note, _ = await a._verify_blueprint_coverage(bp, [])
+
+    assert (tmp_path / "templates" / "signup.html").is_file()
+    assert "signup.html" in note
+
+
+async def test_coverage_leaves_an_existing_rendered_template_alone(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_cov_template_ok")
+    (tmp_path / "templates").mkdir()
+    original = "<p>mine</p>"
+    (tmp_path / "templates" / "signup.html").write_text(original, encoding="utf-8")
+    (tmp_path / "app.py").write_text(
+        '@app.route("/signup")\n'
+        "def signup():\n"
+        '    return render_template("signup.html")\n',
+        encoding="utf-8",
+    )
+    bp = _bp_with(["app.py"])
+
+    note, _ = await a._verify_blueprint_coverage(bp, [])
+
+    assert (tmp_path / "templates" / "signup.html").read_text() == original
+    assert "signup.html" not in note
+
+
+async def test_coverage_does_not_invent_a_dynamic_template_name(tmp_path, monkeypatch):
+    """`render_template(name + ".html")` cannot be resolved, and writing a file
+    for a guessed name is worse than the 500 it replaces."""
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_cov_template_dynamic")
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "app.py").write_text(
+        '@app.route("/p/<slug>")\n'
+        "def page(slug):\n"
+        '    return render_template(slug + ".html")\n',
+        encoding="utf-8",
+    )
+    bp = _bp_with(["app.py"])
+
+    note, _ = await a._verify_blueprint_coverage(bp, [])
+
+    assert list((tmp_path / "templates").iterdir()) == []
+    assert "Created template" not in note
+
+
+def _flask_app(routes: str) -> str:
+    return (
+        "from flask import Flask, render_template\n"
+        "app = Flask(__name__)\n" + routes + '\nif __name__ == "__main__":\n'
+        "    app.run()\n"
+    )
+
+
+async def test_wiring_adds_a_route_the_pages_need(tmp_path, monkeypatch):
+    """The blueprint plans eleven routes, the model's one surgical edit lands
+    six, and the pages the SAME build wrote then 500 on `url_for('new_category')`.
+    Coverage already computed that list and only reported it."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "wire_missing_endpoints", True)
+    a = AgentCore(session_id="pytest_wire_add")
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "templates" / "categories.html").write_text(
+        "<a href=\"{{ url_for('new_category') }}\">Add</a>", encoding="utf-8"
+    )
+    (tmp_path / "app.py").write_text(
+        _flask_app(
+            '@app.route("/categories")\n'
+            "def categories():\n"
+            '    return render_template("categories.html")\n'
+        ),
+        encoding="utf-8",
+    )
+    # app.py exists, so the edit goes through `_surgical_edit` → `_llm_edit`.
+    # Unscripted it reaches a real ChatOllama and the test silently stops being
+    # offline — conftest's `_no_intent_check` trap in another hat.
+    a._llm_edit = ScriptedLLM(["no blocks"])  # force the whole-file rewrite
+    a._llm_direct = ScriptedLLM(
+        [
+            "FILENAME: app.py\n"
+            + _flask_app(
+                '@app.route("/categories")\n'
+                "def categories():\n"
+                '    return render_template("categories.html")\n\n'
+                '@app.route("/categories/new")\n'
+                "def new_category():\n"
+                '    return render_template("new_category.html")\n'
+            )
+        ]
+    )
+    bp = _bp_with(["app.py"], endpoints=[Endpoint("GET", "/categories/new")])
+
+    note, _ = await a._verify_blueprint_coverage(bp, [])
+
+    assert "new_category" in (tmp_path / "app.py").read_text()
+    assert "Wired" in note
+    assert "may not meet: still no route" not in note
+
+
+async def test_wiring_is_skipped_when_nothing_is_missing(tmp_path, monkeypatch):
+    """A correct build costs no LLM call and comes out byte-for-byte the same."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "wire_missing_endpoints", True)
+    a = AgentCore(session_id="pytest_wire_noop")
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "templates" / "categories.html").write_text(
+        "<a href=\"{{ url_for('categories') }}\">All</a>", encoding="utf-8"
+    )
+    source = _flask_app(
+        '@app.route("/categories")\n'
+        "def categories():\n"
+        '    return render_template("categories.html")\n'
+    )
+    (tmp_path / "app.py").write_text(source, encoding="utf-8")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("a build with nothing missing must not be edited")
+
+    a._llm_direct = SimpleNamespace(invoke=_boom)
+    bp = _bp_with(["app.py"], endpoints=[Endpoint("GET", "/categories")])
+
+    note, _ = await a._verify_blueprint_coverage(bp, [])
+
+    assert (tmp_path / "app.py").read_text() == source
+    assert "Wired" not in note
+
+
+async def test_wiring_puts_the_index_route_back(tmp_path, monkeypatch):
+    """This is a whole-file rewrite of the very file
+    `_restore_scaffold_invariants` protects, and it runs AFTER it — so it
+    deletes the `/` route straight back out. Measured: `/` 404'd on a build
+    whose answer said, truthfully, that the home page had been restored."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "wire_missing_endpoints", True)
+    a = AgentCore(session_id="pytest_wire_index")
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "templates" / "categories.html").write_text(
+        "<a href=\"{{ url_for('new_category') }}\">Add</a>", encoding="utf-8"
+    )
+    (tmp_path / "app.py").write_text(
+        _flask_app(
+            '@app.route("/")\n'
+            "def index():\n"
+            '    return render_template("index.html")\n'
+        ),
+        encoding="utf-8",
+    )
+    a._llm_edit = ScriptedLLM(["no blocks"])
+    a._llm_direct = ScriptedLLM(  # a rewrite that drops "/", as 7B builds do
+        [
+            "FILENAME: app.py\n"
+            + _flask_app(
+                '@app.route("/categories/new")\n'
+                "def new_category():\n"
+                '    return render_template("new_category.html")\n'
+            ),
+            # Restoring `/` gives the file a route rendering index.html, which
+            # `_create_rendered_templates` then writes. ScriptedLLM repeats its
+            # LAST output forever, so this one has to be a template — replaying
+            # the app.py block would land the routeless source back on disk and
+            # the test would "reproduce" a bug it had itself caused.
+            "FILENAME: templates/index.html\n<p>home</p>\n",
+        ]
+    )
+    bp = _bp_with(["app.py"], endpoints=[Endpoint("GET", "/categories/new")])
+
+    await a._verify_blueprint_coverage(bp, [])
+
+    source = (tmp_path / "app.py").read_text()
+    assert "new_category" in source  # the wiring landed
+    assert '@app.route("/")' in source  # ...and did not cost the home page
+
+
+async def test_wiring_reverts_an_edit_that_breaks_the_entry_file(tmp_path, monkeypatch):
+    """Every page is downstream of this one file, so a bad edit is a total
+    outage rather than one 500 — `_intent_repair`'s revert rule, load-bearing."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "wire_missing_endpoints", True)
+    a = AgentCore(session_id="pytest_wire_revert")
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "templates" / "categories.html").write_text(
+        "<a href=\"{{ url_for('new_category') }}\">Add</a>", encoding="utf-8"
+    )
+    source = _flask_app(
+        '@app.route("/categories")\n'
+        "def categories():\n"
+        '    return render_template("categories.html")\n'
+    )
+    (tmp_path / "app.py").write_text(source, encoding="utf-8")
+    a._llm_edit = ScriptedLLM(["no blocks"])
+    a._llm_direct = ScriptedLLM(["FILENAME: app.py\ndef broken(:\n"])
+    bp = _bp_with(["app.py"], endpoints=[Endpoint("GET", "/categories/new")])
+
+    note, _ = await a._verify_blueprint_coverage(bp, [])
+
+    assert (tmp_path / "app.py").read_text() == source  # reverted, byte-for-byte
+    assert "reverted" in note
+
+
+async def test_wiring_reports_what_it_could_not_fix(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "wire_missing_endpoints", True)
+    a = AgentCore(session_id="pytest_wire_partial")
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "templates" / "categories.html").write_text(
+        "<a href=\"{{ url_for('new_category') }}\">Add</a>", encoding="utf-8"
+    )
+    source = _flask_app(
+        '@app.route("/categories")\n'
+        "def categories():\n"
+        '    return render_template("categories.html")\n'
+    )
+    (tmp_path / "app.py").write_text(source, encoding="utf-8")
+    # A syntactically fine rewrite that adds nothing — one attempt, no loop.
+    a._llm_edit = ScriptedLLM(["no blocks"])
+    a._llm_direct = ScriptedLLM(["FILENAME: app.py\n" + source])
+    bp = _bp_with(["app.py"])
+
+    note, _ = await a._verify_blueprint_coverage(bp, [])
+
+    assert "may not meet: still no route" in note
+    assert "new_category" in note
+
+
+async def test_wiring_off_reports_only(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "wire_missing_endpoints", False)
+    a = AgentCore(session_id="pytest_wire_off")
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "templates" / "categories.html").write_text(
+        "<a href=\"{{ url_for('new_category') }}\">Add</a>", encoding="utf-8"
+    )
+    source = _flask_app(
+        '@app.route("/categories")\n'
+        "def categories():\n"
+        '    return render_template("categories.html")\n'
+    )
+    (tmp_path / "app.py").write_text(source, encoding="utf-8")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("the flag is off; nothing may be edited")
+
+    a._llm_direct = SimpleNamespace(invoke=_boom)
+    bp = _bp_with(["app.py"], endpoints=[Endpoint("GET", "/categories/new")])
+
+    note, _ = await a._verify_blueprint_coverage(bp, [])
+
+    assert (tmp_path / "app.py").read_text() == source
+    assert "may not meet" in note  # the old report is unchanged
+
+
+async def test_final_restore_puts_the_index_route_back(tmp_path, monkeypatch):
+    """The smoke repair is the LAST pass that rewrites the entry file, and it
+    rewrites it wholesale. Measured across three live builds: the answer said,
+    truthfully, that the home page had been restored, and the finished site
+    still 404'd on its front door."""
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_final_restore")
+    (tmp_path / "app.py").write_text(
+        _flask_app(
+            '@app.route("/items")\n'
+            "def items():\n"
+            '    return render_template("items.html")\n'
+        ),
+        encoding="utf-8",
+    )
+
+    note = await a._restore_entry_route_note()
+
+    assert '@app.route("/")' in (tmp_path / "app.py").read_text()
+    assert "front page" in note
+
+
+async def test_final_restore_is_a_noop_when_the_route_is_there(tmp_path, monkeypatch):
+    """Idempotent: a build that never lost `/` is untouched and says nothing."""
+    monkeypatch.chdir(tmp_path)
+    a = AgentCore(session_id="pytest_final_restore_noop")
+    source = _flask_app(
+        '@app.route("/")\ndef index():\n    return render_template("index.html")\n'
+    )
+    (tmp_path / "app.py").write_text(source, encoding="utf-8")
+
+    note = await a._restore_entry_route_note()
+
+    assert (tmp_path / "app.py").read_text() == source
+    assert note == ""
+
+
 async def test_coverage_inert_when_no_blueprint_ran(tmp_path, monkeypatch):
     """A non-blueprint turn (self._blueprint is None) never runs coverage."""
     monkeypatch.chdir(tmp_path)
@@ -918,8 +1232,13 @@ def test_completion_does_not_re_route_pages_the_model_planned():
     )
 
     paths = {e.path for e in bp.contract.endpoints}
-    assert paths == {"/catalogue", "/catalogue/add"}
+    # The model's own list and form pages keep their own routes and gain no
+    # duplicates. `/books/<id>` is not an exception to that rule but an
+    # instance of it: the detail page is a template THIS pass creates, and the
+    # model planned neither a page for one book nor a route to it.
+    assert paths == {"/catalogue", "/catalogue/add", "/books/<id>"}
     assert not any(f.filename.startswith("templates/books") for f in bp.files)
+    assert "templates/book_detail.html" in {f.filename for f in bp.files}
 
 
 # ---------------------------------------------------------------------------
@@ -1222,3 +1541,108 @@ def test_home_page_without_routes_still_gets_an_instruction():
     bp = blueprint_from_data(data, "build me a page", _FLASK)
     home = next(f for f in bp.files if f.filename == HOME_TEMPLATE)
     assert "what a visitor can do here" in home.instruction
+
+
+# ---------------------------------------------------------------------------
+# A requirements document outranks the model's own tiering
+# ---------------------------------------------------------------------------
+
+
+def test_a_feature_the_document_asks_for_is_not_left_optional():
+    """`prompts/blueprint.md` already says every capability a document
+    describes is `requested`. On the OpenBazaar PRD the 7B ignored it for
+    "Responsive Web Design" — a whole section of that document, with numeric
+    budgets — so it was reported as NOT BUILT and the site shipped without it."""
+    data = {
+        "summary": "a marketplace",
+        "features": [
+            {"name": "Responsive Web Design", "tier": "optional", "files": ["a.html"]},
+            {"name": "Bidding", "tier": "requested", "files": ["a.html"]},
+        ],
+        "files": [{"filename": "a.html", "action": "create", "instruction": "x"}],
+    }
+    doc = "## 4. UI/UX & Responsive Web Design Requirements\nLCP under 1.2s."
+
+    bp = blueprint_from_data(data, "build it", spec_doc=doc)
+
+    tiers = {f.name: f.tier for f in bp.features}
+    assert tiers["Responsive Web Design"] == "core"
+    assert tiers["Bidding"] == "requested"
+    assert "Responsive Web Design" not in (bp.optional_note() or "")
+
+
+def test_an_optional_feature_the_document_never_mentions_stays_optional():
+    """Otherwise the tier stops meaning anything and every build grows OAuth."""
+    data = {
+        "summary": "a marketplace",
+        "features": [{"name": "OAuth login", "tier": "optional", "files": ["a.html"]}],
+        "files": [{"filename": "a.html", "action": "create", "instruction": "x"}],
+    }
+
+    bp = blueprint_from_data(data, "build it", spec_doc="Sellers list items.")
+
+    assert [f.tier for f in bp.features] == ["optional"]
+
+
+def test_no_document_leaves_every_tier_alone():
+    data = {
+        "summary": "a marketplace",
+        "features": [{"name": "OAuth login", "tier": "optional", "files": ["a.html"]}],
+        "files": [{"filename": "a.html", "action": "create", "instruction": "x"}],
+    }
+
+    assert [f.tier for f in blueprint_from_data(data, "build it").features] == [
+        "optional"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Every entity gets a page for ONE of it, not only a list and a form
+# ---------------------------------------------------------------------------
+
+
+def _entity(name="item", table="items"):
+    return Entity(
+        name=name,
+        table=table,
+        fields=(Field("id", "INTEGER", pk=True), Field("title", "TEXT")),
+    )
+
+
+def test_every_entity_gets_a_detail_page_and_its_route():
+    """The OpenBazaar PRD builds half the product on the Product Detail Page —
+    the carousel, the countdown, the bid buttons, the Buy Now CTA. A build that
+    derives only "list" and "new" has nowhere to put any of it."""
+    files, features, contract = derive_pages_from_entities(
+        (), (), ApiContract(), (_entity(),), FLASK
+    )
+
+    assert "templates/item_detail.html" in {f.filename for f in files}
+    detail = next(e for e in contract.endpoints if e.path == "/items/<id>")
+    assert detail.method == "GET"
+    assert detail.template == "templates/item_detail.html"
+
+
+def test_the_detail_route_is_declared_after_the_create_form():
+    """Express matches in registration order, so `/items/:id` declared above
+    `/items/new` swallows the form and "new" arrives as an id."""
+    node_stack = Stack(language="node", backend="express", note="Express")
+    _files, _features, contract = derive_pages_from_entities(
+        (), (), ApiContract(), (_entity(),), node_stack
+    )
+    paths = [e.path for e in contract.endpoints]
+
+    assert paths.index("/items/new") < paths.index("/items/:id")
+
+
+def test_a_detail_page_the_model_already_planned_is_not_duplicated():
+    planned = (
+        PlannedFile(
+            "templates/item_details.html", instruction="one item", reads=("item",)
+        ),
+    )
+    files, _features, _contract = derive_pages_from_entities(
+        planned, (), ApiContract(), (_entity(),), FLASK
+    )
+
+    assert "templates/item_detail.html" not in {f.filename for f in files}

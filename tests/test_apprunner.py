@@ -44,6 +44,13 @@ HTTPServer(("127.0.0.1", 5000), H).serve_forever()
 
 _DEAD_APP = "import sys\nsys.stderr.write('ValueError: nope\\n')\nsys.exit(1)\n"
 
+# Runs to the end and never serves: the shape of an entry file whose startup
+# block a rewrite deleted. Exits 0, prints nothing.
+_SILENT_APP = "handlers = []\n"
+
+# Reports its own failure on STDOUT, which reading stderr alone threw away.
+_CHATTY_APP = "print('Could not initialise the database: nope')\nraise SystemExit(1)\n"
+
 
 @pytest.fixture
 def runner():
@@ -136,6 +143,37 @@ def test_an_app_that_dies_on_startup_reports_its_error(tmp_path, runner):
     assert ok is False
     assert "ValueError: nope" in message
     assert runner.is_running() is False
+
+
+def test_an_app_that_exits_silently_is_told_apart_from_one_that_crashed(
+    tmp_path, runner
+):
+    """The measured failure: `server.js exited on startup: no output`.
+
+    An entry file that lost its listen call runs to the end and exits **0**
+    without printing anything, and that read identically to a crash whose
+    output went somewhere else. The exit code is the whole diagnosis, so it is
+    always stated, and a clean exit says what a clean exit means.
+    """
+    (tmp_path / "app.py").write_text(_SILENT_APP, encoding="utf-8")
+
+    ok, message = runner.start(tmp_path)
+
+    assert ok is False
+    assert "exit code 0" in message
+    assert "without serving anything" in message
+    assert "app.py" in message
+
+
+def test_a_failure_printed_on_stdout_is_not_thrown_away(tmp_path, runner):
+    """Reading stderr alone discarded the only line that named the cause."""
+    (tmp_path / "app.py").write_text(_CHATTY_APP, encoding="utf-8")
+
+    ok, message = runner.start(tmp_path)
+
+    assert ok is False
+    assert "Could not initialise the database: nope" in message
+    assert "exit code 1" in message
 
 
 def test_stopping_when_nothing_runs_is_false_not_an_error(runner):
@@ -236,6 +274,76 @@ async def test_run_names_the_reason_instead_of_launching_something_that_cannot_w
     out = captured_console.getvalue()
     assert "createdb shop" in out
     assert "Not started" in out
+
+
+async def test_run_puts_the_startup_block_back_before_launching(
+    tmp_path, captured_console, monkeypatch
+):
+    """The other half of `server.js exited on startup`.
+
+    The passes that keep the entry file startable run at the build seam, and
+    `/run` launches with no turn around it — so an entry file a rewrite ended
+    at its last route stayed broken through every `/run`, reported only as an
+    exit with nothing to act on. Repaired here instead, before anything is
+    launched.
+    """
+    from app.agent.core import AgentCore
+    from app.agent.stacks.node_adapter import NODE
+
+    monkeypatch.chdir(tmp_path)
+    # Exactly what a rewrite leaves behind: handlers, and then nothing. `node
+    # --check` accepts this file, and `node server.js` exits 0 in silence.
+    (tmp_path / "server.js").write_text(
+        'const express = require("express");\n'
+        "const app = express();\n"
+        'app.get("/", (req, res) => { res.render("index"); });\n',
+        encoding="utf-8",
+    )
+    ProjectSpec(name="shop", language="node", backend="express").save(tmp_path)
+    monkeypatch.setattr(NODE, "readiness", lambda root: "")
+    monkeypatch.setattr(NODE, "autosetup", lambda root, log=None: [])
+    monkeypatch.setattr(
+        get_runner(),
+        "start",
+        lambda *a, **kw: (True, "running at http://127.0.0.1:3000"),
+    )
+
+    handled = await handle_command(
+        "/run", _FakeRepl(AgentCore(session_id="pytest_run_repair"))
+    )
+
+    assert handled is True
+    source = (tmp_path / "server.js").read_text(encoding="utf-8")
+    assert "app.listen(" in source, "the entry file still cannot start"
+    assert "restored the startup block" in captured_console.getvalue()
+
+
+async def test_run_leaves_a_healthy_entry_file_byte_for_byte(
+    tmp_path, captured_console, monkeypatch
+):
+    """Idempotent, or it is a pass that rewrites working code on every /run."""
+    from app.agent.core import AgentCore
+    from app.agent.stacks.node_adapter import NODE
+
+    monkeypatch.chdir(tmp_path)
+    source = (
+        'const express = require("express");\n'
+        "const app = express();\n"
+        'app.get("/", (req, res) => { res.render("index"); });\n'
+        "app.use((req, res) => { res.status(404).send('no'); });\n"
+        "app.listen(3000);\n"
+        "module.exports = app;\n"
+    )
+    (tmp_path / "server.js").write_text(source, encoding="utf-8")
+    ProjectSpec(name="shop", language="node", backend="express").save(tmp_path)
+    monkeypatch.setattr(NODE, "readiness", lambda root: "")
+    monkeypatch.setattr(NODE, "autosetup", lambda root, log=None: [])
+    monkeypatch.setattr(get_runner(), "start", lambda *a, **kw: (True, "running"))
+
+    await handle_command("/run", _FakeRepl(AgentCore(session_id="pytest_run_ok")))
+
+    assert (tmp_path / "server.js").read_text(encoding="utf-8") == source
+    assert "restored" not in captured_console.getvalue()
 
 
 async def test_run_on_flask_is_unchanged_by_the_readiness_gate(

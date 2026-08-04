@@ -67,9 +67,32 @@ def test_known_keys_resolve(monkeypatch):
 
 
 def test_default_is_listed_first():
-    """Flask stays the default and the head of the menu: it is the stack with
-    the deeper guarantees, so an accident lands on the better-verified path."""
+    """Flask stays the FALLBACK and the head of the menu: it is the stack with
+    the deeper guarantees, so an accident lands on the better-verified path.
+
+    This is not the same question as `settings.web_stack` — see the test
+    below."""
     assert stack_keys()[0] == DEFAULT_KEY
+
+
+def test_the_shipped_default_stack_is_node():
+    """The session default is `node`; `DEFAULT_KEY` is still `flask`.
+
+    Read off the SETTINGS CLASS, not the live `settings` object, because
+    `conftest.py::_flask_stack` pins the instance to Flask for the whole suite —
+    every other test therefore measures Flask, and without this one the shipped
+    default would be exercised by nothing at all, which reads exactly like a
+    default that works.
+
+    The two values are deliberately different. `DEFAULT_KEY` answers "what does
+    an empty, missing or unrecognised key mean" — including every `project.json`
+    written before the stack seam existed, which would otherwise be reinterpreted
+    as Express and send an amendment to write `ensure_column` calls into a
+    `db.js` that does not exist. `web_stack` answers "what does a NEW build use",
+    and that is a deliberate choice, not an accident.
+    """
+    assert type(settings).model_fields["web_stack"].default == "node"
+    assert DEFAULT_KEY == "flask"
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +175,7 @@ def test_every_adapter_answers_the_whole_protocol(adapter):
         "write_data_layer",
         "migration_note",
         "readiness",
+        "autosetup",
         "run_command",
         "seed_command",
         "write_source_if_valid",
@@ -596,7 +620,9 @@ needs_node = pytest.mark.skipif(
 
 
 @needs_node
-@pytest.mark.parametrize("name", ["_PROBE_SCRIPT", "_SCHEMA_SCRIPT"])
+@pytest.mark.parametrize(
+    "name", ["_PROBE_SCRIPT", "_SCHEMA_SCRIPT", "_CREATE_DB_SCRIPT"]
+)
 def test_the_node_scripts_are_valid_javascript(tmp_path, name):
     """Not ceremony — `pageaudit.py` learned this the expensive way.
 
@@ -1278,8 +1304,21 @@ def test_the_gaps_are_gaps_the_code_really_has(tmp_path):
     assert "nothing runs `select 1`" not in claims
     assert "not proven" not in claims
 
+    # The undefined-name check landed — the gap line must describe what is left
+    # (npm packages are reported, not required) rather than claim there is no
+    # repair at all. A stale "we don't do this" is worse than no list: it tells
+    # someone choosing a stack the opposite of the truth.
+    fixed, added, reports = NODE.repair_runtime_names(
+        "server.js",
+        'const path = require("path");\n'
+        'app.post("/login", (req, res) => { bcrypt.compareSync(req.body.p); });\n',
+        tmp_path,
+    )
+    assert added == [], "an npm package is never required into existence"
+    assert any("bcrypt" in line for line in reports), "...it is reported instead"
+    assert "no missing-import repair" not in claims
+    assert "missing-require repair only binds" in claims
+
     # Still genuinely missing — these must stay stated.
     assert NODE.template_edit_region("views/x.ejs", "<p>x</p>") is None
     assert "template-scoped editing" in claims
-    assert not hasattr(NODE, "add_missing_imports")
-    assert "missing-import repair" in claims

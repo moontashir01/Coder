@@ -25,6 +25,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -590,6 +591,8 @@ def check_file(path: Path | str) -> tuple[bool, str]:
         return _check_with_command(p, "node", ["--check"])
     if suffix == ".ts":
         return _check_with_command(p, "tsc", ["--noEmit"])
+    if suffix == ".ejs":
+        return _check_ejs_javascript(text, p.name)
     return True, ""
 
 
@@ -785,6 +788,64 @@ def strip_ejs(text: str) -> tuple[str, str]:
     return "".join(out), ""
 
 
+def ejs_script(text: str) -> str:
+    """The JavaScript an EJS view compiles to, as one syntax-checkable program.
+
+    `strip_ejs` throws this half away — it takes the JavaScript OUT so the
+    markup underneath can be balanced. Nothing then looked at the JavaScript,
+    and it is where EJS views actually break: measured on a live build, one view
+    shipped `<%- users.forEach(user => { %>` (an OUTPUT tag around a statement
+    that opens a brace, so EJS emits `__append(users.forEach(user => {)`) and
+    another had a sentence of the model's own prose welded into a call's
+    argument list. Both files were structurally perfect markup, both passed
+    every check that existed, and both threw at render time — which on this
+    project's own build meant the home page, `/users` and `/items` were 500s.
+
+    The translation is EJS's own, kept deliberately literal:
+      * `<% code %>`             → `code`            (scriptlet)
+      * `<%= x %>` / `<%- x %>`  → `__append(x);`    (output)
+      * `<%# … %>`               → nothing           (comment)
+      * `<%% `                   → nothing           (the literal-`<%` escape)
+    Markup between tags becomes nothing at all: it is a string in the real
+    compilation and cannot affect whether the code parses.
+
+    The result is wrapped in an `async function` because a view body may
+    legitimately `await` and may `return` early, and both are syntax errors at
+    the top level of a script. Undefined locals (`users`, `ui`) are irrelevant —
+    `node --check` parses, it never runs.
+    """
+    parts: list[str] = ["async function __ejs(__append, locals) {\n"]
+    i, n = 0, len(text or "")
+    while i < n:
+        if text.startswith("<%%", i):
+            i += 3
+            continue
+        if not text.startswith("<%", i):
+            i += 1
+            continue
+        end = text.find("%>", i + 2)
+        if end == -1:
+            break  # unterminated — strip_ejs owns that error, and reports it
+        body = text[i + 2 : end]
+        i = end + 2
+        # `<%_` and `_%>`/`-%>` are whitespace-slurp markers, not code.
+        if body.startswith("_"):
+            body = body[1:]
+        if body.endswith(("_", "-")):
+            body = body[:-1]
+        if not body.strip():
+            continue
+        marker, rest = body[0], body[1:]
+        if marker == "#":
+            continue  # a comment compiles to nothing
+        if marker in ("=", "-"):
+            parts.append(f"__append({rest}\n);\n")
+            continue
+        parts.append(body + "\n")
+    parts.append("\n}\n")
+    return "".join(parts)
+
+
 def _check_ejs_text(text: str, name: str) -> tuple[bool, str]:
     """Structural validation for an EJS view: delimiters, then tag balance.
 
@@ -793,9 +854,9 @@ def _check_ejs_text(text: str, name: str) -> tuple[bool, str]:
     and `_html_surrounding_prose` only fires when there is a document to be
     outside of, so both shapes pass for the right reason.
 
-    A view may legitimately be mostly prose (a hero paragraph), so there is no
-    "this looks like prose" guard here — unlike `.js`, where prose means the
-    model wrote the wrong kind of content entirely.
+    The JavaScript itself is checked separately and needs `node` — see
+    `ejs_script` and `check_file`. This half stays tooling-free so a W9
+    candidate can still be scored before it is written.
     """
     html, error = strip_ejs(text)
     if error:
@@ -812,7 +873,60 @@ def _check_ejs_text(text: str, name: str) -> tuple[bool, str]:
     errors.extend(f"unclosed <{tag}>" for tag in reversed(parser.stack))
     if errors:
         return False, f"{name}: " + "; ".join(errors[:5])
+
+    # A view with no EJS tag AND no markup at all is not a view. There is
+    # deliberately no general "this looks like prose" guard here — a hero
+    # paragraph is a legitimate fragment, unlike in a `.js` file where prose
+    # means the wrong kind of content entirely — but a file containing neither a
+    # tag nor an element renders literally nothing, so it can only be the model
+    # answering in the file instead of writing one. Measured: "fix the files
+    # inside users.ejs" produced a `users.ejs` whose entire content was "To
+    # address the request … I need more information about the specific issues",
+    # and it passed as a valid view.
+    if text.strip() and "<%" not in text and not parser.saw_tag:
+        head = " ".join(text.split())[:80]
+        return False, (
+            f"{name}: no markup and no EJS tags — this is prose, not a view: "
+            f"{head!r}. Output only the contents of the file."
+        )
     return True, ""
+
+
+def _check_ejs_javascript(text: str, name: str) -> tuple[bool, str]:
+    """Syntax-check the JavaScript inside an EJS view with `node --check`.
+
+    The half of `check_file` that needs a binary, kept beside the `.js` and
+    `.ts` cases and skipped the same way when `node` is missing. The script is
+    written to a temp file rather than the view itself, so the error is about
+    the code and the view on disk is never touched.
+    """
+    if shutil.which("node") is None:
+        return True, ""
+    script = ejs_script(text)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, encoding="utf-8"
+        ) as handle:
+            handle.write(script)
+            tmp = Path(handle.name)
+        ok, error = _check_with_command(tmp, "node", ["--check"])
+    except Exception:
+        return True, ""  # the checker itself broke → never block the write
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    if ok:
+        return True, ""
+    # The temp path is noise, and the line numbers are the script's rather than
+    # the view's — say which file is wrong and quote the parser.
+    detail = " ".join(str(error).split())
+    return False, (
+        f"{name}: the JavaScript inside the EJS tags does not parse — {detail[:400]}"
+    )
 
 
 def _check_html_text(text: str, name: str) -> tuple[bool, str]:

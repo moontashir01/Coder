@@ -21,14 +21,23 @@ import logging
 from pathlib import Path
 
 from app.agent import scaffold as _scaffold
-from app.agent.crud import api_context, apply_table_block, models_source, seed_source
+from app.agent.crud import (
+    api_context,
+    apply_table_block,
+    models_source,
+    plaintext_password_writes,
+    seed_source,
+)
 from app.agent.impact import (
     DB_FILE,
     apply_migration_block,
     migration_block,
+    reinstate_routes,
     restore_page_routes,
+    route_blocks,
 )
 from app.agent.projectspec import ProjectSpec, routes_from_source
+from app.agent.pyimports import add_missing_imports, searchable_sql
 from app.agent.verify import (
     fix_endpoint_names,
     form_method_mismatches,
@@ -54,6 +63,8 @@ class FlaskAdapter:
     entry_file = "app.py"
     template_dir = "templates"
     template_ext = ".html"
+    # How this stack spells "the id goes here" in a route path.
+    route_param = "<id>"
     layout_file = "base.html"
     static_dir = "static"
     theme_file = "static/css/theme.css"
@@ -179,6 +190,19 @@ class FlaskAdapter:
         """
         return ""
 
+    def autosetup(self, root: Path, log=None) -> list[str]:
+        """Nothing to do — and that is the point of this stack.
+
+        sqlite is a file, and the generated app's one dependency is installed in
+        the venv Coder itself runs from (`run_command` uses `sys.executable` for
+        exactly that reason). So a Flask project is runnable the moment it is
+        written, and `/run` on this stack is unchanged by the auto-setup work.
+
+        Returns the empty list, never a "nothing needed" line: a step that did
+        not happen must not be printed as one that did.
+        """
+        return []
+
     def table_columns(self, root: Path) -> dict[str, set[str]] | None:
         """What the database REALLY has: `{table: {column, ...}}`, or None.
 
@@ -294,6 +318,96 @@ class FlaskAdapter:
     def restore_routes(self, source: str, missing) -> tuple[str, list[str]]:
         return restore_page_routes(source, missing)
 
+    def restore_boot_block(self, source: str) -> tuple[str, bool]:
+        return _scaffold.restore_run_block(source)
+
+    def sql_literals(self, source: str) -> list[str]:
+        """Python's answer, unchanged — string literals of a module that
+        parses, the whole raw text of one that does not."""
+        return searchable_sql(source)
+
+    def render_locals(self, entry_source: str) -> dict[str, set[str]]:
+        """Not needed here, and that is a property of Jinja rather than a gap.
+
+        An undefined name in a Jinja template renders as empty; in EJS it is a
+        ReferenceError and the page 500s. So the Node adapter has to check this
+        and Flask genuinely does not.
+        """
+        return {}
+
+    def repair_view_locals(
+        self, text: str, provided: set[str]
+    ) -> tuple[str, list[str], list[str]]:
+        return text, [], []
+
+    def repair_module_calls(self, source: str, root: Path) -> tuple[str, list[str]]:
+        """Nothing here yet — `_check_cross_module_calls` REPORTS these on both
+        stacks, and the Node repair is one scaffold invariant (`db.initDb`), not
+        a general fixer. Inventing a Python equivalent without a measured
+        failure behind it is how a repair pass becomes churn."""
+        return source, []
+
+    def repair_runtime_names(
+        self, filename: str, source: str, root: Path
+    ) -> tuple[str, list[str], list[str]]:
+        """Delegation, unchanged: `add_missing_imports` + the password check.
+
+        This is exactly what `core._repair_missing_imports` inlined before the
+        Node half existed — moved behind the seam so the two stacks answer the
+        same question rather than only one of them being asked it.
+        """
+        if Path(filename).suffix.lower() != ".py":
+            return source, [], []
+
+        sibling_sources: dict[str, str] = {}
+        for name in ("db", "models", "seed"):
+            sibling = root / f"{name}.py"
+            if sibling.is_file() and sibling.name != Path(filename).name:
+                try:
+                    sibling_sources[name] = sibling.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    logger.debug("import repair: could not read %s.py", name)
+        fixed, added, unresolved = add_missing_imports(
+            source, frozenset(sibling_sources)
+        )
+
+        reports: list[str] = []
+        if unresolved:
+            reports.append(
+                "uses undefined name(s) at runtime — " + ", ".join(unresolved[:6])
+            )
+        try:
+            leaks = plaintext_password_writes(fixed)
+        except Exception:
+            logger.debug("password check failed for %s", filename, exc_info=True)
+            leaks = []
+        if leaks:
+            reports.append(
+                "stores a password without hashing it — "
+                + "; ".join(leaks[:3])
+                + " (use werkzeug.security.generate_password_hash)"
+            )
+        return fixed, added, reports
+
+    def order_routes(self, source: str) -> tuple[str, list[str], list[str]]:
+        """Nothing to do, and that is a property of Werkzeug, not an omission.
+
+        Flask's URL map ranks rules by specificity, so `/items/<id>` written
+        above `/items/new` still loses to it. Express matches in registration
+        order and does not — see `NodeAdapter.order_routes`.
+        """
+        return source, [], []
+
+    def route_blocks(self, source: str) -> dict[tuple[str, str], str]:
+        return route_blocks(source)
+
+    def reinstate_routes(
+        self, source: str, blocks: dict[tuple[str, str], str]
+    ) -> tuple[str, list[str]]:
+        return reinstate_routes(source, blocks)
+
     def orphan_templates(self, root: Path) -> list[str]:
         return _scaffold.templates_without_inheritance(root)
 
@@ -310,6 +424,67 @@ class FlaskAdapter:
         return _scaffold.template_edit_region(filename, text)
 
     # -- prompt blocks ----------------------------------------------------
+
+    def schema_types(self) -> str:
+        """The column types the SCHEMA call may use on this stack.
+
+        It used to be a fixed "Storage is SQLite" paragraph in
+        `prompts/schema.md`, which meant a Node build — whose database is
+        PostgreSQL — was told to flatten `BOOLEAN` to `INTEGER` and every
+        timestamp to `TEXT`. That is right here and wrong there, and the cost
+        showed on the OpenBazaar PRD: an auction's `auction_end_time` became a
+        string, so `WHERE auction_end_time > NOW()` could not be written.
+        """
+        return (
+            "## Column types — use only these\n"
+            "`INTEGER`, `TEXT`, `REAL`, `BLOB`, `NUMERIC`.\n\n"
+            "Storage is SQLite, which has no boolean and no date type: a "
+            "yes/no is `INTEGER`, a timestamp is `TEXT`. The primary key of "
+            'every table is `{"name": "id", "type": "INTEGER", '
+            '"pk": true}` — it autoincrements, so nothing supplies it.'
+        )
+
+    def blueprint_layout(self) -> str:
+        """The filenames the PLANNING call must use (was hard-coded in the prompt).
+
+        It lived in `prompts/blueprint.md` as "On the Flask stack, use this
+        exact layout", which meant the Node stack was planned with no layout at
+        all — the planner invented `app.py`/`templates/*.html` for an Express
+        project and every later pass had to guess what it meant. The rules moved
+        here unchanged; what changed is that each stack now has some.
+        """
+        return (
+            "## File layout — use these names and no others\n"
+            "| File | Holds |\n"
+            "| --- | --- |\n"
+            "| `app.py` | routes only — one `@app.route` per URL, no SQL |\n"
+            "| `db.py` | `get_db()`, `init_db()`, `ensure_column()` |\n"
+            "| `models.py` | one query helper per operation, `?` parameters only |\n"
+            "| `seed.py` | a few demo rows per table |\n"
+            "| `templates/base.html` | the nav and page shell — the ONLY place "
+            "nav exists |\n"
+            '| `templates/index.html` | the home page — `"action": "edit"`, it '
+            "already exists |\n"
+            "| `templates/<page>.html` | one per page, each "
+            '`{% extends "base.html" %}` |\n'
+            "| `static/css/style.css` | the one stylesheet |\n"
+            "| `static/js/app.js` | optional enhancement only |\n\n"
+            "Rules that follow from it:\n"
+            "- A page template contains ONLY `{% extends %}` plus its blocks — "
+            "never a full `<html>` document, never its own copy of the nav.\n"
+            '- Prefer a real `<form method="post" action="/route">` posting to '
+            "a Flask route over `fetch()`. It works with JavaScript disabled, "
+            'which is what makes "the button does nothing" impossible rather '
+            "than merely unlikely.\n"
+            "- Routes call helpers in `models.py`; they never write SQL inline.\n"
+            "- Do NOT plan `requirements.txt`, `Procfile` or `.gitignore` — they "
+            "are already written for you.\n"
+            "- **Plan the home page.** `templates/index.html` exists but holds "
+            'placeholder text, so give it `"action": "edit"` and an instruction '
+            "describing what this site's front door shows and which pages it "
+            "links to. A build that leaves it alone ships a site whose first "
+            "page says it was scaffolded."
+        )
 
     def ui_context(self) -> str:
         return _scaffold.ui_context()

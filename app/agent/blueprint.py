@@ -692,6 +692,18 @@ def _is_form_stem(stem: str) -> bool:
     return bool(_FORM_WORDS & set(_STEM_SPLIT_RE.split(stem.lower())))
 
 
+# A page showing ONE row, as opposed to the list of them. The PRD this was
+# measured against calls it the Product Detail Page and builds half the product
+# on it — the carousel, the countdown, the bid buttons and the Buy Now CTA all
+# live there — and a build that derives only "list" and "new" has nowhere to put
+# any of it.
+_DETAIL_WORDS = frozenset({"detail", "details", "show", "view", "single", "page"})
+
+
+def _is_detail_stem(stem: str) -> bool:
+    return bool(_DETAIL_WORDS & set(_STEM_SPLIT_RE.split(stem.lower())))
+
+
 def derive_pages_from_entities(
     files: tuple[PlannedFile, ...],
     features: tuple[Feature, ...],
@@ -735,20 +747,25 @@ def derive_pages_from_entities(
     for entity in entities:
         list_tpl = f"{tpl_dir}/{entity.table}{ext}"
         form_tpl = f"{tpl_dir}/new_{entity.name}{ext}"
+        detail_tpl = f"{tpl_dir}/{entity.name}_detail{ext}"
         list_path = f"/{entity.table}"
         form_path = f"/{entity.table}/new"
+        detail_path = f"/{entity.table}/{adapter.route_param}"
 
         # Already covered? A page counts for this entity if it declared `reads`
         # for it (Phase C2) or its filename names it. `new_*.html` is the form,
         # anything else naming the entity is the listing.
         has_list = False
         has_form = False
+        has_detail = False
         for pf in planned_pages:
             stem = pf.filename.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
             if not (entity.name in pf.reads or _mentions(entity, pf.filename)):
                 continue
             if _is_form_stem(stem):
                 has_form = True
+            elif _is_detail_stem(stem):
+                has_detail = True
             else:
                 has_list = True
 
@@ -762,6 +779,7 @@ def derive_pages_from_entities(
         # model planned, it also routed; the coverage check owns gaps there.
         wants_list_route = False
         wants_form_routes = False
+        wants_detail_route = False
 
         if not has_list and list_tpl.lower() not in taken:
             taken.add(list_tpl.lower())
@@ -805,6 +823,29 @@ def derive_pages_from_entities(
             )
             new_features.append(Feature(f"Add a {entity.name}", TIER_CORE, (form_tpl,)))
 
+        if not has_detail and detail_tpl.lower() not in taken:
+            taken.add(detail_tpl.lower())
+            wants_detail_route = True
+            new_files.append(
+                PlannedFile(
+                    filename=detail_tpl,
+                    action="create",
+                    instruction=(
+                        f"The page for ONE {entity.name}, served from the route "
+                        f"as a `{entity.name}` variable: every field of it "
+                        f"({', '.join(f.name for f in entity.fields)}) laid out "
+                        f"in full, with whatever action this {entity.name} "
+                        f"supports and a link back to /{entity.table}. "
+                        f"{adapter.page_note}"
+                    ),
+                    role="frontend",
+                    reads=(entity.name,),
+                )
+            )
+            new_features.append(
+                Feature(f"View one {entity.name}", TIER_CORE, (detail_tpl,))
+            )
+
         wanted = ()
         if wants_list_route:
             wanted += (("GET", list_path, list_tpl),)
@@ -812,6 +853,13 @@ def derive_pages_from_entities(
             # Both halves: the GET serves the form, the POST accepts it. A form
             # page with only a POST route cannot be opened at all.
             wanted += (("GET", form_path, form_tpl), ("POST", form_path, form_tpl))
+        if wants_detail_route:
+            # LAST, and that is not cosmetic: Express matches in registration
+            # order, so `/items/:id` written above `/items/new` swallows the
+            # form page and "new" arrives as an id. `node_adapter.order_routes`
+            # enforces the same rule on the file that is finally written, for
+            # the passes that insert routes later.
+            wanted += (("GET", detail_path, detail_tpl),)
         for method, path, tpl in wanted:
             if (method, path) in routes:
                 continue
@@ -977,11 +1025,71 @@ def derive_home_page(
     )
 
 
+_TIER_WORD_RE = re.compile(r"[a-z0-9]+")
+# Words too common to prove a feature was named by a document.
+_TIER_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "for",
+        "of",
+        "on",
+        "or",
+        "page",
+        "support",
+        "system",
+        "the",
+        "to",
+        "with",
+    }
+)
+
+
+def retier_documented_features(
+    features: tuple[Feature, ...], spec_doc: str
+) -> tuple[Feature, ...]:
+    """Promote `optional` features the requirements document actually asks for.
+
+    `prompts/blueprint.md` already says that when a document is supplied every
+    capability in it is `requested` rather than `optional`. That is a rule
+    addressed to a 7B model, and on the OpenBazaar PRD it was ignored in the one
+    way that costs the most: "Responsive Web Design" — a whole section of the
+    document, with numeric budgets — came back `optional`, so it was reported as
+    *not built* and the build shipped without it.
+
+    Deterministic and narrow: a feature is promoted only when every significant
+    word of its name appears in the document. "Responsive Web Design" does;
+    "OAuth" or "Two-factor authentication" on a document that never mentions
+    them does not, so the optional tier still means something.
+    """
+    if not spec_doc or not features:
+        return features
+    haystack = set(_TIER_WORD_RE.findall(spec_doc.lower()))
+    out: list[Feature] = []
+    for feature in features:
+        words = [
+            w
+            for w in _TIER_WORD_RE.findall(feature.name.lower())
+            if w not in _TIER_STOPWORDS and len(w) > 2
+        ]
+        if (
+            feature.tier == TIER_OPTIONAL
+            and words
+            and all(w in haystack for w in words)
+        ):
+            out.append(Feature(feature.name, TIER_CORE, feature.files))
+        else:
+            out.append(feature)
+    return tuple(out)
+
+
 def blueprint_from_data(
     data: dict | None,
     message: str,
     stack: Stack | None = None,
     entities: tuple["Entity", ...] = (),
+    spec_doc: str = "",
 ) -> Blueprint:
     """Turn a parsed extraction response into a filtered Blueprint.
 
@@ -1002,7 +1110,9 @@ def blueprint_from_data(
     summary = " ".join(str(data.get("summary") or "").split())[:300]
     files = _clean_files(data.get("files"))
     known = {f.filename.lower() for f in files}
-    features = _clean_features(data.get("features"), known)
+    features = retier_documented_features(
+        _clean_features(data.get("features"), known), spec_doc
+    )
 
     contract_raw = data.get("contract")
     contract_raw = contract_raw if isinstance(contract_raw, dict) else {}

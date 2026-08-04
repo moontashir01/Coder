@@ -380,6 +380,86 @@ def restore_page_routes(app_source: str, missing: list) -> tuple[str, list[str]]
     return text.rstrip("\n") + "\n" + body, restored
 
 
+def route_blocks(app_source: str) -> dict[tuple[str, str], str]:
+    """`(METHOD, path) -> the exact source of that route`, decorator and all.
+
+    Regex rather than `ast`, for `routes_from_source`' reason: this has to work
+    on a file that no longer fully parses, which is exactly when a route has
+    just been lost. A route declaring several methods yields one entry per
+    method, all sharing the one block — `reinstate_routes` writes each block
+    once.
+    """
+    from app.agent.projectspec import _METHODS_RE, _ROUTE_RE
+
+    out: dict[tuple[str, str], str] = {}
+    for match in _ROUTE_RE.finditer(app_source or ""):
+        block = (app_source[match.start() : match.end()]).strip("\n") + "\n"
+        methods_match = _METHODS_RE.search(match.group("rest") or "")
+        methods = (
+            [
+                m.strip().strip("\"'").upper()
+                for m in methods_match.group("m").split(",")
+            ]
+            if methods_match
+            else ["GET"]
+        )
+        for method in methods or ["GET"]:
+            if method:
+                out.setdefault((method, match.group("path")), block)
+    return out
+
+
+def reinstate_routes(
+    app_source: str, blocks: dict[tuple[str, str], str]
+) -> tuple[str, list[str]]:
+    """Put back, verbatim, routes this file held earlier in the same turn.
+
+    `restore_page_routes` can only rebuild a GET whose body is a
+    `render_template` call, because anything else would be generation. This is
+    the other half: the handler's own source is still in hand, so a POST full of
+    domain logic comes back as it was written instead of being reported as lost.
+    """
+    text = app_source or ""
+    if not blocks:
+        return app_source, []
+    from app.agent.projectspec import routes_from_source as _routes
+
+    live = {(m, p) for m, p, _v, _t in _routes(text)}
+    seen: set[str] = set()
+    body_parts, restored = [], []
+    for (method, path), block in blocks.items():
+        if (method, path) in live:
+            continue
+        if block in seen:
+            # One `@app.route(..., methods=["GET", "POST"])` is ONE block and
+            # several keys. Write it once, but report every method it brings
+            # back — a restore that named only the GET would read as if the
+            # POST were still missing.
+            restored.append(f"{method} {path}")
+            continue
+        # A view name that is still defined means the handler was RENAMED onto
+        # another path, not deleted. Re-adding it would define the function
+        # twice and let the second definition win — a worse app than the one
+        # route this pass exists to save.
+        view = re.search(r"\bdef\s+(\w+)\s*\(", block)
+        if view and re.search(rf"\bdef\s+{re.escape(view.group(1))}\s*\(", text):
+            continue
+        seen.add(block)
+        body_parts.append("\n\n" + block.rstrip("\n") + "\n")
+        restored.append(f"{method} {path}")
+    if not body_parts:
+        return app_source, []
+
+    guard = _MAIN_GUARD_RE.search(text)
+    body = "".join(body_parts)
+    if guard:
+        at = guard.start()
+        return text[:at].rstrip("\n") + "\n" + body + "\n\n" + text[at:], sorted(
+            restored
+        )
+    return text.rstrip("\n") + "\n" + body, sorted(restored)
+
+
 def _view_name(path: str) -> str:
     """`/admin/products` -> `admin_products`, safe as a Python identifier."""
     slug = re.sub(r"[^a-z0-9]+", "_", (path or "").lower()).strip("_")

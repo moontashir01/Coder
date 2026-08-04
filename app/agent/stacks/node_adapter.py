@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -41,14 +42,24 @@ from app.agent.crud_node import (
     api_context,
     apply_block,
     creates_table,
+    js_strings,
+    js_without_comments,
     models_source,
     needs_password_helper,
     password_helper_source,
     seed_source,
     table_block,
 )
+from app.agent.ejslocals import render_locals, repair_view_locals
+from app.agent.jsdeps import fix_db_bootstrap
+from app.agent.jsimports import (
+    add_missing_requires,
+    middleware_gaps,
+    plaintext_password_writes,
+)
 from app.agent.projectspec import POSTGRES
 from app.agent.verify import (
+    check_file,
     check_text,
     fix_link_targets,
     form_method_mismatches_by_path,
@@ -103,6 +114,28 @@ _TERMINAL_USE_RE = re.compile(
 # the only check that reports it.
 _CANNOT_TELL = frozenset({"CODER_NO_URL", "CODER_BAD_DBJS"})
 
+# `CREATE DATABASE` cannot take a bound parameter, so the name is interpolated —
+# and therefore has to be an identifier this project generated, never anything
+# that arrived from outside. `scaffold.project_slug` emits `[a-z0-9-]`; this is
+# the same guard `projectspec._ident` applies to a table name, for the same
+# reason. Anything else is refused rather than quoted and hoped for.
+_DB_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,63}$")
+
+
+def _last_error_line(stderr: str | None) -> str:
+    """One useful line out of a failed command's stderr.
+
+    `apprunner._loudest_line`'s rule: prefer a line that names an error, fall
+    back to the last line, and never return the whole log — this is printed to
+    someone who asked for a URL, not a build transcript.
+    """
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    for line in reversed(lines):
+        if "error" in line.lower():
+            return line[:200]
+    return lines[-1][:200] if lines else "no output"
+
+
 _INDEX_ROUTE_SNIPPET = """
 app.get("/", (req, res) => {
   // Home page. Restored by Coder: generation had removed it.
@@ -110,6 +143,114 @@ app.get("/", (req, res) => {
 });
 
 """
+
+_EXPORTS_RE = re.compile(r"\bmodule\s*\.\s*exports\b")
+
+# The scaffold's terminal section, which is what makes server.js an app rather
+# than a list of handlers. Restored verbatim when a rewrite drops it — see
+# `NodeAdapter.restore_boot_block` for why it has to be checked at all.
+_NOT_FOUND_SNIPPET = """
+// Anything that matched no route above. Restored by Coder.
+app.use((req, res) => {
+  res.status(404).render("index", {
+    title: "Not found",
+    notFound: req.originalUrl,
+  });
+});
+
+// Any error a route throws lands here. Logged in full, shown short.
+app.use((err, req, res, _next) => {
+  console.error(err);
+  res.status(500).send("Internal Server Error");
+});
+"""
+
+# Written against `process.env.PORT` rather than the scaffold's `PORT` const,
+# and the `db` half is only used when the file really does require ./db: this
+# runs on a file a rewrite has already damaged, so it must not assume that any
+# particular binding above it survived.
+_LISTEN_SNIPPET = """
+// Create the database schema and apply any new columns, then serve. Restored
+// by Coder: a rewrite had removed it, so `node server.js` exited silently
+// without ever listening.
+db.initDb()
+  .then(() => {
+    app.listen(process.env.PORT || 3000, () => {
+      console.log(`listening on http://127.0.0.1:${process.env.PORT || 3000}`);
+    });
+  })
+  .catch((err) => {
+    console.error("Could not initialise the database:", err.message);
+    console.error(
+      "Start PostgreSQL and create the database, or set DATABASE_URL. See db.js."
+    );
+    process.exit(1);
+  });
+"""
+
+_LISTEN_SNIPPET_NO_DB = """
+// Restored by Coder: a rewrite had removed the listen call, so `node server.js`
+// exited silently without ever serving.
+app.listen(process.env.PORT || 3000, () => {
+  console.log(`listening on http://127.0.0.1:${process.env.PORT || 3000}`);
+});
+"""
+
+_DB_REQUIRE_RE = re.compile(r"""require\(\s*["'`]\./db["'`]\s*\)""")
+
+_EXPORTS_SNIPPET = """
+module.exports = app;
+"""
+
+
+# Strings/templates, for the bracket-balance guard below. Comments are gone
+# by then (`js_without_comments`), so a naive literal regex is safe here.
+_JS_LITERAL_RE = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`")
+
+
+def _brackets_balance(block: str) -> bool:
+    """Do `{}`, `()` and `[]` pair up in this slice, ignoring strings/comments?
+
+    Not a parser and not trying to be — `write_source_if_valid` runs the real
+    `node --check`. This is the cheap guard that stops an unbalanced slice from
+    being RECORDED in the first place, so a later reinstatement cannot even
+    propose it.
+    """
+    # Comments first (that walk knows a `//` inside a URL from a real comment),
+    # then blank the literals it left intact — a `{` inside a string is text.
+    text = _JS_LITERAL_RE.sub(
+        lambda m: " " * len(m.group(0)), js_without_comments(block or "")
+    )
+    depth = {"{": 0, "(": 0, "[": 0}
+    closing = {"}": "{", ")": "(", "]": "["}
+    for char in text:
+        if char in depth:
+            depth[char] += 1
+        elif char in closing:
+            depth[closing[char]] -= 1
+            if depth[closing[char]] < 0:
+                return False
+    return not any(depth.values())
+
+
+def _shadows(param_path: str, literal_path: str) -> bool:
+    """Would Express match `param_path` for a request meant for `literal_path`?
+
+    True only for the case that actually bites: same segment count, every
+    literal segment equal, and at least one `:param` standing where the other
+    path has a fixed word — `/items/:id` against `/items/new`.
+    """
+    a = (param_path or "").strip("/").split("/")
+    b = (literal_path or "").strip("/").split("/")
+    if len(a) != len(b) or any(seg.startswith(":") for seg in b):
+        return False
+    saw_param = False
+    for seg_a, seg_b in zip(a, b):
+        if seg_a.startswith(":"):
+            saw_param = True
+        elif seg_a != seg_b:
+            return False
+    return saw_param
 
 
 def _insertion_point(text: str) -> int | None:
@@ -156,6 +297,8 @@ class NodeAdapter:
     entry_file = "server.js"
     template_dir = "views"
     template_ext = ".ejs"
+    # How this stack spells "the id goes here" in a route path.
+    route_param = ":id"
     layout_file = "layout.ejs"
     static_dir = "public"
     theme_file = "public/css/theme.css"
@@ -193,12 +336,37 @@ class NodeAdapter:
         "real SELECT 1 through the project's own connection string, so a "
         "database that does not exist is named instead of surfacing as a "
         "mysterious failed start",
+        "the startup block is an invariant: a rewrite that ends server.js at "
+        "the last handler is repaired, because `node --check` accepts such a "
+        "file and the app then exits without ever listening",
+        "routes are restored from the source they had earlier in the turn, so a "
+        "POST full of domain logic comes back as written rather than being "
+        "reported as lost",
+        "a parameterised route that shadows a literal sibling is moved below it "
+        "— Express matches in registration order, so /items/:id above "
+        "/items/new swallows the create form",
+        "undefined names at runtime are found the way Flask finds them "
+        "(`jsimports.py`, tree-sitter): a `require` that was never written, a "
+        "`req.session` with no session middleware mounted, and a raw form "
+        "password on its way into storage — none of which `node --check` sees",
+        "the JavaScript INSIDE an .ejs view is syntax-checked, not just the "
+        "markup around it: `<%- users.forEach(u => { %>` parses as balanced "
+        "markup and throws at render time",
+        "calls between the project's own modules are checked (jsdeps.py): "
+        "server.js calling something db.js does not export is a startup crash "
+        "no syntax check can see",
+        "views are checked against what their routes actually pass: EJS "
+        "compiles to `with (locals)`, so a free identifier is a render-time "
+        "ReferenceError and a 500 on a page this build wrote",
     )
     gaps = (
-        "no missing-import repair: Flask adds an import a module uses but never "
-        "binds, which is its only AUTO-REPAIRING correctness check. It is built "
-        "on stdlib `ast`; a JS equivalent is its own piece of work and would be "
-        "weaker, so an undefined name here surfaces at runtime",
+        "missing-require repair only binds Node builtins and this project's own "
+        "modules: an undefined npm package (`bcrypt`) is REPORTED, never "
+        "required, because requiring something absent from node_modules turns "
+        "one broken route into an app that will not boot",
+        "no duplicate-definition check: `pyimports.duplicate_definitions` is "
+        "`ast`-based, and a regex guess would report the same function twice "
+        "for every if/else branch",
         "the IMPORT dependency graph stays Python-only: `symbols.py` extracts JS "
         "symbols but does not resolve JS imports, so a change's blast radius "
         "comes from the template graph and the spec's own `reads`, not from "
@@ -377,7 +545,13 @@ class NodeAdapter:
         import shutil
 
         if not shutil.which("node"):
-            return "Node.js is not on PATH — install it to run the generated app"
+            # Named with the download, because this is the one blocker `/run`'s
+            # auto-setup cannot clear for you: installing a runtime needs an
+            # installer, and often an administrator.
+            return (
+                "Node.js is not installed — get it from https://nodejs.org, "
+                "then run this again"
+            )
         if not (Path(root) / "node_modules").is_dir():
             return (
                 "`node_modules` is missing — run `npm install` in the project "
@@ -386,10 +560,252 @@ class NodeAdapter:
         if not self._postgres_listening():
             host, port = self._db_endpoint()
             return (
-                f"nothing is listening on {host}:{port} — start PostgreSQL and "
-                "create the project's database (see db.js)"
+                f"PostgreSQL is not running on {host}:{port} — start it (on "
+                "Windows: Services → postgresql), then run this again. The "
+                "project's database is created for you once it answers"
             )
         return self.database_reason(root)
+
+    def autosetup(self, root: Path, log=None) -> list[str]:
+        """Do the setup this project needs, and return what was really done.
+
+        `readiness` names why the app cannot start. Three of the reasons it names
+        are commands — `npm install`, `createdb`, the seed — and typing them in
+        another terminal, in the right order, is the entire difference between a
+        URL and a wall of instructions for someone who does not use a terminal.
+        This performs exactly those three.
+
+        Five rules, and each one is a failure this would otherwise cause:
+
+        * **It only ever does what `readiness` would have TOLD you to do.**
+          Nothing here is a repair of the generated code, and nothing is done
+          speculatively — `node_modules` is installed because it is absent, the
+          database is created because PostgreSQL said `3D000`.
+        * **A refused login is never answered by creating a database.** Only
+          `3D000` (invalid_catalog_name) reaches `_create_database`; `28P01` is a
+          password this cannot guess, and creating something under a working
+          *other* credential would hide that.
+        * **Uncertainty does nothing.** `_probe_database` returning None means we
+          could not find out — the same "cannot tell" that must never replace the
+          smoke test — so no database is created on a guess.
+        * **What could not be done is not reported as done.** Every line returned
+          describes a step that finished; a failed `npm install` returns its
+          error, and `readiness` then names the same blocker it named before.
+        * **It never installs Node, starts a service, or edits `.env`.** Those
+          need an installer or an administrator. They stay `readiness`'s job.
+
+        ``log`` is called with progress lines for the steps that take real time
+        (an `npm install` on a cold cache is ~30s of silence otherwise).
+        """
+        import shutil
+
+        root = Path(root)
+        done: list[str] = []
+
+        def say(line: str) -> None:
+            if log is not None:
+                try:
+                    log(line)
+                except Exception:  # a progress line must never break setup
+                    logger.debug("autosetup log hook raised", exc_info=True)
+
+        # Nothing below can be fixed without an installer, so do not start.
+        if not shutil.which("node"):
+            return done
+        # Not a scaffolded Node project: no manifest, nothing to install. An
+        # adopted repo with its own tooling is not ours to run npm in.
+        if not (root / "package.json").is_file():
+            return done
+
+        if not (root / "node_modules").is_dir():
+            say("installing dependencies (npm install) — this needs the network, once")
+            ok, note = self._npm_install(root)
+            done.append(note)
+            if not ok:
+                return done
+
+        # A database cannot be created through a server that is not answering,
+        # and starting one is not something this may do.
+        if not self._postgres_listening():
+            return done
+
+        payload = self._probe_database(root)
+        if payload is None or payload.get("ok"):
+            return done
+        if str(payload.get("code") or "") != "3D000":
+            return done
+
+        name = str(payload.get("database") or "")
+        if not _DB_NAME_RE.match(name):
+            return done
+
+        say(f"creating the database {name}")
+        ok, note = self._create_database(root, name)
+        done.append(note)
+        if not ok:
+            return done
+
+        # `seed.js` calls `initDb()` first, so this one command both creates the
+        # tables in the brand-new database and puts demo rows in them. Only after
+        # a database we just created: re-seeding one that already existed would
+        # write rows into someone's data.
+        seeded = self._seed(root, say)
+        if seeded:
+            done.append(seeded)
+        return done
+
+    def _npm_install(self, root: Path) -> tuple[bool, str]:
+        """`npm install` in ``root``. Returns ``(ok, one line about it)``."""
+        import shutil
+        import subprocess
+
+        npm = shutil.which("npm")
+        if npm is None:
+            return False, "npm is not on PATH — install Node.js, which includes it"
+
+        timeout = max(30.0, float(getattr(settings, "npm_install_timeout", 300.0)))
+        try:
+            proc = subprocess.run(
+                [npm, "install"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return False, (
+                f"npm install did not finish within {timeout:.0f}s — run it "
+                "yourself in the project folder and check the network"
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("npm install did not run", exc_info=True)
+            return False, f"npm install could not be started: {e}"
+
+        if proc.returncode != 0:
+            return False, f"npm install failed: {_last_error_line(proc.stderr)}"
+        if not (root / "node_modules").is_dir():
+            # Exit code 0 with nothing installed: report the state on disk, not
+            # the exit code, since the next step depends on the directory.
+            return False, "npm install reported success but node_modules is absent"
+        return True, "installed the project's dependencies (npm install)"
+
+    # `CREATE DATABASE` has to run against a database that already exists, so
+    # this connects to the maintenance database `postgres` on the SAME server,
+    # with the SAME credentials, taken from the project's own `db.js` — the rule
+    # `_probe_database` follows and for its reason: a connection string we
+    # guessed could succeed where the app fails, or fail where the app works.
+    _CREATE_DB_SCRIPT = """
+"use strict";
+function say(o) { console.log("CODER_SETUP " + JSON.stringify(o)); }
+let url = process.env.DATABASE_URL || "";
+try { url = require("./db").DATABASE_URL || url; } catch (e) {}
+if (!url) { say({ ok: false, message: "no connection string" }); process.exit(2); }
+let admin;
+try {
+  const u = new URL(url);
+  u.pathname = "/postgres";
+  admin = u.toString();
+} catch (e) { say({ ok: false, message: "unreadable connection string" }); process.exit(2); }
+let pg;
+try { pg = require("pg"); }
+catch (e) { say({ ok: false, message: "the pg package is not installed" }); process.exit(2); }
+const client = new pg.Client({
+  connectionString: admin,
+  connectionTimeoutMillis: TIMEOUT_MS,
+});
+client
+  .connect()
+  .then(function () { return client.query('CREATE DATABASE "DBNAME"'); })
+  .then(function () { say({ ok: true }); process.exit(0); })
+  .catch(function (e) {
+    // 42P04 = duplicate_database. Something else created it in the meantime,
+    // which is the state we wanted; that is a success, not an error.
+    if (String(e.code || "") === "42P04") { say({ ok: true, existed: true }); process.exit(0); }
+    say({ ok: false, code: String(e.code || ""), message: String(e.message || "").split("\\n")[0] });
+    process.exit(1);
+  });
+"""
+
+    def _create_database(self, root: Path, name: str) -> tuple[bool, str]:
+        """`CREATE DATABASE <name>` through the project's own `pg`.
+
+        ``name`` must already have passed `_DB_NAME_RE` — it is interpolated into
+        SQL, because `CREATE DATABASE` takes no bound parameters.
+        """
+        import json
+        import subprocess
+
+        if not _DB_NAME_RE.match(name):  # pragma: no cover - caller checks first
+            return False, f"refusing to create a database named {name!r}"
+
+        timeout = max(1.0, float(getattr(settings, "db_probe_timeout", 6.0)))
+        script = self._CREATE_DB_SCRIPT.replace(
+            "TIMEOUT_MS", str(int(timeout * 1000))
+        ).replace("DBNAME", name)
+        try:
+            proc = subprocess.run(
+                ["node", "-e", script],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=timeout + 3.0,
+            )
+        except Exception:
+            logger.debug("create-database did not run", exc_info=True)
+            return False, f"could not create the database {name}"
+
+        payload: dict | None = None
+        for line in (proc.stdout or "").splitlines():
+            if line.startswith("CODER_SETUP "):
+                try:
+                    parsed = json.loads(line[len("CODER_SETUP ") :])
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    payload = parsed
+                break
+
+        if payload is None:
+            return False, f"could not create the database {name}"
+        if payload.get("ok"):
+            if payload.get("existed"):
+                return True, f"the database {name} already existed"
+            return True, f"created the database {name}"
+
+        message = str(payload.get("message") or "").strip()
+        detail = f" — {message}" if message else ""
+        return False, f"could not create the database {name}{detail}"
+
+    def _seed(self, root: Path, say) -> str:
+        """Run `node seed.js`, which calls `initDb()` first. Best-effort.
+
+        Returns a line when it did something, "" when it did not. A seed that
+        fails is not a reason to withhold the URL: the app creates its own tables
+        on startup, so the site works — it is just empty, and `readiness` has
+        nothing to say about that.
+        """
+        import subprocess
+
+        command = self.seed_command()
+        if not command or not (root / "seed.js").is_file():
+            return ""
+        say("creating the tables and demo data")
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=max(
+                    5.0, float(getattr(settings, "smoke_test_timeout", 8.0)) * 4
+                ),
+            )
+        except Exception:
+            logger.debug("seed did not run", exc_info=True)
+            return ""
+        if proc.returncode != 0:
+            return f"the demo data could not be loaded: {_last_error_line(proc.stderr)}"
+        return "created the tables and loaded demo data"
 
     def database_reason(self, root: Path) -> str:
         """The `SELECT 1` half of N5: can the app really reach its database?
@@ -723,16 +1139,57 @@ client
         return ok
 
     def write_source_if_valid(self, path: Path, source: str) -> bool:
+        """Write only if the result still PARSES — `node --check`, not a guess.
+
+        This is the gate every deterministic pass leans on, and until it ran
+        `node --check` it was the Flask guarantee's shadow rather than its
+        equal: `_write_python_if_valid` compiles the Python it is about to
+        write, so a hand-written repair that breaks `app.py` is refused, while
+        here only a content guard ran ("is this HTML in a .js file?") and a
+        repair that broke `server.js` shipped.
+
+        Measured: `reinstate_routes` put back four handlers captured from a
+        version of the file where they were nested inside a callback, the
+        re-inserted text carried one closing brace too many, and the finished
+        build died with `SyntaxError: Unexpected token '}'`. Everything
+        downstream was green, because nothing between that pass and the user
+        ever parsed the file.
+
+        The check needs a path, so it writes first and RESTORES the previous
+        contents when the result does not parse — the same net `_intent_repair`
+        casts, one stack over. With `node` absent it degrades to the old content
+        guard rather than blocking the write, because a check that cannot run
+        must not become a refusal to work.
+        """
         path = Path(path)
         if not self.source_is_valid(path.name, source):
             logger.warning("declined to write invalid source to %s", path.name)
             return False
         try:
+            before = (
+                path.read_text(encoding="utf-8", errors="replace")
+                if path.is_file()
+                else None
+            )
             path.write_text(source, encoding="utf-8", newline="\n")
-            return True
         except Exception:
             logger.warning("could not write %s", path.name, exc_info=True)
             return False
+
+        if shutil.which("node") is None:
+            return True  # cannot tell; the ordinary write path still checks it
+        ok, error = check_file(path)
+        if ok:
+            return True
+        logger.warning("reverted %s — the rewrite broke it: %s", path.name, error)
+        try:
+            if before is None:
+                path.unlink()
+            else:
+                path.write_text(before, encoding="utf-8", newline="\n")
+        except Exception:
+            logger.warning("could not revert %s", path.name, exc_info=True)
+        return False
 
     def restore_entry_route(self, source: str) -> tuple[str, bool]:
         """Put the `/` route back into server.js when generation removed it.
@@ -754,6 +1211,314 @@ client
         if cut is None:
             return source, False  # can't place it safely
         return text[:cut].rstrip("\n") + "\n" + _INDEX_ROUTE_SNIPPET + text[cut:], True
+
+    def restore_boot_block(self, source: str) -> tuple[str, bool]:
+        """Put back the tail that makes server.js an app rather than a list of
+        handlers: the 404 handler, the error handler, `db.initDb()` and
+        `app.listen()`.
+
+        Measured on the OpenBazaar PRD build: `_wire_missing_endpoints` was
+        asked to add ONE route, and its rewrite ended the file at the last
+        handler — no `initDb`, no `listen`, no exports. Every guard passed.
+        `node --check` passes, because a file of handler registrations is
+        perfectly valid JavaScript; `restore_entry_route` declined, because
+        `_insertion_point` anchors on the very lines that had been deleted; and
+        the smoke test was skipped for want of `node_modules`. So the build
+        reported "verified OK" on an app that cannot start at all.
+
+        That is why this is checked separately from the routes: without
+        `app.listen`, nothing else about the file matters, and it is the one
+        defect the existing invariants were structurally unable to see. Restored
+        piece by piece, so a file that kept its 404 handler but lost `listen`
+        gets only what is missing.
+        """
+        text = source or ""
+        if not _ANY_ROUTE_RE.search(text):
+            return source, False  # not a route file — nothing to reason about
+        additions: list[str] = []
+        if not _TERMINAL_USE_RE.search(text):
+            additions.append(_NOT_FOUND_SNIPPET)
+        if not _LISTEN_RE.search(text):
+            additions.append(
+                _LISTEN_SNIPPET
+                if _DB_REQUIRE_RE.search(text)
+                else _LISTEN_SNIPPET_NO_DB
+            )
+        if not _EXPORTS_RE.search(text):
+            additions.append(_EXPORTS_SNIPPET)
+        if not additions:
+            return source, False
+        return text.rstrip("\n") + "\n" + "".join(additions), True
+
+    def sql_literals(self, source: str) -> list[str]:
+        """Where SQL may legitimately live in a `.js` file: string literals.
+
+        `crud_node.js_strings` separates literals from comments in one walk,
+        which is the only order that can tell `"postgres://host/db"` apart from
+        a `//` comment. The Python default falls back to the whole raw file for
+        anything `ast` cannot parse — i.e. every JavaScript file — and then
+        reads the prose in the comments as SQL.
+        """
+        return js_strings(source)
+
+    def render_locals(self, entry_source: str) -> dict[str, set[str]]:
+        """Per view stem, the names its routes pass to `res.render`."""
+        return render_locals(entry_source)
+
+    def repair_view_locals(
+        self, text: str, provided: set[str]
+    ) -> tuple[str, list[str], list[str]]:
+        """Blank undefined `ui.*()` arguments; report every other free name.
+
+        EJS compiles to `with (locals)`, so a name the route did not pass is a
+        ReferenceError at render time. Measured: every listing page of the
+        OpenBazaar build answered 500 on `empty_state is not defined`, and no
+        static check could see it.
+        """
+        return repair_view_locals(text, provided)
+
+    def repair_module_calls(self, source: str, root: Path) -> tuple[str, list[str]]:
+        """Point the startup call back at the function `db.js` really exports.
+
+        The measured failure: generation rewrote server.js's tail as
+        `db.setup().then(…)`, and `db.js` exports `initDb`. `node --check`
+        accepts it, every route is found, `app.listen(` is present so the
+        boot-block invariant holds — and the app dies on startup with
+        `db.setup is not a function`.
+        """
+        db_file = Path(root) / "db.js"
+        if not db_file.is_file():
+            return source, []
+        try:
+            db_source = db_file.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return source, []
+        return fix_db_bootstrap(source, db_source)
+
+    def repair_runtime_names(
+        self, filename: str, source: str, root: Path
+    ) -> tuple[str, list[str], list[str]]:
+        """The Flask import/password checks, for JavaScript (`jsimports.py`).
+
+        This was the widest of the Node stack's gaps and it was invisible in the
+        worst way: `node --check` passes a file full of undefined names, so the
+        build reported `verified OK` and the app threw at runtime. Measured on a
+        live build — `server.js` called `bcrypt.compareSync(...)` with `bcrypt`
+        never required, assigned `req.session.userId` with no session middleware
+        mounted, and stored the raw `password_hash` form field while the
+        project's own generated `passwords.js` sat unused. Three defects, one
+        file, nothing in the pipeline able to see any of them.
+
+        Only requires from the allowlist are WRITTEN (a Node builtin, or a
+        sibling module that really exports the name). A package this project may
+        not have installed is reported, because `require("bcrypt")` against an
+        absent package turns one broken route into an app that will not boot.
+        """
+        if Path(filename).suffix.lower() not in (".js", ".mjs", ".cjs"):
+            return source, [], []
+
+        fixed, added, unresolved = add_missing_requires(source, Path(root))
+
+        reports: list[str] = []
+        if unresolved:
+            reports.append(
+                "uses undefined name(s) at runtime — "
+                + ", ".join(unresolved[:6])
+                + " (require them, or remove the code that uses them)"
+            )
+        try:
+            leaks = plaintext_password_writes(fixed, set(unresolved))
+        except Exception:
+            logger.debug("password check failed for %s", filename, exc_info=True)
+            leaks = []
+        if leaks:
+            reports.append(
+                "stores a password without hashing it — "
+                + "; ".join(leaks[:3])
+                + " (use hashPassword from ./passwords)"
+            )
+        try:
+            reports.extend(middleware_gaps(fixed))
+        except Exception:
+            logger.debug("middleware check failed for %s", filename, exc_info=True)
+        return fixed, added, reports
+
+    def shadowed_routes(self, source: str) -> list[tuple[str, str, str]]:
+        """`(method, param_path, literal_path)` for every route pair where the
+        parameterised one is registered FIRST and therefore wins.
+
+        Read straight off `routes_from_source`, which is the robust
+        order-preserving reader, rather than off `route_blocks` — the point is
+        that this question must still be answerable on a file whose shape
+        `route_blocks` declines to slice. That distinction is not academic: on a
+        measured build the routes were nested inside a callback, the block
+        slicer correctly gave up, and `order_routes` then reported *nothing* —
+        so `/bids/new` went on being served by `/bids/:id` and answered 500 with
+        no complaint anywhere. Silence is the failure mode this whole file
+        exists to remove.
+        """
+        seen: list[tuple[str, str]] = [
+            (method.upper(), path)
+            for method, path, _v, _t in self.routes_from_source(source or "")
+        ]
+        out: list[tuple[str, str, str]] = []
+        for index, (method, path) in enumerate(seen):
+            if ":" not in path:
+                continue
+            for later_method, later_path in seen[index + 1 :]:
+                if later_method == method and _shadows(path, later_path):
+                    out.append((method, path, later_path))
+        return out
+
+    def order_routes(self, source: str) -> tuple[str, list[str], list[str]]:
+        """Move `/items/new` above `/items/:id` when a rewrite put it below.
+
+        Express matches middleware in registration order, so a parameterised
+        route registered first swallows every literal sibling: `GET /items/:id`
+        above `GET /items/new` turns the create form into a lookup for an item
+        whose id is the string "new" — a 404 or a 500 on a page the same build
+        wrote, with nothing anywhere reporting a defect.
+
+        Order is not something a route-adding pass can be trusted to preserve:
+        `reinstate_routes` and `restore_routes` both insert at the bottom of the
+        route section, which is exactly the wrong end. So it is asserted on the
+        finished file instead.
+
+        Only reorders blocks that COLLIDE — same method, same prefix, one
+        literal and one parameterised. Everything else keeps the order it was
+        written in, because route order carries meaning this cannot see.
+        """
+        text = source or ""
+        collisions = self.shadowed_routes(text)
+        if not collisions:
+            return source, [], []
+        shadowing = {(method, path) for method, path, _lit in collisions}
+
+        spans = self._route_spans(text)
+        if len(spans) < 2 or not shadowing <= {(m, p) for m, p, _s, _e in spans}:
+            # The collision is real but this file's shape cannot be sliced —
+            # routes nested inside a callback, most often. SAY SO. Returning
+            # `[]` here is indistinguishable from "nothing was wrong", and the
+            # page the parameterised route is swallowing goes on 500ing.
+            return (
+                source,
+                [],
+                [
+                    f" {method} {literal} is registered BELOW "
+                    f"{method} {param}, which matches it first — Express matches in "
+                    "registration order, so that page is unreachable. Move it above "
+                    "by hand (its routes are nested, so this could not be done "
+                    "safely here)."
+                    for method, param, literal in collisions
+                ],
+            )
+
+        start, end = spans[0][2], spans[-1][3]
+        # A stable sort by one bit: a route that shadows a literal sibling goes
+        # to the BOTTOM of the route section, everything else keeps the order it
+        # was written in. Deliberately not a full sort — route order carries
+        # meaning this cannot see, so it moves only what is provably wrong.
+        ordered = sorted(spans, key=lambda s: (s[0], s[1]) in shadowing)
+        if ordered == spans:
+            return source, [], []
+        body = "\n\n".join(text[s[2] : s[3]].strip("\n") for s in ordered)
+        moved = sorted(f"{m} {p}" for m, p in shadowing)
+        return text[:start] + body + "\n" + text[end:], moved, []
+
+    def _route_spans(self, text: str) -> list[tuple[str, str, int, int]]:
+        """`(method, path, start, end)` per route, in the order they appear."""
+        blocks = self.route_blocks(text)
+        spans: list[tuple[str, str, int, int]] = []
+        at = 0
+        for (method, path), block in sorted(
+            blocks.items(), key=lambda kv: text.find(kv[1])
+        ):
+            found = text.find(block, at)
+            if found < 0:
+                return []  # a block we cannot locate — decline rather than guess
+            spans.append((method, path, found, found + len(block)))
+            at = found
+        return spans
+
+    def route_blocks(self, source: str) -> dict[tuple[str, str], str]:
+        """`(METHOD, path) -> the exact source of that route's handler.
+
+        Not a parse: the block runs from the start of the line the `app.get(`
+        call sits on (plus any comment lines directly above it, which is where
+        the handler's own explanation lives) to the start of the next route, or
+        to the first terminal handler — never past it, or the last route would
+        swallow the 404 handler and `app.listen`.
+
+        **Declines outright when the routes are not at the top level.** If the
+        terminal boundary sits ABOVE the first route, the model has wrapped the
+        routes inside something — measured: `db.initDb().then(() => { …routes…
+        })`, which puts `db.initDb(` on line 1 of the region. The slices are
+        then meaningless, and the last one runs to end-of-file and swallows the
+        wrapper's own closing `});`. Reinstating that block later wrote one
+        brace too many and the finished build would not parse. A shape this
+        cannot read must produce no blocks rather than wrong ones.
+        """
+        text = source or ""
+        matches = list(_ROUTE_RE.finditer(text))
+        if not matches:
+            return {}
+        floor = _insertion_point(text)
+        if floor is not None and floor <= matches[0].start():
+            return {}
+        limit = floor if floor is not None else len(text)
+        out: dict[tuple[str, str], str] = {}
+        for i, match in enumerate(matches):
+            start = text.rfind("\n", 0, match.start()) + 1
+            # Walk back over comment lines that belong to this handler.
+            while start > 0:
+                prev_start = text.rfind("\n", 0, start - 1) + 1
+                line = text[prev_start : start - 1].strip()
+                if not line.startswith("//"):
+                    break
+                start = prev_start
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            if end > limit >= start:
+                end = limit
+            if end <= start:
+                continue
+            block = text[start:end].strip("\n") + "\n"
+            # A block whose brackets do not balance is a slice through the
+            # middle of something, not a handler. Re-inserting it elsewhere can
+            # only produce a file that will not parse.
+            if not _brackets_balance(block):
+                continue
+            key = (match.group("method").upper(), match.group("path"))
+            out.setdefault(key, block)
+        return out
+
+    def reinstate_routes(
+        self, source: str, blocks: dict[tuple[str, str], str]
+    ) -> tuple[str, list[str]]:
+        """Put back, verbatim, routes that were in this file earlier in the turn.
+
+        `restore_routes` can only rebuild a GET whose whole body is a
+        `res.render`, because anything else would be generation. This is the
+        other half and the commoner one: the handler's real source is still in
+        hand from minutes ago, so a POST with domain logic in it comes back
+        exactly as written rather than being reported as lost.
+        """
+        text = source or ""
+        cut = _insertion_point(text)
+        if cut is None or not blocks:
+            return source, []
+        live = {(m, p) for m, p, _v, _t in self.routes_from_source(text)}
+        chunks, restored = [], []
+        for (method, path), block in blocks.items():
+            if (method, path) in live:
+                continue
+            chunks.append("\n" + block)
+            restored.append(f"{method} {path}")
+        if not chunks:
+            return source, []
+        return (
+            text[:cut].rstrip("\n") + "\n" + "".join(chunks) + "\n" + text[cut:],
+            sorted(restored),
+        )
 
     def restore_routes(self, source: str, missing) -> tuple[str, list[str]]:
         """Re-add GET routes an amendment deleted, as Express handlers.
@@ -908,6 +1673,76 @@ client
             "`var(--font-heading)`, …). Never write a hex code or a font family "
             "into a view or a new stylesheet: a value that isn't a variable is "
             "the one thing a restyle cannot reach."
+        )
+
+    def schema_types(self) -> str:
+        """The column types the SCHEMA call may use on this stack.
+
+        PostgreSQL has a real boolean and a real timestamp, so this stack says
+        so. `TIMESTAMP` is emitted as `TIMESTAMPTZ` and `TEXT` primary keys are
+        generated by the database (`gen_random_uuid()`), which is what lets a
+        PRD's `UUID PRIMARY KEY` survive as something the app can actually
+        insert into.
+        """
+        return (
+            "## Column types — use only these\n"
+            "`INTEGER`, `TEXT`, `REAL`, `BLOB`, `NUMERIC`, `BOOLEAN`, "
+            "`TIMESTAMP`.\n\n"
+            "Storage is PostgreSQL. A yes/no is `BOOLEAN` and a point in time "
+            "is `TIMESTAMP` (written as `TIMESTAMPTZ`) — do NOT flatten either "
+            "into `INTEGER` or `TEXT`, or the app cannot compare them. Money is "
+            "`NUMERIC`. The primary key of every table is either "
+            '`{"name": "id", "type": "INTEGER", "pk": true}` '
+            '(autoincrement) or `{"name": "id", "type": "TEXT", '
+            '"pk": true}` (a generated UUID); use TEXT when the document asks '
+            "for UUID keys. Either way the database fills it in."
+        )
+
+    def blueprint_layout(self) -> str:
+        """The filenames the PLANNING call must use on this stack.
+
+        Until this existed the planning prompt named the Flask layout and
+        nothing else, so an Express build was planned as `app.py` +
+        `templates/*.html`. `derive_pages_from_entities` then wrote the real
+        `views/*.ejs` beside those, and the two sets disagreed — the model's own
+        pages were planned at paths this stack never renders.
+        """
+        return (
+            "## File layout — use these names and no others\n"
+            "| File | Holds |\n"
+            "| --- | --- |\n"
+            "| `server.js` | routes only — one `app.get`/`app.post` per URL, no "
+            "SQL |\n"
+            "| `db.js` | the `pg` pool, `initDb()`, `ensureColumn()` |\n"
+            "| `models.js` | one query helper per operation, `$1, $2` parameters "
+            "only |\n"
+            "| `seed.js` | a few demo rows per table |\n"
+            "| `views/layout.ejs` | the nav and page shell — the ONLY place nav "
+            "exists |\n"
+            '| `views/index.ejs` | the home page — `"action": "edit"`, it '
+            "already exists |\n"
+            "| `views/<page>.ejs` | one per page, a FRAGMENT the layout wraps |\n"
+            "| `public/css/style.css` | the one stylesheet |\n"
+            "| `public/js/app.js` | optional enhancement only |\n\n"
+            "Rules that follow from it:\n"
+            "- A view is a fragment: never `<html>`, `<head>` or its own `<nav>`. "
+            "`express-ejs-layouts` wraps every `res.render()` in "
+            "`views/layout.ejs`.\n"
+            '- Express renders a view by its STEM: `res.render("items")` for '
+            "`views/items.ejs`. A link names a PATH (`/items/new`), never a view "
+            "name.\n"
+            '- Prefer a real `<form method="post" action="/route">` over '
+            "`fetch()`. It works with JavaScript disabled, which is what makes "
+            '"the button does nothing" impossible rather than merely unlikely.\n'
+            "- Routes call helpers in `models.js`; they never write SQL inline. "
+            "Handlers are `async` and `await` those helpers.\n"
+            "- Do NOT plan `package.json`, `Procfile`, `ui.js` or `.gitignore` — "
+            "they are already written for you.\n"
+            "- **Plan the home page.** `views/index.ejs` exists but holds "
+            'placeholder text, so give it `"action": "edit"` and an instruction '
+            "describing what this site's front door shows and which pages it "
+            "links to. A build that leaves it alone ships a site whose first "
+            "page says it was scaffolded."
         )
 
     def scaffold_context(self, written) -> str:

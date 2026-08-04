@@ -15,7 +15,7 @@ The default is the Python standard library — `http.server`/`wsgiref` + stdlib
 turning "offline" from a limitation into the feature's grounding principle.
 
 **`prefer` forces a stack, and a forced stack is never silently downgraded**
-(`settings.web_stack`, default `"flask"` — Phase A of
+(`settings.web_stack`, default `"node"` since 2026-08-04 — Phase A of
 `docs/always-fullstack-plan.md`). Probing is the right default for a generic
 agent; it is the wrong one for a tool that promises "every website is built on
 Flask/Jinja/SQLite", because the promise then quietly depends on what happens to

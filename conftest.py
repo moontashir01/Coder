@@ -37,6 +37,29 @@ def _no_intent_check(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _flask_stack(monkeypatch):
+    """Pin the session stack to Flask in tests — the same shape as `_no_blueprint`.
+
+    `settings.web_stack` ships as **"node"** (2026-08-04). Most of this suite is
+    about Flask behaviour and builds its fixtures accordingly — `templates/`,
+    `app.py`, `{% extends %}`, `url_for` — while reading the stack off the
+    SETTING, because until now the setting agreed. Flipping the default made 20
+    of them fail against a Node adapter that correctly looks for `views/` and
+    `server.js`: the code was right and the fixtures were Flask.
+
+    So tests pin Flask and a Node test opts in (`tests/test_stacks.py`,
+    `tests/test_crud_node.py`, `tests/test_evals.py` already do, explicitly).
+
+    **The cost is that this suite no longer exercises the shipped default**, and
+    a fixture that hides the default is exactly the "a check that never runs
+    reads like a check that passes" trap. `test_stacks.py::
+    test_the_shipped_default_stack_is_node` asserts the real value against the
+    settings class, so the default itself stays pinned somewhere loud.
+    """
+    monkeypatch.setattr(settings, "web_stack", "flask")
+
+
+@pytest.fixture(autouse=True)
 def _no_blueprint(monkeypatch):
     """Default the blueprint stage OFF in tests — same reason as `_no_intent_check`.
 

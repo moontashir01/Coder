@@ -73,8 +73,17 @@ def _pk(entity: Entity) -> Field | None:
 
 
 def _writable(entity: Entity) -> list[Field]:
-    """Fields a caller supplies — everything except an autoincrement key."""
-    return [f for f in entity.fields if not (f.pk and f.type == "INTEGER")]
+    """Fields a caller supplies — everything the DATABASE does not fill in.
+
+    Asked of the dialect rather than tested as `pk and type == "INTEGER"`, which
+    is what it used to be. On PostgreSQL a TEXT primary key is generated too
+    (`gen_random_uuid()`), and treating it as writable put the id first in every
+    insert helper — so the route generated beside it read `const id = await
+    models.createUser(id, …)` and threw a ReferenceError before it ever reached
+    the database. Measured on the OpenBazaar PRD build, whose five tables all
+    have UUID keys, i.e. every create form on the site.
+    """
+    return [f for f in entity.fields if not POSTGRES.generates_pk(f.type, f.pk)]
 
 
 def _sample(field: Field, index: int) -> str:
@@ -89,8 +98,27 @@ def _sample(field: Field, index: int) -> str:
         return '""'  # no file on disk yet; the view falls back
     if field.type == "INTEGER":
         return str(index)
-    if field.type == "REAL":
+    if field.type in ("REAL", "NUMERIC"):
+        # NUMERIC is NOT a fall-through to the string default. SQLite has type
+        # AFFINITY, so `INSERT INTO users (cod_reliability_score) VALUES
+        # ('Demo cod_reliability_score 1')` is accepted there and the bug is
+        # invisible; PostgreSQL maps the column to NUMERIC and refuses outright
+        # with `invalid input syntax for type numeric`, taking the whole seed
+        # with it. Measured on the first real-PostgreSQL run of a generated
+        # project (2026-08-04) — the exact class of defect that only a live
+        # database can show, which is why that run was worth doing.
         return f"{9.99 + index:.2f}"
+    if field.type == "BOOLEAN":
+        # A real PostgreSQL boolean, so the string default would be rejected the
+        # same way NUMERIC's was. Kept in step with `crud._sample`, which emits
+        # `1` because SQLite spells this column INTEGER.
+        return "true"
+    if field.type == "TIMESTAMP":
+        # TIMESTAMPTZ on PostgreSQL: a bare "2026-01-01" parses, but a full
+        # ISO instant is what every comparison in a generated app comes to.
+        return '"2026-01-01T00:00:00Z"'
+    if field.type == "BLOB":
+        return "null"  # BYTEA on PostgreSQL; a text literal is not a valid one
     if "email" in name:
         return f'"demo{index}@example.com"'
     if "url" in name or "link" in name:
@@ -110,6 +138,23 @@ def _sample(field: Field, index: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Columns for which an empty string is not a value. An unfilled optional form
+# field arrives as `""`, and PostgreSQL refuses it outright:
+#
+#     invalid input syntax for type integer: ""
+#
+# SQLite's type AFFINITY accepts it and stores the empty string in an INTEGER
+# column, so the Flask stack has the same defect and merely hides it — the
+# `_sample` lesson again, and `crud._bind` is its other half.
+_NOT_BLANKABLE = frozenset({"TEXT", "BLOB"})
+
+
+def _bind(field: Field) -> str:
+    """The argument expression an INSERT/UPDATE binds for ``field``."""
+    arg = _camel(field.name)
+    return arg if field.type in _NOT_BLANKABLE else f"nullIfBlank({arg})"
+
+
 def entity_helpers(entity: Entity) -> str:
     """`list / get / create / update / delete` for one entity, as async functions."""
     pk = _pk(entity)
@@ -118,6 +163,7 @@ def entity_helpers(entity: Entity) -> str:
     cols = ", ".join(f.name for f in writable)
     marks = POSTGRES.placeholders(len(writable))
     args = ", ".join(_camel(f.name) for f in writable)
+    binds = ", ".join(_bind(f) for f in writable)
 
     order = f" ORDER BY {pk.name} DESC" if pk else ""
     parts = [
@@ -152,7 +198,7 @@ def entity_helpers(entity: Entity) -> str:
             f"async function create{_pascal(name)}({args}) {{\n"
             f"  const {{ rows }} = await getPool().query(\n"
             f'    "INSERT INTO {table} ({cols}) VALUES ({marks}){returning}",\n'
-            f"    [{args}]\n"
+            f"    [{binds}]\n"
             f"  );\n" + result + "}\n"
         )
 
@@ -167,13 +213,14 @@ def entity_helpers(entity: Entity) -> str:
         )
         key_mark = POSTGRES.placeholder(len(updatable) + 1)
         update_args = ", ".join(_camel(f.name) for f in updatable)
+        update_binds = ", ".join(_bind(f) for f in updatable)
         pk_arg = _camel(pk.name)
         parts.append(
             f"/** Overwrite one {name}. */\n"
             f"async function update{_pascal(name)}({pk_arg}, {update_args}) {{\n"
             f"  await getPool().query(\n"
             f'    "UPDATE {table} SET {assignments} WHERE {pk.name} = {key_mark}",\n'
-            f"    [{update_args}, {pk_arg}]\n"
+            f"    [{update_binds}, {pk_arg}]\n"
             f"  );\n"
             f"}}\n"
         )
@@ -301,6 +348,21 @@ def models_source(spec: ProjectSpec) -> str:
     )
     if needs_hash:
         header += 'const { hashPassword } = require("./passwords");\n'
+    header += (
+        "\n/**\n"
+        ' * An unfilled optional form field arrives as `""`, and PostgreSQL\n'
+        " * refuses it for anything that is not text:\n"
+        " *\n"
+        ' *     invalid input syntax for type integer: ""\n'
+        " *\n"
+        " * The column means `NULL` there, so say so. Applied to every non-text\n"
+        " * bind below, never to a TEXT one — an empty string IS a valid value\n"
+        " * for a text column, and turning it into NULL would lose it.\n"
+        " */\n"
+        "function nullIfBlank(value) {\n"
+        '  return value === "" || value === undefined ? null : value;\n'
+        "}\n"
+    )
 
     bodies = [entity_helpers(e) for e in spec.entities if e.fields]
     names: list[str] = []

@@ -161,10 +161,9 @@ class Settings(BaseSettings):
     expand_requirements: bool = True
     # Which backend stack a build targets (docs/always-fullstack-plan.md Phase A).
     # "flask" | "node" | "fastapi" | "stdlib" | "none" force that stack; "auto"
-    # restores the old probe-and-pick behaviour. Default "flask" because the whole
-    # full-stack direction promises Flask + Jinja2 + sqlite3 — leaving it on
-    # "auto" made the promise depend on Flask happening to be importable, which
-    # it is here only because Coder's own environment installs it.
+    # restores the old probe-and-pick behaviour. Leaving it on "auto" made the
+    # full-stack promise depend on a framework happening to be importable, which
+    # is why it is a forced name and not a probe.
     # A forced stack that ISN'T installed is reported (Stack.runnable=False +
     # install_hint), never swapped for another one — see runtime_probe.py.
     # **This is a SESSION DEFAULT, and it loses to a project that remembers its
@@ -172,9 +171,20 @@ class Settings(BaseSettings):
     # first would send an amendment to a Node project down the Flask path, which
     # writes Python `ensure_column` calls into a db.py that does not exist.
     # `/stack` shows and switches it, and says so when a project overrides it.
-    # "node" is Express + EJS + PostgreSQL and is shallower than Flask on
-    # purpose — `/stack` prints each stack's gaps.
-    web_stack: str = "flask"
+    #
+    # Default "node" (Express + EJS + PostgreSQL) since 2026-08-04, by request.
+    # **It is the SHALLOWER of the two stacks and that has not changed** — the
+    # real, current gaps are in `NodeAdapter.gaps` and `/stack` prints them
+    # verbatim: no import repair, no template-scoped editing, an import
+    # dependency graph that stays Python-only, and routes read by regex rather
+    # than by a parser. Two environment facts come with it, both of which the
+    # Flask default did not have: a generated project cannot RUN until
+    # `npm install` has used the network once (Coder will not do that for you),
+    # and it needs a live PostgreSQL whose database exists — `NodeAdapter.
+    # database_reason` names that with the `createdb` command instead of letting
+    # it arrive as a failed smoke test. Set `WEB_STACK=flask` in `.env`, or run
+    # `/stack flask`, to go back.
+    web_stack: str = "node"
     # Phase C: spend ONE extra temperature-0 call deciding what the app STORES
     # before planning what it looks like, so the layout is derived from a schema
     # rather than invented alongside it (app/resources/prompts/schema.md). Every
@@ -182,6 +192,22 @@ class Settings(BaseSettings):
     # deterministically (blueprint.derive_pages_from_entities). Off = the schema
     # arrives as free text inside the blueprint's own answer, exactly as before.
     schema_first: bool = True
+    # A `@`-referenced prose document (`.md`/`.txt`/`.rst`/…) on a BUILD request
+    # is a requirements document, not a file to edit: "build the site described
+    # in @PRD.md". Before this, the blueprint stages saw only the one-line
+    # request — the schema call, the layout call and every per-file generation
+    # were planned from "build the website described in PRD.md" and the document
+    # itself was read, then dropped. This is the budget for how much of it is
+    # quoted into those calls; what does not fit is reported as truncated, never
+    # silently cut. 0 disables the whole feature (the pre-Phase-R behaviour).
+    max_spec_doc_chars: int = 16000
+    # ...and the tighter budget for threading it into EVERY per-file generation,
+    # where it sits on top of the contract, the scaffold block, the UI block, the
+    # plan manifest and the siblings. An overflowing prompt evicts the siblings,
+    # which is `_sibling_context`'s "every page has a different navbar" bug
+    # arriving by a new road — and the contract those pages need was already
+    # derived from this document by the planning stages.
+    max_spec_doc_context_chars: int = 4000
     # Phase B: when should_blueprint()'s verb×noun regex MISSES, ask the model
     # the one thing a noun list cannot know — "is this a request to build a web
     # app?" — so "a recipe organizer" or "somewhere to track my expenses" stops
@@ -202,6 +228,18 @@ class Settings(BaseSettings):
     # what it drops (`may not meet:`), per the "never claim a pass you didn't
     # get" rule: a cap that reports is a budget, a cap that hides is a bug.
     blueprint_max_files: int = 24
+    # After coverage, make ONE edit to the entry file adding the routes the
+    # build's own contract and its own pages need but that generation did not
+    # write. The blueprint plans 11 routes and the model's single surgical edit
+    # to `app.py` lands 6 of them, so the pages the same build wrote 500 on
+    # `url_for('new_category')` — measured, every live build. Coverage already
+    # computes exactly what is missing and REPORTED it; this acts on that list.
+    # One attempt, never a loop: repeatedly rewriting the file the whole app
+    # depends on is how a working build gets churned into a broken one. The
+    # edit is reverted if it breaks the file, and whatever is still missing
+    # afterwards is reported rather than claimed. False = report only, which is
+    # exactly the behaviour before this existed.
+    wire_missing_endpoints: bool = True
     # After a blueprint build, verify the WHOLE request shipped (weaknesses.md #3):
     # every planned file exists (create the missing ones) and every declared
     # endpoint is defined in a backend file (reported if not). Inert unless a
@@ -230,6 +268,42 @@ class Settings(BaseSettings):
     # and the smoke test RUNS, because a check we could not complete must never
     # gate the real measurement. Flask never reaches this (sqlite has no daemon).
     db_probe_timeout: float = 6.0
+    # This machine's PostgreSQL server, WITHOUT a database name — the scaffold
+    # appends the project's own slug. Every generated project on the Node stack
+    # ships with it as the default connection string, so the credentials are
+    # stated once here rather than retyped into each project. Override per
+    # machine in `.env` (POSTGRES_SERVER=…) or per deployment with the
+    # DATABASE_URL environment variable, which the generated `db.js` reads
+    # first. The old hard-coded `postgres://postgres:postgres@localhost:5432`
+    # was nobody's real server, so a first run failed on authentication before
+    # it could fail on anything worth reading.
+    postgres_server: str = "postgres://postgres:admin@localhost:5432"
+    # `/run` does the setup a generated project needs before it can start,
+    # instead of printing the commands and leaving them to the person watching.
+    # On Flask there is nothing to do; on Node it is `npm install`, `CREATE
+    # DATABASE` and the seed — three commands that have to be typed in another
+    # terminal, in the right order, before a single page can be opened.
+    #
+    # This is the second deliberate exception to the offline rule, after
+    # Playwright's Chromium download, and it is the only one that ships ON. The
+    # reason they differ: a missing browser costs an optional CHECK, while
+    # missing `node_modules` means the app cannot run at all, so the network is
+    # not an enhancement here — it is the difference between a URL and a wall of
+    # instructions. Nothing about the BUILD reaches the network either way.
+    #
+    # What it will never do: install Node, start a PostgreSQL service, or guess
+    # a password. Those need an installer or an administrator, so they stay
+    # reported (`readiness`) rather than attempted. And it only creates a
+    # database when PostgreSQL said `3D000` — a refused login is never answered
+    # by creating something.
+    #
+    # `AUTO_SETUP=false` in `.env` restores the previous behaviour exactly:
+    # `/run` names what is missing and changes nothing.
+    auto_setup: bool = True
+    # `npm install` on a cold cache fetches express, ejs and pg. Bounded because
+    # a hung registry connection would otherwise hold the REPL open with no
+    # output; on timeout the step is REPORTED as failed, never as done.
+    npm_install_timeout: float = 300.0
     # Phase W4 (docs/web-quality-plan.md): render generated pages in a real
     # headless browser, so layout, CSS and JS can be observed at all — every
     # check before this one reads bytes (`smoke.py` is urllib), which is why a

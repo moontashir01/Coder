@@ -21,9 +21,7 @@
 
 const { Pool } = require("pg");
 
-const DATABASE_URL =
-  process.env.DATABASE_URL ||
-  "postgres://postgres:postgres@localhost:5432/{{PROJECT_SLUG}}";
+const DATABASE_URL = process.env.DATABASE_URL || "{{DATABASE_URL}}";
 
 let pool = null;
 

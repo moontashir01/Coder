@@ -2,6 +2,76 @@
 
 **Written:** 2026-08-04. Read this first, then `docs/node-stack-plan.md`.
 
+## The Node stack has now been RUN, and running it found six things
+
+A generated Express app was built from a real 12.5 KB PRD, installed, seeded and
+served against a live PostgreSQL 18, and every page was requested. That is the
+first time the Node stack has been exercised end to end, and it is where all six
+of the following came from — **none of them was visible to any check that reads
+bytes**, and every one of them shipped inside a build whose answer said
+"verified OK":
+
+1. `server.js` truncated at the last handler — no `initDb`, no `listen`, no 404
+   handler. The app could not start. `node --check` passes on a file of route
+   registrations, and `restore_entry_route` anchors on the lines that had been
+   deleted, so it declined without saying anything.
+2. Two routes deleted by `_wire_missing_endpoints`, which had been asked to ADD
+   one. The loss was reported and not acted on.
+3. `db.setup()` against a `db.js` exporting `initDb` — the cross-module check
+   was Python-only and returned `[]`.
+4. Every listing page 500 on `empty_state is not defined`: EJS compiles to
+   `with (locals)`, so a free identifier is a render-time ReferenceError.
+5. Every create form a `ReferenceError` before the database: a canonical TEXT
+   primary key had no default, so `id` was the insert helper's first argument.
+6. One empty optional form field killed the process — PostgreSQL refuses `""`
+   for an integer, and Express 4 does not forward a rejected `async` handler.
+
+**The durable lesson is the one this file already states, arriving through a
+sixth door: a check that cannot run reads exactly like a check that passed.**
+Three of the six were *guarded* — by `restore_entry_route`, by the coverage
+report, by `_check_cross_module_calls` — and each guard declined silently on the
+one input that mattered. When you add a check, test what it does on the input it
+is meant to catch, not only on the input it is meant to pass.
+
+All six are fixed, with regression tests in `tests/test_entry_repair.py`,
+`tests/test_jsdeps.py`, `tests/test_ejslocals.py` and additions to
+`tests/test_crud_node.py`. Each new repair has a test asserting `core` CALLS it,
+and in the order that makes it work — the boot block before the routes (a
+restored route needs the 404 handler to be placed relative to), the ordering
+pass after both restores (they insert at the wrong end), and the view check last
+(it reads `res.render` out of the finished entry file).
+
+**Still unmeasured, and must not be reported otherwise:** the app was proven on a
+throwaway cluster, so nothing here says anything about a particular machine's
+server; and the `--stack node --npm-install` EVAL SUITE has still never been run,
+so the Node *score* remains unmeasured exactly as it was.
+
+## Then the repairs themselves produced four more, and the lesson repeated
+
+Running the *fixed* builds found four defects in the fixes, and every one was
+the same shape a third time:
+
+7. `reinstate_routes` re-inserted a block sliced from a file whose routes were
+   nested in a callback, one closing brace too many, and the build shipped a
+   `server.js` that would not parse. **`NodeAdapter.write_source_if_valid` was
+   not running `node --check`** — the Flask gate compiles, this one only asked
+   "is this HTML in a .js file?". It runs the real check now and reverts.
+8. `order_routes` returned `[]` both for "the order is fine" and for "I cannot
+   read this file's shape", so a real collision was silent. It returns
+   `(text, moved, problems)` now, and a decline is stated.
+9. The route record was filled only on a BUILD turn, leaving the amendment path
+   — where the user literally asks for routes to be preserved — unprotected.
+10. `_extract_filename` created a file named `app.get` from a sentence about
+    `app.get(...)`. The blocklist could never have held it.
+
+**Two rules worth carrying forward.** First: whenever the Flask path has a
+guarantee, ask out loud whether the Node path has it too — six of the sixteen
+defects this session were exactly that gap, and each was invisible because the
+Node side returned a neutral value rather than failing. Second: **a repair pass
+needs the same net as generation.** These passes write files without going
+through `_verify_and_repair`, so the write gate is the only thing standing
+between a bad slice and the user.
+
 ## The previous handoff's work is done and committed
 
 The tree that this file used to warn about — several days of W1–W10 and N0–N4
@@ -89,18 +159,39 @@ the entry file, the template dir, the route parser and the database reader.
 
 ## What is LEFT
 
-1. **The Node eval suite has never been run end to end.** Everything is wired and
-   unit-tested offline, but `--stack node --npm-install` needs the network, a
-   live PostgreSQL and Ollama all at once, and that has not happened on this
-   machine. Until it does, treat the Node score as unmeasured — not as zero, and
-   certainly not as passing.
-2. **A real PostgreSQL has still never run the generated SQL.**
-   `tests/test_crud_node.py` has that tier, gated on `psycopg` +
-   `CODER_TEST_DATABASE_URL`. It **skips loudly** — do not make it pass quietly.
+1. **A generated Node project HAS now been built and run end to end** (2026-08-04,
+   PostgreSQL 18.4 + `npm install` + `node server.js`), and it found two defects
+   that only a live database could show. Both are fixed, both have regression
+   tests in `tests/test_crud_node.py`:
+   - `_sample` let **`NUMERIC` fall through to the string default**, so
+     `seed.js` died with `invalid input syntax for type numeric: "Demo
+     cod_reliability_score 1"`. SQLite has type AFFINITY and accepts that
+     string, so **the Flask seed was wrong in the same way and looked fine** —
+     the two `_sample`s must stay in step. `BLOB` had the same hole (`BYTEA`).
+   - The scaffold's `server.js` **never required `models`**, so every data page
+     answered `{"error":"models is not defined"}`. Flask survives the identical
+     omission only because `_repair_missing_imports` adds it, and that pass is
+     Python-only — see gap 3. A scaffold on this stack has to be right unaided.
+
+   The `--stack node --npm-install` EVAL SUITE is still unrun; what happened was
+   a single real build, not the scored suite. Treat the Node *score* as
+   unmeasured.
+2. **A real PostgreSQL has now run the generated SQL** — `initDb()` created all
+   five tables and the app served `/`. `tests/test_crud_node.py`'s live tier is
+   still gated on `psycopg` + `CODER_TEST_DATABASE_URL` and still **skips
+   loudly** here (psycopg is not installed); do not make it pass quietly. The
+   run above went through **node and the project's own `pg`**, which is the same
+   path `NodeAdapter.database_reason` uses and a different one from that tier.
 3. **Node's remaining gaps are real**, listed in `NodeAdapter.gaps` and printed
    by `/stack`: no import repair, no template-scoped editing, an import
    dependency graph that stays Python-only, and routes read by regex rather than
-   by a parser. Flask stays the default because of them.
+   by a parser. **`settings.web_stack` was switched to `"node"` on 2026-08-04 by
+   the repo owner, and none of these gaps closed when it was** — the default now
+   points at the shallower stack deliberately, so read `NodeAdapter.gaps` before
+   treating a Node build's output as being held to Flask's guarantees.
+   `stacks.DEFAULT_KEY` is still `"flask"`, and that is a different question (an
+   empty/unknown key, including every spec written before the seam existed);
+   changing it would reinterpret existing Flask projects as Express ones.
 4. **`_repair_page_links` and `_repair_nav_consistency` are still `.html`-only,
    and that is FINE** — do not "fix" them to match the others. The first
    rewrites a link only when the target exists as a sibling file, because a real

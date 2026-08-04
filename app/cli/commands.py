@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -32,7 +33,9 @@ HELP_TEXT = """
   /stack [flask|node]   Show or choose the stack a build targets. A project
                         that already has a spec keeps ITS stack regardless
   /run [restart|stop|status]  Start the generated app and keep it up across
-                        turns; prints the URL to open
+                        turns; prints the URL to open. Does whatever setup the
+                        project needs first (on Node: installs its packages,
+                        creates its database, loads demo data)
 
 [yellow]Tools & Context[/yellow]
   /tools                List all registered tools (builtin + MCP)
@@ -126,6 +129,24 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
         runner = get_runner()
         action = args[0].lower() if args else "start"
 
+        async def repair_entry(root) -> None:
+            """Re-assert the entry file's startup invariants before launching.
+
+            The passes that keep `server.js` / `app.py` startable run at the
+            build seam, and `/run` is the one path that launches a project with
+            no turn around it — so a rewrite that ended the entry file at its
+            last route stayed broken through every `/run`, reported only as
+            "exited on startup". Deterministic and idempotent: a healthy file
+            is read and not written. Guarded on the attribute because the CLI
+            is driven by stand-in agents in the tests, and a `/run` that failed
+            on a missing method would be a worse bug than the one this fixes.
+            """
+            repair = getattr(repl.agent, "repair_entry_before_run", None)
+            if repair is None:
+                return
+            for line in await repair(root):
+                console.print(f"[green]✓[/green] {escape(line)}")
+
         if action in ("stop", "kill"):
             console.print(
                 "[green]Stopped.[/green]"
@@ -139,6 +160,9 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
             return True
 
         if action == "restart":
+            # The restart path is where this matters most: it is what someone
+            # types straight after the amendment that broke the file.
+            await repair_entry(runner.workdir)
             ok, message = runner.restart()
             console.print(
                 f"[green]Restarted:[/green] {message}"
@@ -153,6 +177,25 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
         # that was never written.
         workdir = repl.agent.project_path or str(Path.cwd())
         adapter = get_adapter(resolve_key(repl.agent.get_spec(), settings.web_stack))
+
+        # Before the environment, the code: a file that cannot start will not
+        # start however well `npm install` goes, and this costs one file read
+        # when nothing is wrong.
+        await repair_entry(workdir)
+
+        # Do the setup before asking whether it can run. Three of the blockers
+        # `readiness` names are really just commands — `npm install`, `createdb`,
+        # the seed — and printing them is the difference between "here is your
+        # site" and a terminal exercise for someone who does not use one. What
+        # cannot be done this way (no Node, no PostgreSQL service, a wrong
+        # password) is untouched and still reported below. Flask has nothing to
+        # do here and returns [], so that stack prints nothing new.
+        if getattr(settings, "auto_setup", True):
+            for line in adapter.autosetup(
+                Path(workdir),
+                log=lambda m: console.print(f"[dim]  {escape(m)}…[/dim]"),
+            ):
+                console.print(f"[green]✓[/green] {escape(line)}")
 
         # Phase N5: say WHY before launching something that cannot work. Without
         # this the Node stack's answer to a missing database is whatever `pg`

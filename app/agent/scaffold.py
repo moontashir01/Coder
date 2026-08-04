@@ -195,6 +195,24 @@ def project_slug(root: Path, name: str | None = None) -> str:
     return slug[:48]
 
 
+def database_url(slug: str) -> str:
+    """The connection string a generated project ships with, for ``slug``.
+
+    Built from `settings.postgres_server`, so the machine's credentials are
+    remembered in ONE place instead of being retyped into every project — the
+    scaffold used to hard-code `postgres://postgres:postgres@localhost:5432/`,
+    which is nobody's actual server and made every first run fail on
+    authentication before it could fail on anything real.
+
+    Only the default. The generated `db.js` still reads `process.env
+    .DATABASE_URL` first, so a deployment overrides it without an edit.
+    """
+    base = (settings.postgres_server or "").strip().rstrip("/")
+    if not base:
+        base = "postgres://postgres:postgres@localhost:5432"
+    return f"{base}/{slug}"
+
+
 def copy_scaffold(src_root: Path, root: Path, name: str | None = None) -> list[str]:
     """Copy a runnable project skeleton from ``src_root`` into ``root``.
 
@@ -225,6 +243,11 @@ def copy_scaffold(src_root: Path, root: Path, name: str | None = None) -> list[s
         # An identifier-safe form of the name, for the things that cannot take
         # spaces: an npm package name and a PostgreSQL database name.
         "{{PROJECT_SLUG}}": project_slug(root, name),
+        # This machine's PostgreSQL server, remembered once in settings instead
+        # of being retyped into every generated project. `DATABASE_URL` in the
+        # environment still wins at RUNTIME — the generated `db.js` reads it
+        # first — so this is the default, not a lock-in.
+        "{{DATABASE_URL}}": database_url(project_slug(root, name)),
     }
 
     written: list[str] = []
@@ -383,6 +406,37 @@ def restore_index_route(source: str) -> tuple[str, bool]:
     else:
         new = text.rstrip("\n") + "\n" + _INDEX_ROUTE_SNIPPET
     return new, True
+
+
+_RUN_BLOCK_SNIPPET = """
+
+if __name__ == "__main__":
+    # Restored by Coder: a rewrite had removed the run block, so `python app.py`
+    # imported the module and exited without ever serving.
+    app.run(debug=True, port=5000)
+"""
+
+
+def restore_run_block(source: str) -> tuple[str, bool]:
+    """Put back the `if __name__ == "__main__":` block that makes app.py run.
+
+    The Flask half of `NodeAdapter.restore_boot_block`, and it exists for the
+    same measured reason: a repair pass that rewrites the entry file wholesale
+    can end it at the last route, and nothing downstream notices. The file still
+    compiles — a module of route definitions is valid Python — so `check_file`
+    passes and the build reports "verified OK" on an app that cannot start.
+
+    Conservative in the same way as `restore_index_route`: it declines unless
+    this is recognisably a Flask entry file with an `app` to run.
+    """
+    text = source or ""
+    if not _APP_ROUTE_RE.search(text):
+        return source, False  # not a Flask route file
+    if _MAIN_GUARD_RE.search(text):
+        return source, False  # still there
+    if not re.search(r"^app\s*=\s*Flask\(", text, re.MULTILINE):
+        return source, False  # no app to run — restoring would NameError
+    return text.rstrip("\n") + "\n" + _RUN_BLOCK_SNIPPET.lstrip("\n"), True
 
 
 _BODY_RE = re.compile(

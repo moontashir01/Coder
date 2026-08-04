@@ -45,6 +45,20 @@ logger = logging.getLogger(__name__)
 STARTUP_TIMEOUT = 12.0
 
 
+def _loudest_line(text: str | None) -> str:
+    """The one line worth printing out of a dead process's output, or "".
+
+    Prefer a line that names an error, fall back to the last line, and never
+    return the whole log — this is shown to someone who asked for a URL, not a
+    build transcript.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    for line in reversed(lines):
+        if "Error" in line or "Exception" in line:
+            return line[:200]
+    return lines[-1][:200] if lines else ""
+
+
 class AppRunner:
     """One background app process, owned by the session rather than a turn."""
 
@@ -126,9 +140,9 @@ class AppRunner:
         deadline = time.monotonic() + STARTUP_TIMEOUT
         while time.monotonic() < deadline:
             if proc.poll() is not None:
-                err = self._drain_stderr()
+                reason = self._exit_reason(proc)
                 self._proc = None
-                return False, f"{entry} exited on startup: {err}"
+                return False, f"{entry} exited on startup: {reason}"
             for port in ports:
                 if _port_open(port):
                     self._port = port
@@ -163,16 +177,40 @@ class AppRunner:
             return False, "nothing has been run yet — use `/run` first"
         return self.start(workdir, entry)
 
-    def _drain_stderr(self) -> str:
+    def _exit_reason(self, proc: subprocess.Popen) -> str:
+        """Why the process is already gone, in one line.
+
+        This used to read stderr alone and say "no output" when it was empty,
+        which is the least useful sentence this file can produce: it describes
+        the diagnosis, not the failure. Two things changed, both measured on a
+        real `server.js exited on startup: no output`.
+
+        * **stdout is read as well.** A generated app that reports its own
+          failure with `console.log` before exiting puts nothing on stderr, and
+          the whole explanation was being thrown away.
+        * **the exit code is always stated.** A clean exit and a crash read
+          identically without it, and they are opposite problems: a silent
+          **0** means the file ran to the end and never started a server — the
+          entry file has lost its listen/serve call, which no syntax check can
+          see — while a non-zero silent exit is a process that died with its
+          output somewhere else.
+        """
+        code = proc.returncode
+        out, err = "", ""
         try:
-            _, err = self._proc.communicate(timeout=3)
+            out, err = proc.communicate(timeout=3)
         except Exception:
-            return "no output"
-        lines = [ln.strip() for ln in (err or "").splitlines() if ln.strip()]
-        for line in reversed(lines):
-            if "Error" in line or "Exception" in line:
-                return line[:200]
-        return lines[-1][:200] if lines else "no output"
+            logger.debug("could not drain the app's output", exc_info=True)
+        line = _loudest_line(err) or _loudest_line(out)
+        if line:
+            return f"exit code {code} — {line}"
+        if code == 0:
+            return (
+                "exit code 0 and no output — it ran to the end without serving "
+                f"anything, which is what {self._entry or 'the entry file'} "
+                "looks like once it has lost the call that starts the server"
+            )
+        return f"exit code {code}, no output on stdout or stderr"
 
 
 _RUNNER: AppRunner | None = None

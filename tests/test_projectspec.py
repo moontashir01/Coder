@@ -24,6 +24,8 @@ from app.agent.blueprint import (
 )
 from app.agent.projectspec import (
     CONTEXT_BUDGET_CHARS,
+    POSTGRES,
+    SQLITE,
     Entity,
     Field,
     Page,
@@ -60,7 +62,11 @@ def test_parses_the_blueprints_own_schema_format():
     assert entity.field("password_hash").required is True
 
 
-def test_types_are_normalised_to_sqlite_storage_classes():
+def test_types_are_normalised_to_canonical_storage_classes():
+    """`BOOLEAN` and `TIMESTAMP` are canonical rather than aliases of
+    INTEGER/TEXT, because PostgreSQL genuinely has both and an app that compares
+    an auction's end time needs the distinction. SQLite keeps spelling them the
+    old way — see the DDL assertion below."""
     entity = parse_schema_line(
         "products(id INT PRIMARY KEY, title VARCHAR(255), price DECIMAL(10,2), "
         "live BOOLEAN, added DATETIME)"
@@ -70,9 +76,37 @@ def test_types_are_normalised_to_sqlite_storage_classes():
         "id": "INTEGER",
         "title": "TEXT",
         "price": "REAL",
-        "live": "INTEGER",
-        "added": "TEXT",
+        "live": "BOOLEAN",
+        "added": "TIMESTAMP",
     }
+
+
+def test_sqlite_still_spells_booleans_and_timestamps_the_old_way():
+    """The Flask stack's DDL must not have changed by one character: SQLite has
+    neither type, which is what the schema prompt has always said."""
+    entity = parse_schema_line("products(id INT PRIMARY KEY, live BOOLEAN, added DATE)")
+    ddl = entity.to_ddl(SQLITE)
+    assert "live INTEGER" in ddl and "added TEXT" in ddl
+    assert "BOOLEAN" not in ddl and "TIMESTAMP" not in ddl
+
+
+def test_postgres_keeps_the_types_the_document_asked_for():
+    entity = parse_schema_line("products(id INT PRIMARY KEY, live BOOLEAN, added DATE)")
+    ddl = entity.to_ddl(POSTGRES)
+    assert "live BOOLEAN" in ddl and "added TIMESTAMPTZ" in ddl
+
+
+def test_a_text_primary_key_is_generated_by_postgres_and_supplied_on_sqlite():
+    """A PRD that prints `UUID PRIMARY KEY` normalises to a canonical TEXT key.
+    Without a database-side default the generated insert took the id as its
+    first argument, and the route beside it read `const id = await
+    models.createUser(id, …)` — a ReferenceError on every create form."""
+    entity = parse_schema_line("users(id UUID PRIMARY KEY, email TEXT)")
+    assert "gen_random_uuid()" in entity.to_ddl(POSTGRES)
+    assert POSTGRES.generates_pk("TEXT", pk=True) is True
+    # SQLite has no expression default, so there the key stays a caller's job.
+    assert "gen_random_uuid()" not in entity.to_ddl(SQLITE)
+    assert SQLITE.generates_pk("TEXT", pk=True) is False
 
 
 def test_parenthesised_types_are_not_split_on_their_comma():

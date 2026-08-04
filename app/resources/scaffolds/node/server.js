@@ -17,6 +17,7 @@ const express = require("express");
 const expressLayouts = require("express-ejs-layouts");
 
 const db = require("./db");
+const models = require("./models");
 const ui = require("./ui");
 
 const app = express();
@@ -44,6 +45,29 @@ app.use(express.json());
 // `public/css/theme.css` the colour and font variables; theme.css is linked
 // LAST by the layout, so it wins, and it is the only file a restyle touches.
 app.use(express.static(path.join(__dirname, "public")));
+
+// Express 4 does not forward a REJECTED promise from an `async` handler to the
+// error middleware below: the rejection goes unhandled, and Node 15+ treats
+// that as fatal. Measured on a generated app — one form posted with an empty
+// optional number field returned `invalid input syntax for type integer: ""`
+// and the whole site went down, rather than that one request returning 500.
+//
+// Wrapping the routing methods ONCE, here, covers every route defined after
+// this point, including ones added by a later change. A four-argument function
+// is error middleware and is left alone.
+for (const method of ["get", "post", "put", "patch", "delete", "all"]) {
+  const original = app[method].bind(app);
+  app[method] = (routePath, ...handlers) =>
+    original(
+      routePath,
+      ...handlers.map((handler) =>
+        typeof handler === "function" && handler.length < 4
+          ? (req, res, next) =>
+              Promise.resolve(handler(req, res, next)).catch(next)
+          : handler
+      )
+    );
+}
 
 app.get("/", (req, res) => {
   // Home page. Replace the view body with this project's real content.

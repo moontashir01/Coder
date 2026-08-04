@@ -167,6 +167,22 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
   `_reindex_after_write`, which every successful write path hits) — skipped when the message asks
   for a new artifact (`_NEW_ARTIFACT_RE`: "a css file", "a new page") or the last write is
   gone/outside the workdir.
+  - **A name the regex found is then RESOLVED against the project** (`_locate_named_file`).
+    `_extract_filename` is a regex over the message: it recognises `users.ejs` and stops there, and
+    nothing checked the project actually had one at its root — while a Node build keeps its views in
+    `views/` and a Flask build its pages in `templates/`, so the name a person types is almost never
+    the path. Measured: "fix the files inside users.ejs" resolved to `<root>/users.ejs`, which does
+    not exist, so the flow read an empty string, took this for a NEW file, and wrote the model's
+    "I need more information about the specific issues" reply to disk as a second, junk `users.ejs`
+    beside the real `views/users.ejs`. **Both guards that should have caught it were gated on
+    `filename is None`** — the spec lookup that matches by template stem, and the tool-loop
+    escalation whose own comment describes this exact outcome — and a WRONG name is not a MISSING
+    one. Three rules: **exactly one match or none** (two `index.ejs` mean the message was ambiguous,
+    `_resolve_target_from_spec`'s rule); **dot-directories, `node_modules` and `__pycache__` are
+    skipped**, load-bearing because `.coder_backups/` holds a copy of every file ever written and an
+    unfiltered walk resolves `server.js` to a snapshot of itself; and **an unresolved name is only
+    dropped for a request that CHANGES something** (`_wants_existing_file_change`) — a file being
+    created is *supposed* not to exist yet, so "create theme.css" keeps its name.
   - **Create / new file:** ONE plain LLM call for `FILENAME: <name>\n<full contents>`, parsed by
     `_parse_file_output` (strips code fences, incl. stray/unmatched ones), written via `write_file`.
     Each call generates ONE file, but the model sometimes answers with the whole build —
@@ -547,6 +563,103 @@ calls.
 **Precedence is load-bearing and unchanged:** `should_amend` still runs first in `chat()`, so
 widening the build gate cannot make turn 2 rebuild turn 1's project.
 
+### Building from a referenced document (`settings.max_spec_doc_chars`)
+
+"Build the website described in @PRD.md" is how a real specification arrives, and until now
+the document contributed **nothing**. `_read_refs` read it into `_multi_file_flow`'s `context`
+— whose only consumer is `_plan_file_ops`, which `_run_blueprint` **skips** because it
+preplans the ops — and the two calls that decide what the app *is*, `_extract_schema` and
+`_expand_requirements`, were never given it at all. Measured on a 12.5 KB marketplace PRD
+specifying auctions, proxy bidding, cash-on-delivery with SMS OTP and a buyer reliability
+score: the build came out `products`/`users`/`orders` with a cart. Every table, page and route
+had been derived from the one sentence that names the file.
+
+`AgentCore._requirements_doc_context(at_refs)` reads it once at the top of `chat()` into
+`self._spec_doc`, and it reaches all three stages. Per-turn state rather than a parameter so
+the stages keep the signatures their callers and tests already use — `""` on every turn that
+references no prose file, which is what makes them behave exactly as they did before.
+
+- **Prose extensions only** (`_SPEC_DOC_EXTS`: `.md`/`.txt`/`.rst`/…). An `@app.py` on a build
+  request is code to work from; quoting it to the schema call as requirements would model the
+  *code* instead of the product.
+- **The budget is total, not per document** — `_sibling_context`'s rule. A per-file cap is how
+  several references overflow the context window and evict the block they were meant to add.
+- **Truncation is stated in the block** (`[TRUNCATED: n of m …]`). A silently halved PRD is a
+  requirement the build will not have and nobody will know is missing.
+- **It is part of the `_extract_schema` cache key.** The same sentence with a different
+  document behind it is a different request; the cache is keyed on the message, and would
+  otherwise answer a question it was never asked.
+- **A greenfield build never TARGETS the document** (`_resolve_ref(exclude_docs=…)`, keyed on
+  `should_blueprint`). An @ref pins the edit target, so with the blueprint stage off or
+  declining, "build the website described in @PRD.md" resolved its target to the PRD and
+  `_file_op_flow` sends an existing file to `_surgical_edit` — the one file the user could not
+  regenerate, overwritten with a web page. Off by default because the ordinary case is the
+  opposite: "fix the typo in @README.md" must still target the README.
+
+Both prompts state the precedence (`schema.md`, `blueprint.md`): when a document is present the
+request is only a pointer to it, so "keep it small" is never a reason to drop a table the
+document asks for, and every capability it describes is `requested`, not `optional`.
+
+### Two repairs that were making builds worse
+
+Both were found by that same live build, and both are the same shape: a check whose safety
+argument holds for a static site and inverts inside a server-rendered one.
+
+- **`_repair_page_links` must not run inside the stack's template directory.** "The corrected
+  target exists as a sibling file" is what makes rewriting `href="/about"` → `about.html` safe
+  on a build opened over `file://`. In `templates/` **every route's page exists as a sibling**,
+  because that is what a template directory is — so the scaffold's `<a href="/users">` was
+  rewritten to `href="users.html"` in `base.html`, and every page of the finished site linked
+  at a URL Flask does not serve. `/users` was a route and `templates/users.html` was its
+  template; the check could not tell them apart. A `.html` file outside the template dir is
+  still a static page, which is the case the pass was written for.
+- **`_verify_blueprint_coverage` now also creates the templates a ROUTE RENDERS**
+  (`_create_rendered_templates`). Check 1 covers the files the blueprint *planned*; nothing
+  covered the ones generation *invented*. The same build added `/signup`, `/cart` and
+  `/order/<id>` to `app.py` rendering `signup.html`, `cart.html` and `order_confirmation.html`
+  — none planned, none written, three `TemplateNotFound` 500s on links in the site's own nav.
+  Nothing else could see it: `_repair_dead_references` reads HTML/CSS/JS and never Python, and
+  the endpoint check asks the opposite question ("is the route there?"), which for these three
+  it was. Routes are read off the file **on disk** (`routes_from_source`'s rule — the spec is
+  additive and would name a template this turn's edit removed), only a **literal** template
+  name counts (`render_template(name + ".html")` cannot be resolved, and writing a file for a
+  guessed name is worse than the 500), and a name that escapes the template directory is
+  skipped rather than written outside it.
+- **`_wire_missing_endpoints` acts on the unwired-endpoint report instead of only printing
+  it** (`settings.wire_missing_endpoints`). The blueprint plans eleven routes; the model's one
+  surgical edit to `app.py` lands six; the pages the SAME build wrote then 500 on
+  `url_for('new_category')`. Coverage already computed that list deterministically — reporting
+  a defect this specific and this fatal while declining to act on it is a check that never
+  runs. Five rules keep it from being the churn the report was protecting against: **one
+  attempt, never a loop**; **nothing missing means no LLM call and a byte-identical file**;
+  **an edit that fails `check_file` is reverted** (`_intent_repair`'s rule, and it matters more
+  here — every page is downstream of this one file, so a bad edit is a total outage rather than
+  one 500); **the instruction NAMES what is missing** rather than asking the model what it
+  thinks the app needs; and **what is still missing afterwards is recomputed from disk and
+  reported**. `_unresolved_view_names` is the Flask half (Jinja names a route by its VIEW) and
+  runs at the END, when the entry file is final — the same pass writes the pages and edits
+  `app.py`, so a name is legitimately unresolved mid-build and only a defect once it has
+  stopped. It returns `[]` for `.ejs`, where linking is by PATH and `check_links` owns the
+  question.
+- **The `/` route is re-asserted at the END of `chat()`, not only in `_restore_scaffold_invariants`**
+  (`_restore_entry_route_note`). That pass runs inside `_run_blueprint`; coverage, the endpoint
+  wiring above and the **smoke repair** all rewrite the entry file wholesale afterwards, and
+  each deletes the route straight back out. Measured across three live builds: the answer said,
+  truthfully, that the home page had been restored and the finished site still 404'd on its own
+  front door. **The invariant belongs wherever the file stops being rewritten, not at the point
+  it was first broken.** `restore_entry_route` returns `(source, False)` when `/` is still
+  routed, so this is idempotent and a build that never lost it is untouched.
+- **`_fix_macro_import` — Jinja's `import` is NOT inherited.** `base.html` importing
+  `_macros.html` does nothing for a child, so a page calling `ui.field(...)` without its own
+  import line is `UndefinedError: 'ui' is undefined`: a 500 on a file that parses, balances,
+  passes the intent judge and looks exactly like the pages that work. `ui_context()` states the
+  requirement and a 7B drops it anyway — measured on one page of fourteen, which is the worst
+  frequency a defect can have. Stage 0 of `_verify_and_repair`, deterministic, and narrow in
+  `_repair_missing_imports`' sense: it fires only when the file USES the name and does not bind
+  it, and the line inserted is fixed text. It goes **after `{% extends %}`** — a statement above
+  it is outside every block, so the import would parse and still not bind. `.html` only: EJS has
+  no macro construct and `ui` is a required module there.
+
 ### Schema first, layout derived from it (Phase C, `settings.schema_first`)
 
 Phase C of `docs/always-fullstack-plan.md`. The schema used to arrive as free text inside the
@@ -635,9 +748,10 @@ fifth and `[sys.executable, "seed.py"]` at a sixth; those all read
   callables — and the call site is identical either way
   (`{{ ui.table(...) }}` / `<%- ui.table(...) %>`).
 - **The Node adapter states its gaps, and `/stack` prints them.** They are real
-  and they are printed verbatim: no import repair, no template-scoped editing,
-  the *import* dependency graph stays Python-only, routes are read with a regex
-  rather than a parser, and readiness is checked but not proven (no `SELECT 1`).
+  and they are printed verbatim: no template-scoped editing, the *import*
+  dependency graph stays Python-only, routes are read with a regex rather than a
+  parser, no duplicate-definition check, and missing-require repair binds only
+  builtins and this project's own modules (an npm package is reported).
   A menu that listed the two stacks as equals is how a demo gets built on the
   weaker one by accident. **This list must be maintained as the gaps close** —
   N4 landed three of the things it denied (route validation, the `.ejs` check,
@@ -697,9 +811,30 @@ of them the Flask equivalent restated rather than reinvented:
   Measured: `<%# … #%>` (there is no `#%>`) broke the scaffold's home page during
   N2. Two rules keep it from false-failing: a view may be a **fragment or a whole
   document** (every view except `layout.ejs` is a fragment, so requiring a
-  document would fail all of them), and there is **no prose guard** — a hero
-  paragraph is a legitimate view, unlike in a `.js` file where prose means the
-  model wrote the wrong kind of content entirely.
+  document would fail all of them), and the prose guard is narrow (below).
+  - **The JavaScript is checked too** (`verify.ejs_script` → `_check_ejs_javascript`,
+    in `check_file` beside the `.js`/`.ts` cases). `strip_ejs` throws that half
+    away — it takes the code OUT so the markup can be balanced — and the code is
+    where views really break. Measured on a live build: `views/users.ejs` shipped
+    `<%- users.forEach(user => { %>` (an OUTPUT tag around a statement, so EJS
+    emits `__append(users.forEach(u => {)`), `views/items.ejs` had a sentence of
+    prose welded into a call's argument list, and both files were structurally
+    perfect markup that passed every check and threw at render — which on that
+    build meant the home page, `/users` and `/items` were all 500s. `ejs_script`
+    does EJS's own translation (`<% %>` → code, `<%= %>`/`<%- %>` →
+    `__append(x);`, `<%# %>`/`<%%` → nothing, markup → nothing) and wraps it in
+    an `async function` so a legitimate top-level `await`/`return` parses. Then
+    `node --check` on a temp file — never the view itself. **A missing `node` is
+    a skip, exactly as for `.js`**: a check that could not run has verified
+    nothing, and calling that "broken" blocks a correct write.
+  - **The prose guard is "no markup AND no EJS tags", never "looks like prose".**
+    A hero paragraph is a legitimate fragment, unlike in a `.js` file where prose
+    means the wrong kind of content entirely — so the general guard stays off.
+    But a file with neither a tag nor an element renders literally nothing and
+    can only be the model answering *in* the file instead of writing one.
+    Measured: "fix the files inside users.ejs" produced a `users.ejs` whose whole
+    content was "To address the request … I need more information about the
+    specific issues", and it passed as a valid view.
 - **Link validation dispatches through `adapter.check_links(text, routes)`**, on
   both adapters, from `core._check_endpoints` — which accepts **the stack's own
   `template_ext`** as well as `.html`/`.htm`. That gate is load-bearing: filtered
@@ -794,8 +929,15 @@ project's** database exists or that its credentials work — and both fail insid
 Phase A of `docs/always-fullstack-plan.md`. `detect_stack()` used to *probe* — richest
 importable framework wins — so the full-stack promise silently depended on Flask being
 importable, which it is here only because Coder's own environment installs it. `web_stack`
-(default `"flask"`) is now passed as `prefer=` at both call sites, and `"auto"` restores
-probing.
+(default `"node"` since 2026-08-04; `"flask"` before that) is now passed as `prefer=` at both
+call sites, and `"auto"` restores probing.
+
+> **The session default is `node`; `stacks.DEFAULT_KEY` is still `flask` and must stay so.**
+> They answer different questions. `DEFAULT_KEY` is what an empty/unrecognised/missing key
+> resolves to — and a spec written before the stack seam has no key at all, so resolving those
+> to Node would reinterpret every existing Flask project as an Express one on its next turn,
+> writing `ensure_column` calls into a `db.js` that does not exist. An accident should land on
+> the better-verified path; a deliberate choice is what `web_stack` expresses.
 
 **A forced stack is never silently downgraded.** `prefer="flask"` with Flask absent returns
 the Flask stack with `runnable=False` and an `install_hint`, NOT the stdlib stack —
@@ -1139,6 +1281,34 @@ arrived in — so `ddl()` emits `CREATE TABLE` for revision-1 fields and `migrat
 `ensure_column` calls for everything later. That split is what lets turn 3 add a column without
 dropping turn 1's data.
 
+**A `Field` carries its constraints, because what the model cannot represent it silently discards.**
+Measured against a 12.5 KB marketplace PRD that printed its PostgreSQL DDL in full: every `UNIQUE`,
+every `REFERENCES`, every `CHECK (status IN (…))` and every `DEFAULT` was gone from the generated
+`db.js` — not because the schema call ignored them but because `Field` was
+name/type/pk/required/added_in and there was nowhere to put them. So `unique`, `default`,
+`references`, `check` and `max_length` are fields now, read by all three parsers
+(`_parse_columns` for a DDL line, `_fields_from_data` for the schema call's JSON,
+`entities_from_sql` for adoption) and emitted by `Dialect.column_ddl`. Five rules:
+- **Every one of them reaches DDL as text with no binding, so every one is validated at
+  construction** — `_safe_default` (an allowlisted keyword, a number, or a quoted literal with no
+  quote inside it), `_safe_reference` (both halves through `_ident`), `_safe_check_values` (an
+  enumeration, not free SQL). `_ident`'s rule applied to the parts of a schema that are not
+  identifiers. Anything unrecognised is **dropped, never escaped and passed through**.
+- **`check` is a value list, not a SQL expression.** A `CHECK` clause written by a 7B and
+  interpolated into DDL is an injection surface, and an enumeration is what a PRD's CHECK
+  constraints overwhelmingly are.
+- **A generated primary key takes no extra clauses.** `SERIAL PRIMARY KEY` and
+  `TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text` are complete declarations; a UNIQUE or a
+  DEFAULT bolted on is redundant at best and a conflict with the one already there at worst.
+- **`migration_call` never emits NOT NULL, UNIQUE or CHECK.** All three can be true of a new column
+  and false of the rows already stored, so adding one raises against real data — and a migration
+  that fails on startup takes the whole app down, which is worse than a column that is merely less
+  constrained than the spec says. A DEFAULT and a foreign key are safe: both apply going forward.
+- **`Entity.summary()` states them, so the prompt does too.** Told only `status TEXT` a model
+  invents its own status words, and the CHECK then rejects every insert the app makes.
+Everything defaults to "absent", so a `Field` built the old way emits byte-for-byte the DDL it
+always did. What is still NOT modelled: indices, composite keys, and `ON DELETE` behaviour.
+
 Rules the rest of the code depends on:
 - **A corrupt `project.json` returns None, never raises**, and saving is best-effort — a spec that
   won't save must never cost a turn whose files were written.
@@ -1215,6 +1385,63 @@ it and prints `http://127.0.0.1:5000`; `/run restart` picks up a change; `/run s
 Never a pool: two copies fight over the port and over `app.db`. It reuses `smoke._kill_tree` and
 registers an `atexit` hook, so a crashed REPL cannot orphan something holding :5000 — and an app
 that starts but never answers is reported as such rather than given a URL that returns nothing.
+
+**A dead process is described by its EXIT CODE, not only by its stderr** (`_exit_reason`,
+`_loudest_line`). `_drain_stderr` read one stream and said `no output` when it was empty, which
+describes the diagnosis rather than the failure: an entry file that has lost its `app.listen` runs
+to the end and exits **0** in silence, and that read identically to a crash whose output went
+somewhere else — opposite problems, one message. So the code is always stated, **stdout is drained
+too** (a generated app that reports its own failure with `console.log` had that line discarded),
+and a silent 0 says what a silent 0 means. The three near-identical copies of the
+"loudest line" rule (`smoke.py`, `node_adapter._last_error_line`) all follow it: prefer a line
+naming an error, else the last line, never the whole log.
+
+**`/run` re-asserts the startup invariants before launching** (`AgentCore.repair_entry_before_run`,
+called from both `/run` and `/run restart`). `_restore_boot_block_note` and
+`_repair_entry_module_calls` run at the `chat()` seam, and `/run` is the one path that launches a
+project with **no turn around it** — so an entry file a rewrite ended at its last route stayed
+broken through every `/run` until another build turn happened to run the same passes again, with
+`server.js exited on startup` as the only evidence. It pins the stack from the project's own spec
+(`resolve_key`'s precedence — a Node project left on a Flask default would otherwise be "repaired"
+with the wrong adapter's answers), is idempotent (a healthy file is read and not written), and is
+best-effort: a repair that fails must never withhold the launch, since the app may start anyway and
+the runner now names the exit code either way. It repairs SHAPE only — nothing here regenerates
+code, which stays the build's job.
+
+**`/run` does the setup, it does not print it (`StackAdapter.autosetup`, `settings.auto_setup`).**
+`readiness` names why the generated app cannot start, and on the Node stack three of the reasons it
+names are *commands* — `npm install`, `createdb`, the seed — that have to be typed in another
+terminal, in the right order, before one page can be opened. For the person this product is for,
+that is the whole difference between a URL and a terminal exercise, so `/run` now performs those
+three itself and prints only what it really did. **Flask returns `[]`**: sqlite is a file and the
+generated app's one dependency lives in the venv Coder runs from, so that stack is unchanged.
+
+- **This is the second deliberate exception to the offline rule, and the only one that ships ON.**
+  Playwright's Chromium download stays off because a missing browser costs an optional *check*;
+  missing `node_modules` means the app cannot run **at all**, so the network here is the difference
+  between a URL and instructions. Nothing about the BUILD reaches the network either way, and
+  `AUTO_SETUP=false` restores the previous behaviour exactly.
+- **It only ever does what `readiness` would have told you to do**, and never a repair of generated
+  code. Nothing is speculative: `node_modules` is installed because it is absent, the database is
+  created because PostgreSQL said `3D000`.
+- **A refused login is never answered by creating a database.** Only `3D000` reaches
+  `_create_database`; `28P01` is a password this cannot guess, and creating something under a
+  different working credential would hide that. `_probe_database` returning **None means "could not
+  tell"** — N5's rule — and also creates nothing.
+- **The database name is validated before it is interpolated** (`_DB_NAME_RE`, `projectspec._ident`'s
+  rule): `CREATE DATABASE` takes no bound parameter. The maintenance connection is derived from the
+  project's **own `db.js`** with the path swapped to `/postgres`, for `_probe_database`'s reason — a
+  URL we guessed could succeed where the app fails. `42P04` (it already exists) is a success.
+- **A step that failed is never reported as done**, and nothing is attempted on top of it; the
+  readiness check then names the same blocker it named before. The seed runs **only after a database
+  we just created** — re-seeding an existing one would write rows into someone's data — and its
+  failure never withholds the URL, since the app creates its own tables on startup.
+- **What it will never do: install Node, start a PostgreSQL service, or guess a password.** Those
+  need an installer or an administrator and stay `readiness`'s job, which now names the download and
+  the service rather than a bare fact.
+- `_CREATE_DB_SCRIPT` is covered by `test_the_node_scripts_are_valid_javascript` for
+  `pageaudit.py`'s reason: a syntax error in an embedded `node -e` script fails silently and in the
+  direction that reads as success.
 
 `/plan` gained an amendment preview (`AgentCore.preview_amendment`): with a spec loaded, a change
 request shows the delta, the new files, and a table of **existing** files that will be updated with
@@ -1354,6 +1581,36 @@ was measured on every live build. Four deterministic checks, one repair and thre
   Flask` otherwise matches its `FROM <table>` pattern. A pleasant side effect is that the scaffold's
   *commented* `CREATE TABLE` example correctly doesn't count as creating a table.
 
+**The same, for JavaScript (`app/agent/jsimports.py`).** All of the above was Python-shaped down to
+the `.py` suffix gate and the `werkzeug.security` advice, so the Node stack had none of it and
+`node --check` happily passes a file full of undefined names. Measured on a live build: one
+`server.js` called `bcrypt.compareSync(...)` with `bcrypt` never required, assigned
+`req.session.userId` with no session middleware mounted, and stored the raw `password_hash` form
+field while the project's own generated `passwords.js` sat unused — three runtime-fatal defects in
+one file, and nothing in the pipeline able to see any of them. `core._repair_missing_imports` now
+dispatches through **`adapter.repair_runtime_names(filename, source, root)`**; `FlaskAdapter`'s copy
+is the old body moved, so that stack is unchanged.
+- **Parsing is tree-sitter** (the parser `symbols.py`/`chunker.py` already pin), and identity does
+  **not** work on tree-sitter nodes — `node is other` is False for the same node, because each
+  attribute access builds a fresh wrapper. Getting that wrong is not a subtle mis-report: it made
+  `const path = require("path")` read as an undefined `path`, i.e. every declaration in the file
+  reported as a defect. Bindings are found by walking a construct's pattern subtree
+  (`_BINDERS`), never by asking whether an identifier happens to be its parent's `name` field.
+- **`add_missing_requires` binds from the allowlist ONLY**, and the allowlist is narrower than
+  Python's: a Node builtin, or a sibling module in this project that really exports the name.
+  An npm package is **reported, never required** — `require("bcrypt")` against something absent from
+  `node_modules` turns one broken route into an app that will not boot, which is strictly worse than
+  the defect being repaired.
+- **A hash call on an UNBOUND name does not count as hashing.** `plaintext_password_writes` inherits
+  the Python rule (silent when the module hashes anywhere, so read-then-hash is fine) and that rule
+  inverts here: the measured `server.js` mentioned `bcrypt.compareSync` in a *different* route with
+  `bcrypt` undefined, and text-matching alone read that as "this module hashes" and went quiet about
+  the raw password it really did store. It takes `undefined_names`' answer for exactly this.
+- **`middleware_gaps` reports what is not a binding at all.** `req.session` is a property of a
+  parameter, so `undefined_names` cannot see it, `node --check` is happy, and the route throws
+  `Cannot set properties of undefined` on the first successful login. Reported only — mounting a
+  session store is a design decision with a secret and a backing store behind it, not an import.
+
 **Generated sites are kept offline too.** Coder is offline; the sites it generated were not.
 `buildspec.py` used to instruct the model to load Google Fonts with a `<link>` in every page, and
 `references.py` deliberately ignores external URLs, so nothing stripped it — offline that means a
@@ -1408,7 +1665,7 @@ the next step of a multi-file build — see `_sibling_context`. `extract_build_s
 allows the one extra pre-planning LLM call that distils the shared nav/design spec
 (`app/agent/buildspec.py`); turning it off reverts multi-file builds to the pre-spec behavior.
 Full-stack web knobs (`docs/fullstack-web-plan.md`): `expand_requirements` and
-`blueprint_smoke_test` both ship **on** (Phase 0); **`web_stack` (default `"flask"`) forces the
+`blueprint_smoke_test` both ship **on** (Phase 0); **`web_stack` (default `"node"`) forces the
 backend stack** rather than probing for one — `detect_stack(prefer=…)`, see "Forcing the stack"
 below; `scaffolds_dir` locates the runnable project skeletons; `blueprint_max_files` (24) caps one build's fan-out and now **reports** what it drops as
 `may not meet:` rather than truncating silently — `_run_blueprint` and `_verify_blueprint_coverage`

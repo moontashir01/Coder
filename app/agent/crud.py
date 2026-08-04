@@ -71,8 +71,19 @@ def _sample(field: Field, index: int) -> str:
         return '""'  # no file on disk yet; the template falls back
     if field.type == "INTEGER":
         return str(index)
-    if field.type == "REAL":
+    if field.type in ("REAL", "NUMERIC"):
+        # Kept in step with `crud_node._sample`, where NUMERIC falling through
+        # to the string default is a hard PostgreSQL error. SQLite's type
+        # AFFINITY accepts the string, so the bug is invisible on this stack —
+        # which is exactly why the two must not drift: the Flask seed looked
+        # fine for as long as nobody ran the Node one against a real database.
         return f"{9.99 + index:.2f}"
+    if field.type == "BOOLEAN":
+        return "1"  # SQLite stores it as INTEGER; see SQLITE.type_map
+    if field.type == "TIMESTAMP":
+        return '"2026-01-01T00:00:00"'
+    if field.type == "BLOB":
+        return "None"
     if "email" in name:
         return f'"demo{index}@example.com"'
     if "url" in name or "link" in name:
@@ -92,6 +103,22 @@ def _sample(field: Field, index: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Columns for which an empty string is not a value — the other half of
+# `crud_node._NOT_BLANKABLE`, and it must stay in step with it. An unfilled
+# optional form field arrives as `""`; PostgreSQL rejects it outright
+# (`invalid input syntax for type integer: ""`) while SQLite's type AFFINITY
+# accepts it and quietly stores the empty string in an INTEGER column. The
+# visible failure is on one stack; the wrong data is on both.
+_NOT_BLANKABLE = frozenset({"TEXT", "BLOB"})
+
+
+def _bind(field: Field) -> str:
+    """The expression an INSERT/UPDATE binds for ``field``."""
+    if field.type in _NOT_BLANKABLE:
+        return field.name
+    return f"({field.name} if {field.name} != '' else None)"
+
+
 def entity_helpers(entity: Entity) -> str:
     """`list_ / get_ / create_ / update_ / delete_` for one entity."""
     pk = _pk(entity)
@@ -100,6 +127,7 @@ def entity_helpers(entity: Entity) -> str:
     cols = ", ".join(f.name for f in writable)
     marks = ", ".join("?" for _ in writable)
     args = ", ".join(f.name for f in writable)
+    binds = ", ".join(_bind(f) for f in writable)
 
     order = f" ORDER BY {pk.name} DESC" if pk else ""
     parts = [
@@ -135,7 +163,7 @@ def entity_helpers(entity: Entity) -> str:
             f"    try:\n"
             f"        cur = conn.execute(\n"
             f'            "INSERT INTO {table} ({cols}) VALUES ({marks})",\n'
-            f"            ({args}{',' if len(writable) == 1 else ''}),\n"
+            f"            ({binds}{',' if len(writable) == 1 else ''}),\n"
             f"        )\n"
             f"        conn.commit()\n"
             f"        return cur.lastrowid\n"
@@ -150,6 +178,7 @@ def entity_helpers(entity: Entity) -> str:
     if pk and updatable:
         assignments = ", ".join(f"{f.name} = ?" for f in updatable)
         update_args = ", ".join(f.name for f in updatable)
+        update_binds = ", ".join(_bind(f) for f in updatable)
         parts.append(
             f"def update_{name}({pk.name}, {update_args}):\n"
             f'    """Overwrite one {name}."""\n'
@@ -157,7 +186,7 @@ def entity_helpers(entity: Entity) -> str:
             f"    try:\n"
             f"        conn.execute(\n"
             f'            "UPDATE {table} SET {assignments} WHERE {pk.name} = ?",\n'
-            f"            ({update_args}, {pk.name}),\n"
+            f"            ({update_binds}, {pk.name}),\n"
             f"        )\n"
             f"        conn.commit()\n"
             f"    finally:\n"
