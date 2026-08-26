@@ -2,6 +2,7 @@ import asyncio
 import inspect
 from typing import Any, Awaitable, Callable
 
+from app.agent.scope import effective_denied_permissions
 from app.agent.tool_registry import ToolRegistry
 from config.settings import settings
 
@@ -38,6 +39,18 @@ class Executor:
     def set_approval_hook(self, hook: ApprovalHook | None) -> None:
         """Install (or clear) the interactive approval hook (Step 6 / S3)."""
         self._approval_hook = hook
+
+    @property
+    def approval_hook(self) -> ApprovalHook | None:
+        """The installed hook, so a caller can RESTORE it rather than clear it.
+
+        T4: in the embedded mode the REPL and the bot share this executor. A bot
+        turn installs its own keyboard hook and must put back what it found —
+        clearing it would leave the terminal with NO hook, and no hook means the
+        executor's default policy, which is allow. A front-end quietly losing
+        its approval prompt is the worst possible way for this to fail.
+        """
+        return self._approval_hook
 
     def _needs_approval(self, tool) -> bool:
         if settings.auto_approve:
@@ -77,14 +90,19 @@ class Executor:
             return {"success": False, "result": "", "error": str(e)}
 
         # Permission gating (Tier 3 #8): refuse before touching arguments.
-        denied = sorted(set(tool.permissions) & set(settings.denied_permissions))
+        # T3: the deny list comes from `scope.effective_denied_permissions()`,
+        # which unions the process setting with THIS turn's caller (a bot
+        # `viewer` denies fs:write/fs:delete/shell). Read off the setting alone,
+        # two overlapping turns would share one deny list and whichever started
+        # last would decide what both may do. A scope may only ever add.
+        denied = sorted(set(tool.permissions) & set(effective_denied_permissions()))
         if denied:
             return {
                 "success": False,
                 "result": "",
                 "error": (
                     f"Permission denied: tool '{tool_name}' requires {denied}, "
-                    "blocked by settings.denied_permissions"
+                    "blocked by the caller's denied permissions"
                 ),
             }
 

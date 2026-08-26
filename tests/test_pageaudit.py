@@ -652,7 +652,14 @@ def test_no_hook_when_browser_checks_are_off(monkeypatch):
 
 def test_asking_for_browser_checks_without_a_browser_says_so_loudly(monkeypatch):
     monkeypatch.setattr(settings, "browser_checks", True)
+    # BOTH names, and the second one is the point: `core.browser_available` is
+    # an alias bound at import, while `install_hint()` asks `browser.available`
+    # itself — so patching only the alias left the hint computing from the REAL
+    # environment. That passed for as long as nobody had Playwright installed
+    # and failed the day somebody did, which is the wrong way round for a test
+    # whose whole subject is a machine without a browser.
     monkeypatch.setattr("app.agent.core.browser_available", lambda: False)
+    monkeypatch.setattr("app.agent.browser.available", lambda: False)
     a = AgentCore(session_id="pytest_audit_hint")
     assert a._browser_hook(None, []) is None
     note = a._browser_skip_note()

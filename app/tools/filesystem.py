@@ -6,6 +6,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote
 
+from app.agent.patch import (
+    apply_block,
+    apply_edits,
+    nearest_region,
+    strip_line_numbers,
+)
+from app.agent.scope import effective_sandbox_root
 from config.settings import settings
 
 ToolResult = dict[str, Any]
@@ -21,17 +28,24 @@ def _err(error: str) -> ToolResult:
 
 # ---------------------------------------------------------------------------
 # Path jail (Step 5 / S2): resolve every caller-supplied path and reject any
-# that escapes settings.sandbox_root, unless allow_outside_root is set. The
-# jail is inert when sandbox_root is None (tests / library use) so importing
+# that escapes the sandbox root, unless allow_outside_root is set. The
+# jail is inert when the root is None (tests / library use) so importing
 # the tools imposes no policy; main.py + load_project set the root at runtime.
+#
+# T1: the root comes from `scope.effective_sandbox_root()`, not from the
+# setting directly — with two front-ends, two turns on two projects can be in
+# flight at once, and a process-global cannot answer "which project" for both.
+# The setting is still the fallback and still what a single-front-end session
+# uses.
 # ---------------------------------------------------------------------------
 
 
 def _jail_check(path: str) -> str | None:
     """Return an error string if ``path`` escapes the sandbox root, else None."""
-    if settings.allow_outside_root or settings.sandbox_root is None:
+    sandbox_root = effective_sandbox_root()
+    if settings.allow_outside_root or sandbox_root is None:
         return None
-    root = Path(settings.sandbox_root).resolve()
+    root = Path(sandbox_root).resolve()
     try:
         resolved = Path(path).resolve()
     except OSError as e:
@@ -62,8 +76,9 @@ _backup_seq = count()
 
 def _backup_root() -> Path:
     base = Path(settings.backups_dir)
-    if settings.sandbox_root is not None and not base.is_absolute():
-        return Path(settings.sandbox_root) / base
+    sandbox_root = effective_sandbox_root()
+    if sandbox_root is not None and not base.is_absolute():
+        return Path(sandbox_root) / base
     return base
 
 
@@ -110,10 +125,14 @@ def _attach_diff(res: ToolResult, old: str, new: str, path: str) -> ToolResult:
     )
     if diff:
         added = sum(
-            1 for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")
+            1
+            for l in diff.splitlines()
+            if l.startswith("+") and not l.startswith("+++")
         )
         removed = sum(
-            1 for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")
+            1
+            for l in diff.splitlines()
+            if l.startswith("-") and not l.startswith("---")
         )
         res["diff"] = diff
         res["result"] += f" (+{added}/-{removed} lines)"
@@ -126,7 +145,9 @@ def undo_write(path: str | None = None) -> ToolResult:
     try:
         root = _backup_root()
         backups = (
-            sorted((b for b in root.iterdir() if _original_path(b)), key=lambda b: b.name)
+            sorted(
+                (b for b in root.iterdir() if _original_path(b)), key=lambda b: b.name
+            )
             if root.exists()
             else []
         )
@@ -200,26 +221,118 @@ def write_file(path: str, content: str) -> ToolResult:
         return _err(str(e))
 
 
+def _no_match_error(path: str, original: str, old_str: str) -> str:
+    """Why the edit missed — and the text it came closest to, numbered.
+
+    Told only "String not found", a small model's next move is `write_file`
+    with the whole file regenerated, which is how a one-line change becomes a
+    truncated file. Shown the real lines, it quotes them back and the second
+    call lands. The region is computed deterministically (`patch.nearest_region`)
+    and omitted entirely when nothing is close enough to be worth showing — a
+    wrong region is a wrong instruction.
+    """
+    msg = f"String not found in {path}: {old_str[:80]!r}"
+    near = nearest_region(original, old_str)
+    if near:
+        msg += (
+            "\nThe closest text in the file is below. Copy old_str from it "
+            "verbatim (without the line-number gutter):\n" + near
+        )
+    return msg
+
+
 def edit_file(path: str, old_str: str, new_str: str) -> ToolResult:
+    """Replace one unique block of text in a file.
+
+    Matching is the shared ladder in `app/agent/patch.py`: exact first, then
+    whitespace-tolerant, then a unique multi-line fuzzy match. Before that this
+    was exact-only, so a 7B that misquoted the indentation got a refusal and
+    answered it by rewriting the file — the agent's own editor would have
+    applied the very same edit. Ambiguity is still refused, never guessed.
+    """
     jail = _jail_check(path)
     if jail:
         return _err(jail)
     try:
         p = Path(path)
         original = p.read_text(encoding="utf-8", errors="replace")
-        if old_str not in original:
-            return _err(f"String not found in {path}: {old_str[:80]!r}")
+        old_str = strip_line_numbers(old_str)
+        if not old_str:
+            return _err("old_str is empty — nothing to find.")
         count = original.count(old_str)
         if count > 1:
             return _err(
                 f"Ambiguous edit: {count} occurrences of the target string in {path}. "
                 "Provide more context to make it unique."
             )
-        updated = original.replace(old_str, new_str, 1)
+        if count == 1:
+            updated = original.replace(old_str, new_str, 1)
+        else:
+            patched = apply_block(original, old_str, new_str)
+            if patched is None:
+                return _err(_no_match_error(path, original, old_str))
+            updated = patched
         _backup_file(p)  # only after validation — a rejected edit leaves no backup
         p.write_text(updated, encoding="utf-8")
         return _attach_diff(
             _ok(f"Edited {path}: replaced 1 occurrence"), original, updated, path
+        )
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as e:
+        return _err(str(e))
+
+
+def apply_diff(path: str, edits: list[dict] | None = None) -> ToolResult:
+    """Apply several search/replace edits to one file, all or nothing.
+
+    All-or-nothing is the point of having this beside `edit_file`: a partly
+    applied multi-edit leaves a file nobody planned, and the model cannot see
+    what state it is now in, so its next move is a full rewrite. Either every
+    edit matched and the file is written once, or nothing is touched and the
+    report names which edit missed and what it came closest to.
+    """
+    jail = _jail_check(path)
+    if jail:
+        return _err(jail)
+    if not edits:
+        return _err("apply_diff needs a non-empty 'edits' list.")
+    pairs: list[tuple[str, str]] = []
+    for i, e in enumerate(edits):
+        if not isinstance(e, dict):
+            return _err(f"edits[{i}] is not an object with 'search'/'replace'.")
+        search = e.get("search", e.get("old_str", ""))
+        replace = e.get("replace", e.get("new_str", ""))
+        if not isinstance(search, str) or not isinstance(replace, str):
+            return _err(f"edits[{i}]: 'search' and 'replace' must both be strings.")
+        if not search.strip():
+            return _err(f"edits[{i}]: 'search' is empty — nothing to find.")
+        pairs.append((search, replace))
+    try:
+        p = Path(path)
+        original = p.read_text(encoding="utf-8", errors="replace")
+        updated, applied, failed = apply_edits(original, pairs)
+        if failed:
+            report = [
+                f"Applied nothing: {len(failed)} of {len(pairs)} edit(s) did not "
+                f"match {path}."
+            ]
+            for i in failed:
+                report.append(
+                    f"\nedits[{i}] search did not match: "
+                    f"{strip_line_numbers(pairs[i][0]).splitlines()[0][:80]!r}"
+                )
+                near = nearest_region(original, pairs[i][0])
+                if near:
+                    report.append("closest text in the file:\n" + near)
+            return _err("\n".join(report))
+        _backup_file(p)
+        p.write_text(updated, encoding="utf-8")
+        return _attach_diff(
+            _ok(f"Edited {path}: applied {len(applied)} edit(s)"),
+            original,
+            updated,
+            path,
         )
     except FileNotFoundError:
         return _err(f"File not found: {path}")

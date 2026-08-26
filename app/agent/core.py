@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -45,6 +46,8 @@ from app.agent.impact import (
     restore_page_routes,
     vanished_routes,
 )
+from app.agent.instructions import load_instructions
+from app.agent.instructions import to_context_block as instructions_block
 from app.agent.intent import (
     INTENT_JUDGE_SYSTEM,
     build_judge_prompt,
@@ -60,6 +63,13 @@ from app.agent.pageaudit import (
     audit_site,
     repair_instruction,
     repair_plan,
+)
+from app.agent.patch import (
+    apply_block,
+    is_catastrophic_shrink,
+    nearest_region,
+    numbered,
+    strip_line_numbers,
 )
 from app.agent.planner import Planner, _extract_json
 from app.agent.projectspec import (
@@ -112,6 +122,7 @@ from app.agent.visualcheck import (
     filter_visual_complaints,
     parse_visual_verdict,
 )
+from app.memory import turnlog
 from app.memory.conversation import ConversationMemory
 from app.memory.project_memory import ProjectMemory, project_memory
 from app.models.llm import get_llm, get_streaming_llm
@@ -153,6 +164,16 @@ with a relative path like "index.html" — do not just print the code.
 NEVER ask the user to paste file contents. If you need to see a file, find it
 with list_directory or search_files and read it with read_file. You are running
 inside their project — locating the files is your job, not theirs.
+
+CHANGING a file that already exists is edit_file (one change) or apply_diff
+(several changes to the same file). Read the file first and copy old_str /
+search out of what you read, verbatim and with its indentation, including 2-3
+unchanged lines above and below so it is unique. write_file on an existing file
+replaces ALL of it and destroys every line you did not repeat — use it only when
+the user actually asked for the file to be replaced. If an edit reports that it
+did not match, the error shows you the closest text in the file: copy old_str
+from that and call the tool again. Do not answer a failed edit by writing the
+whole file.
 
 The user's message may contain SEVERAL distinct requests. First enumerate every
 one of them, then use tools to complete ALL of them before you give a final
@@ -957,20 +978,40 @@ Change the file by emitting one or more edit blocks in EXACTLY this format:
 >>>>>>> REPLACE
 
 Rules:
-- The SEARCH section MUST match text in the current file exactly — copy it character for character.
-- Keep each block minimal: only the lines that change, plus a little surrounding context.
+- The SEARCH section MUST match text in the current file exactly — copy it character for character, including indentation.
+- The file is shown to you with a line-number gutter (`  12 | code`). The numbers are NOT part of the file: never copy them into a SEARCH block.
+- ANCHOR on a distinctive line — a `def`/`function`/`class` line, a tag, a unique string. Never anchor on a bare `}`, `return`, `</div>` or a blank line: those appear many times and the wrong one will be changed.
+- Include at least 3 lines in SEARCH (the line that changes plus context above and below). A one-line SEARCH is the single most common cause of a failed edit.
+- NEVER put the whole file in a SEARCH block. If a change seems to need that, split it into several small blocks instead.
+- Keep every line you are not changing out of REPLACE only if it is also out of SEARCH — whatever SEARCH covers, REPLACE must restate in full.
 - Use a separate block for each distinct change.
 - Output ONLY the blocks. No explanation, no prose, no markdown code fences.
 
 Example — given this file:
-def greet(name):
-    return "hi"
+   1 | def greet(name):
+   2 |     return "hi"
 and the request "make greet return hello", you output ONLY:
 <<<<<<< SEARCH
+def greet(name):
     return "hi"
 =======
+def greet(name):
     return "hello"
 >>>>>>> REPLACE"""
+
+_PINNED_INSTRUCTIONS = """
+
+## Edit mode — replace one fragment
+You are given ONE exact fragment of a file and a request about it. The rest of
+the file is not yours to touch and is not shown.
+
+Rules:
+- Output the REPLACEMENT for that fragment and nothing else.
+- No SEARCH markers, no `=======`, no explanation, no markdown code fences.
+- Keep the fragment's own indentation style, and keep any template expression
+  (`{{ ... }}`, `{% ... %}`, `<% ... %>`) that must still work — copy those
+  through unless the request is about them.
+- Return the whole fragment rewritten, not only the part that changed."""
 
 _MULTIFILE_PLAN_INSTRUCTIONS = """
 You are planning how to split or reorganize code across MULTIPLE files.
@@ -1002,64 +1043,98 @@ def _parse_search_replace(text: str) -> list[tuple[str, str]]:
     return [(m.group(1), m.group(2)) for m in _SR_BLOCK_RE.finditer(text)]
 
 
-def _leading_ws(s: str) -> str:
-    return s[: len(s) - len(s.lstrip())]
+def _rewrite_refusal(filename: str, existing: str) -> str:
+    """Why a whole-file rewrite of this file must not be attempted, or "".
 
-
-def _apply_block_linewise(content: str, search: str, replace: str) -> str | None:
-    """Whitespace-tolerant fallback matcher (small models mangle indentation).
-
-    Tier 1: match ignoring trailing whitespace.
-    Tier 2: match ignoring all leading/trailing whitespace, then re-indent the
-    replacement to the file's indentation (3B models routinely drop the indent
-    from the SEARCH lines they copy).
+    Only reason so far: the file does not fit in the generation prompt. The
+    answer names the file, its size and what to ask for instead, because the
+    request is still perfectly achievable — as a smaller, targeted edit.
     """
-    c_lines = content.split("\n")
-    s_lines = search.split("\n")
-    n = len(s_lines)
-    if n == 0:
+    cap = max(1000, int(settings.max_rewrite_chars))
+    if len(existing) <= cap:
+        return ""
+    return (
+        f"Refused to rewrite `{filename}` ({len(existing)} bytes): it is larger "
+        f"than the {cap}-byte whole-file rewrite limit, and the surgical edit "
+        f"did not match anything to change. Rewriting it from a partial view of "
+        f"the file would truncate it. Nothing was written.\n\n"
+        f"Name the function, class or section to change (or `@{filename}` plus "
+        f"the specific change) and the edit will be applied in place."
+    )
+
+
+def _parse_pinned_replacement(raw: str) -> str | None:
+    """The replacement fragment out of a pinned-edit answer, or None.
+
+    A 7B told "output only the replacement" still sometimes wraps it in the
+    SEARCH/REPLACE format it was trained on in the prompt above, or in a code
+    fence. Both are recovered rather than refused — the content is right and
+    only the packaging is wrong. Anything empty is None, which sends the caller
+    back to the ordinary path rather than writing a hole into the file.
+    """
+    text = _strip_code_fences(str(raw or "")).strip()
+    if not text:
         return None
+    blocks = _parse_search_replace(text)
+    if blocks:
+        # It answered in the other format anyway; the REPLACE half is the answer.
+        text = blocks[0][1]
+    else:
+        # Or half of it: a stray `>>>>>>> END` / `<<<<<<< FRAGMENT` echo.
+        lines = [
+            ln
+            for ln in text.split("\n")
+            if not re.match(r"^\s*[<>=]{3,}\s*(FRAGMENT|END|SEARCH|REPLACE)?\s*$", ln)
+        ]
+        text = "\n".join(lines)
+    return text.strip("\n") or None
 
-    cs = [x.rstrip() for x in c_lines]
-    ss = [x.rstrip() for x in s_lines]
-    for i in range(0, len(c_lines) - n + 1):
-        if cs[i : i + n] == ss:
-            return "\n".join(c_lines[:i] + replace.split("\n") + c_lines[i + n :])
 
-    csf = [x.strip() for x in c_lines]
-    ssf = [x.strip() for x in s_lines]
-    for i in range(0, len(c_lines) - n + 1):
-        if csf[i : i + n] == ssf:
-            file_indent = _leading_ws(c_lines[i])
-            search_indent = _leading_ws(s_lines[0])
-            pad = (
-                file_indent[: len(file_indent) - len(search_indent)]
-                if file_indent.endswith(search_indent)
-                else ""
-            )
-            r_lines = [(pad + rl if rl.strip() else rl) for rl in replace.split("\n")]
-            return "\n".join(c_lines[:i] + r_lines + c_lines[i + n :])
-    return None
+def _shrink_refused(old: str, new: str, message: str) -> bool:
+    """Would this write truncate the file rather than edit it? (settings-gated)
+
+    Lives here rather than inline because BOTH write paths need it: a SEARCH
+    block that swallowed the file, and a whole-file rewrite that came back
+    short. Neither is visible to `check_file` — half a Python file compiles.
+    """
+    if not settings.shrink_guard:
+        return False
+    return is_catastrophic_shrink(
+        old,
+        new,
+        message,
+        min_chars=int(settings.shrink_guard_min_chars),
+        floor=float(settings.shrink_guard_floor),
+    )
 
 
 def _apply_search_replace(
     content: str, blocks: list[tuple[str, str]]
 ) -> tuple[str, int, int]:
-    """Apply SEARCH/REPLACE blocks. Returns (new_content, applied, failed)."""
+    """Apply SEARCH/REPLACE blocks. Returns (new_content, applied, failed).
+
+    The matching ladder itself lives in `app/agent/patch.py` — the `edit_file`
+    TOOL needs exactly the same tolerance, and a second copy of it is a second
+    thing that can drift.
+    """
+    new, applied, failed = _apply_search_replace_detailed(content, blocks)
+    return new, len(applied), len(failed)
+
+
+def _apply_search_replace_detailed(
+    content: str, blocks: list[tuple[str, str]]
+) -> tuple[str, list[int], list[int]]:
+    """As above, but naming WHICH blocks missed so the retry can quote them."""
     new = content
-    applied = 0
-    failed = 0
-    for search, replace in blocks:
-        if search and search in new:
-            new = new.replace(search, replace, 1)
-            applied += 1
-            continue
-        patched = _apply_block_linewise(new, search, replace) if search else None
-        if patched is not None:
-            new = patched
-            applied += 1
+    applied: list[int] = []
+    failed: list[int] = []
+    for i, (search, replace) in enumerate(blocks):
+        patched = apply_block(new, search, replace) if search else None
+        if patched is None:
+            failed.append(i)
         else:
-            failed += 1
+            new = patched
+            applied.append(i)
     return new, applied, failed
 
 
@@ -1161,6 +1236,12 @@ class AgentCore:
         # at the top of every chat() turn. None means "no memory yet".
         self._spec: ProjectSpec | None = None
         self._skills_context: str = ""
+        # The user's own conventions for the loaded project
+        # (`<project>/.coder/INSTRUCTIONS.md`, app/agent/instructions.py). Set by
+        # load_project and by nothing else — "" means no project, no file, or the
+        # feature turned off, and every prompt then reads exactly as it did
+        # before the file existed.
+        self._instructions: str = ""
         self.mcp_manager = mcp_manager
         self.skill_loader = skill_loader  # SkillLoader | None
         self._watcher = None  # ProjectWatcher for live reindex (Step 4)
@@ -1184,6 +1265,19 @@ class AgentCore:
         # already uses. Cleared in chat(); "" on every turn that references none,
         # which is what makes those stages behave exactly as they did before.
         self._spec_doc: str = ""
+        # Who is driving this turn — "cli", or "telegram:<user_id>" when a bot
+        # front-end sets it (Phase T0, docs/telegram-bot-plan.md). Recorded with
+        # the turn, because a session driven by two front-ends otherwise reads
+        # as one actor in the history and "they worked at the same time" is not
+        # checkable from the record afterwards. An attribute rather than a
+        # `chat()` argument so every existing caller and test is untouched.
+        self.turn_source: str = turnlog.SOURCE_CLI
+        # Which route `chat()` took this turn, and what the classifier called
+        # it. Per-turn, set by the routing block and read only by the recorder:
+        # the decision is made from state that is gone by the time the answer
+        # comes back (the spec, the blueprint, the compound splitter's verdict).
+        self._turn_flow: str = ""
+        self._turn_task_type: str = ""
         # Progress lines for long non-streaming work (currently the vision call,
         # which swaps the loaded Ollama model and takes seconds). The REPL
         # installs a hook that writes into its Live region; unset = silent.
@@ -1232,6 +1326,15 @@ class AgentCore:
         commands so they don't reach into `_project_path` — Step 12 / A4)."""
         return self._project_path
 
+    @property
+    def instructions(self) -> str:
+        """The project conventions currently in effect, exactly as the model
+        sees them — already capped, and carrying their own truncation note if
+        they were cut. "" when there are none. Public accessor for `/instructions`
+        (Step 12 / A4); re-reading the file there would show text the model never
+        received, which is the opposite of what the command is for."""
+        return self._instructions
+
     def get_spec(self) -> ProjectSpec | None:
         """The project's persisted contract, freshly read from disk.
 
@@ -1277,10 +1380,39 @@ class AgentCore:
         self._project_path = project_path
         # Narrow the file-tool path jail (Step 5 / S2) to the loaded project.
         settings.sandbox_root = Path(project_path).resolve()
+        self._load_instructions(project_path)
         index_stats = self.retriever.index_project(project_path)
         await self.pm.index_project(project_path)
         self._start_watching(project_path)
+        # Reported, not silent: this file travels with the folder, so a project
+        # cloned from elsewhere can carry one, and the user must be able to see
+        # that instructions they did not write are in effect. Purely additive to
+        # the returned stats — callers that ignore the key are unaffected.
+        if self._instructions:
+            index_stats = {
+                **index_stats,
+                "instructions_chars": len(self._instructions),
+            }
         return index_stats
+
+    def _load_instructions(self, project_path: str) -> None:
+        """Read this project's `.coder/INSTRUCTIONS.md` into `_instructions`.
+
+        Always ASSIGNS, so loading a second project cannot leave the first
+        project's conventions in effect. Best-effort by construction —
+        `load_instructions` returns "" for every failure — but wrapped anyway,
+        since project loading must never fail over an optional file.
+        """
+        if not settings.project_instructions:
+            self._instructions = ""
+            return
+        try:
+            self._instructions = load_instructions(
+                project_path, settings.max_instructions_chars
+            )
+        except Exception as e:
+            logger.warning("project instructions unavailable: %s", e)
+            self._instructions = ""
 
     def _start_watching(self, project_path: str) -> None:
         """Start (or restart) the live-reindex watcher for project_path.
@@ -1322,6 +1454,14 @@ class AgentCore:
 
     def set_skills_context(self, skills_text: str) -> None:
         self._skills_context = skills_text
+
+    def _instructions_context(self) -> str:
+        """The user's project conventions, as a prompt block ("" when there are
+        none). Stated right after the system prompt at every generation site —
+        a convention that holds for the project holds for the tool loop, a file
+        write and a surgical edit alike, and one that reached only some of them
+        would look like the model ignoring it at random."""
+        return instructions_block(self._instructions)
 
     def set_model(self, model_name: str) -> str:
         """Switch the Ollama LLM at runtime (Step 15 / U5). Rebuilds every cached
@@ -1382,6 +1522,15 @@ class AgentCore:
         include_tool_protocol: bool = True,
     ) -> list:
         parts: list[str] = [_load_system_prompt()]
+
+        # The user's own conventions for this project. Deliberately NOT wrapped
+        # as untrusted data: this is the user's configuration, like a skill, not
+        # file content the model happened to retrieve. It grants nothing — the
+        # permission gate, the path jail and the shell denylist are all below the
+        # prompt — and loading it is reported by load_project.
+        instr = self._instructions_context()
+        if instr:
+            parts.append(f"\n{instr}")
 
         # Injected skill instructions
         if self._skills_context:
@@ -1532,7 +1681,12 @@ class AgentCore:
                 # tool loop, so a follow-up query sees the edit, not stale content.
                 if result.get("success"):
                     _p = arguments.get("path")
-                    if _p and tool_name in ("write_file", "edit_file", "create_file"):
+                    if _p and tool_name in (
+                        "write_file",
+                        "edit_file",
+                        "apply_diff",
+                        "create_file",
+                    ):
                         self._reindex_after_write(_p)
                     elif _p and tool_name == "delete_file":
                         self._reindex_after_delete(_p)
@@ -1631,6 +1785,35 @@ class AgentCore:
             except Exception:
                 continue
         return refs[0]
+
+    def _names_an_existing_file(self, message: str) -> bool:
+        """Does this message name a file the project already has?
+
+        The blueprint gate's veto: such a request is an edit to what exists, not
+        a greenfield build, however much it reads like one. Best-effort and
+        total — anything it cannot resolve is False, so routing is unchanged for
+        every message that names nothing.
+        """
+        if not self._project_path:
+            return False
+        try:
+            filename = _extract_filename(message)
+            if not filename:
+                return False
+            workdir = Path(self._project_path)
+            if (workdir / filename).is_file():
+                return True
+            # `_locate_named_file` deliberately KEEPS an unresolved name when
+            # the request is creating something ("create theme.css" is supposed
+            # to name a file that does not exist yet), so the answer alone is
+            # not enough — the path it returns has to be a real file.
+            located = self._locate_named_file(filename, workdir, message)
+            # It answers with a path RELATIVE to the project, so resolve it
+            # against the project rather than against the process's cwd.
+            return bool(located) and (workdir / located).is_file()
+        except Exception:
+            logger.debug("could not test the message for a known file", exc_info=True)
+            return False
 
     def _locate_named_file(
         self, filename: str, workdir: Path, user_message: str
@@ -2195,9 +2378,20 @@ class AgentCore:
             if edited is not None:
                 return edited
             # else: blocks didn't parse/match → fall through to whole-file rewrite.
+            refusal = _rewrite_refusal(filename, full_existing)
+            if refusal:
+                # A rewrite that cannot see the whole file must not run: it
+                # returns a file ending wherever its view of the input ended,
+                # and that result parses, verifies and destroys the rest. Saying
+                # so is strictly better than writing it.
+                logger.warning("whole-file rewrite refused for %s", filename)
+                return refusal, []
 
         # Create (or whole-file rewrite fallback) via FILENAME: full-content generation.
         sys_parts = [_load_system_prompt()]
+        instr = self._instructions_context()
+        if instr:
+            sys_parts.append(f"\n{instr}")
         if self._skills_context:
             sys_parts.append(f"\n## Active Skills\n{self._skills_context}")
         sys_parts.append(_FILE_GEN_INSTRUCTIONS)
@@ -2216,9 +2410,17 @@ class AgentCore:
         if spec_block:
             ctx += f"\n\n{spec_block}"
         if full_existing:
+            # This used to paste `full_existing[:4000]` under the words "return
+            # the COMPLETE updated file", so every file over 4000 characters was
+            # shown to the model already cut off — and came back cut off, and
+            # was written. That is the reported "it truncates my code", produced
+            # by the pipeline rather than by the model, and invisible to every
+            # check because half a file parses. Above the cap the rewrite is
+            # REFUSED instead (see the guard at the top of this branch).
             ctx += (
                 f"\n\nThe file '{filename}' already exists. Apply the requested change "
-                f"and return the COMPLETE updated file:\n\n{full_existing[:4000]}"
+                f"and return the COMPLETE updated file — every line of it, including "
+                f"the parts the request does not mention:\n\n{full_existing}"
             )
 
         messages = [
@@ -2240,6 +2442,26 @@ class AgentCore:
         content, choice_note = await self._best_of_candidates(
             messages, name, content, fallback, filename, workdir, on_token
         )
+        if full_existing and _shrink_refused(full_existing, content, user_message):
+            # The model answered with a fragment of the file it was asked to
+            # return in full — the commonest way a "rewrite" loses working code,
+            # and one nothing downstream can detect: a truncated file compiles.
+            # Refuse the write; the file on disk is still the working one.
+            logger.warning(
+                "rewrite refused: %s would shrink %d bytes to %d",
+                filename,
+                len(full_existing),
+                len(content),
+            )
+            return (
+                f"Refused to write `{filename}`: the regenerated file was "
+                f"{len(content)} bytes against the existing {len(full_existing)}, "
+                f"so it is a truncation rather than an edit. Nothing was written "
+                f"and the file on disk is unchanged.\n\n"
+                f"Re-run with a narrower request naming the part to change, or "
+                f'say "rewrite it from scratch" if replacing the whole file '
+                f"really is what you want."
+            ), []
         out_path = workdir / name
         result = await self.executor.execute(
             "write_file", {"path": str(out_path), "content": content}
@@ -2328,6 +2550,89 @@ class AgentCore:
         best, scores = pick_best(candidates, name, endpoints)
         return candidates[best][1], describe_choice(best, scores)
 
+    def _edit_view(self, text: str) -> str:
+        """The file as the editing model sees it: numbered, and honest about a cut.
+
+        `max_edit_context_chars` replaces a hardcoded 6000, which was never a
+        context limit (`llm_num_ctx` is 16384 tokens) and only ever guaranteed
+        that an edit aimed past character 6000 could not match — and an
+        unmatchable edit falls through to the whole-file rewrite. When a file
+        genuinely will not fit, the cut is STATED: an unannounced one reads to
+        the model as the whole file, so it edits the end of a file that has no
+        end and the SEARCH block cannot match anything.
+        """
+        cap = max(1000, int(settings.max_edit_context_chars))
+        if len(text) <= cap:
+            return numbered(text)
+        head = text[:cap]
+        shown = head.count("\n") + 1
+        total = text.count("\n") + 1
+        return (
+            f"{numbered(head)}\n"
+            f"[TRUNCATED: showing lines 1-{shown} of {total}. Do not write a "
+            f"SEARCH block for text you cannot see.]"
+        )
+
+    async def _retry_failed_blocks(
+        self,
+        messages: list,
+        editable: str,
+        blocks: list[tuple[str, str]],
+        missed: list[int],
+        current: str,
+    ) -> tuple[str, int] | None:
+        """Re-ask ONLY the blocks that missed, showing the text they came closest to.
+
+        Returns (new_content, how many changes it recovered) or None if the
+        retry helped nothing. Exactly one retry: a loop here is a loop of full-file prompts
+        against a 7B, and the caller's fallback is already correct.
+        """
+        report = []
+        for i in missed:
+            search = blocks[i][0]
+            near = nearest_region(editable, search)
+            quoted = strip_line_numbers(search).split("\n")[0][:80]
+            if near:
+                report.append(
+                    f"- This SEARCH matched nothing: {quoted!r}\n"
+                    f"  The closest text in the file is:\n{near}"
+                )
+            else:
+                report.append(f"- This SEARCH matched nothing: {quoted!r}")
+        if not report:
+            return None
+        messages.append(
+            HumanMessage(
+                content=(
+                    f"{len(missed)} of your SEARCH block(s) did not match the "
+                    "file:\n\n"
+                    + "\n".join(report)
+                    + "\n\nOutput ONLY the corrected block(s) for those changes, "
+                    "copying the SEARCH lines verbatim from the text above "
+                    "(without the line-number gutter). Do not repeat the blocks "
+                    "that already worked."
+                )
+            )
+        )
+        try:
+            raw = await asyncio.to_thread(
+                lambda: str(self._llm_edit.invoke(messages).content)
+            )
+        except Exception:
+            return None
+        retry_blocks = _parse_search_replace(raw)
+        if not retry_blocks:
+            return None
+        # Applied against `current` — the text the successful blocks already
+        # produced — so a correction never reverts a change that landed.
+        patched, ok, _still = _apply_search_replace_detailed(current, retry_blocks)
+        if not ok:
+            return None
+        # How many of the missed changes the correction recovered. The retry's
+        # blocks are new text, not a re-send of the originals, so they cannot be
+        # mapped back one-to-one — the count is what the answer line reports.
+        return patched, len(ok)
+
     async def _surgical_edit(
         self,
         filename: str,
@@ -2336,6 +2641,7 @@ class AgentCore:
         user_message: str,
         extra_context: str = "",
         region: BlockRegion | None = None,
+        pinned: str | None = None,
     ) -> tuple[str, list[dict]] | None:
         """Edit an existing file via SEARCH/REPLACE blocks.
 
@@ -2347,20 +2653,37 @@ class AgentCore:
         against that body, and the result is spliced back. `{% extends %}`,
         `{% block title %}` and the file's other blocks cannot be lost, because
         they are never part of the text being edited.
+
+        ``pinned`` is the click path (`app/agent/pointer.py`): the SEARCH half is
+        already known — it was lifted verbatim out of this file — so the model is
+        asked for the REPLACEMENT ONLY. That deletes the entire failure class the
+        rest of this method is built to survive: a pinned SEARCH cannot be
+        misquoted, cannot fail to match, and never reaches the rewrite fallback.
         """
         # Deliberately NOT the full persona prompt — its "confirm what you did"
         # rule pushes the model toward prose. Keep it a strict editing engine.
         sys_parts = ["You are a precise code-editing engine. You output only edits."]
+        instr = self._instructions_context()
+        if instr:
+            sys_parts.append(f"\n{instr}")
         if self._skills_context:
             sys_parts.append(f"\n## Active Skills\n{self._skills_context}")
-        sys_parts.append(_EDIT_INSTRUCTIONS)
+        sys_parts.append(_PINNED_INSTRUCTIONS if pinned else _EDIT_INSTRUCTIONS)
 
         guard = _extension_guard(filename)
         guard_line = f"IMPORTANT: {guard}\n\n" if guard else ""
         extra_block = f"{extra_context}\n\n" if extra_context else ""
         editable = full_content if region is None else region.body
+        # The file is shown NUMBERED (patch.numbered): a small model given a
+        # gutter anchors better, and `patch.strip_line_numbers` removes the
+        # gutter again if it copies one back into a SEARCH block — which is what
+        # makes showing it safe. `_edit_view` also states any truncation instead
+        # of applying one silently; SEARCH cannot match text that was cut.
         if region is None:
-            head = f"File: {filename}\nCurrent content:\n{full_content[:6000]}\n\n"
+            head = (
+                f"File: {filename}\nCurrent content:\n"
+                f"{self._edit_view(full_content)}\n\n"
+            )
         else:
             siblings = (
                 " Its other block(s): "
@@ -2377,15 +2700,32 @@ class AgentCore:
                 "shown below. Do not output any `{% extends %}`, `{% block %}` "
                 "or `{% endblock %}` line — they are not part of this text, and "
                 "SEARCH must match the text below exactly.\n\n"
-                f"Body of {{% block {region.name} %}}:\n{region.body[:6000]}\n\n"
+                f"Body of {{% block {region.name} %}}:\n"
+                f"{self._edit_view(region.body)}\n\n"
             )
-        ctx = (
-            f"{head}"
-            f"{extra_block}"
-            f"{guard_line}"
-            f"Request: {user_message}\n\n"
-            f"Output the SEARCH/REPLACE block(s) now:"
-        )
+        if pinned:
+            # No file listing and no SEARCH: the span is already known, so the
+            # prompt is as small as the job — this fragment, this request, the
+            # replacement. Everything outside it is out of reach by
+            # construction, which is the same guarantee `region` gives one
+            # level up and this gives one level finer.
+            ctx = (
+                f"File: {filename}\n"
+                f"{extra_block}"
+                f"{guard_line}"
+                "This exact fragment of the file is what must change:\n"
+                f"<<<<<<< FRAGMENT\n{pinned}\n>>>>>>> END\n\n"
+                f"Request: {user_message}\n\n"
+                "Output the replacement for that fragment now:"
+            )
+        else:
+            ctx = (
+                f"{head}"
+                f"{extra_block}"
+                f"{guard_line}"
+                f"Request: {user_message}\n\n"
+                f"Output the SEARCH/REPLACE block(s) now:"
+            )
         messages = [
             SystemMessage(content="\n".join(sys_parts)),
             HumanMessage(content=ctx),
@@ -2395,7 +2735,13 @@ class AgentCore:
         except Exception:
             return None
 
-        blocks = _parse_search_replace(raw)
+        if pinned:
+            replacement = _parse_pinned_replacement(str(raw))
+            if replacement is None:
+                return None
+            blocks = [(pinned, replacement)]
+        else:
+            blocks = _parse_search_replace(raw)
         if not blocks:
             # One firm retry before giving up and falling back to a rewrite.
             messages.append(
@@ -2415,9 +2761,36 @@ class AgentCore:
             if not blocks:
                 return None
 
-        new_content, applied, failed = _apply_search_replace(editable, blocks)
+        new_content, ok_idx, missed = _apply_search_replace_detailed(editable, blocks)
+        applied, failed = len(ok_idx), len(missed)
+        if missed:
+            # A SEARCH that matched nothing used to end the attempt and hand the
+            # file to the whole-file rewrite. But the model does not need to be
+            # told it failed — it needs to be shown the text it was trying to
+            # quote, which `patch.nearest_region` can name deterministically.
+            # One retry, and only the blocks that missed are re-asked, so the
+            # ones that landed are not applied twice.
+            retry = await self._retry_failed_blocks(
+                messages, editable, blocks, missed, new_content
+            )
+            if retry is not None:
+                new_content, recovered = retry
+                applied += recovered
+                failed = max(0, failed - recovered)
         if applied == 0:
             return None  # nothing matched → let caller rewrite the whole file
+        if _shrink_refused(editable, new_content, user_message):
+            # A SEARCH block covering most of the file, replaced by a stub, is
+            # the exact failure the block format exists to prevent — and it
+            # parses, so no later stage can see it. Refusing here sends the
+            # caller to the rewrite path, which has the same guard.
+            logger.warning(
+                "surgical edit refused: %s would shrink %d bytes to %d",
+                filename,
+                len(editable),
+                len(new_content),
+            )
+            return None
         if region is not None:
             # The ONLY writer of the spliced file: everything outside the block
             # is copied through byte-for-byte.
@@ -5591,6 +5964,12 @@ class AgentCore:
 
         answer: str | None = None
         trace: list[dict] = []
+        # T0: the turn's own record. Reset here rather than in `__init__` so a
+        # turn that raises cannot leave the previous turn's route attached to
+        # the next one.
+        started = time.monotonic()
+        self._turn_flow = ""
+        self._turn_task_type = ""
 
         # Requirements Blueprint: a greenfield build ("build me a login page") is
         # expanded into the WHOLE build — the implied features, a backend, and an
@@ -5614,10 +5993,26 @@ class AgentCore:
             answer, trace = await self._amend_project(
                 clean_message, self._spec, at_refs
             )
+            self._turn_flow = turnlog.FLOW_AMEND
 
         if (
             answer is None
             and settings.expand_requirements
+            # A request that NAMES A FILE THIS PROJECT ALREADY HAS is an edit,
+            # whatever it otherwise looks like. `should_amend` is the guard for
+            # this and it is gated on a saved spec — which a static build never
+            # writes, so nothing protected one. Measured on a live static game:
+            # turn 2 said "Fix js/audio.js. It loads sounds/shoot.wav ...
+            # replace it with Web Audio synthesis", the web-intent classifier
+            # read that as a web app, and the turn scaffolded a whole Express
+            # project — server.js, db.js, models.js, seed.js, views/, package
+            # .json — into a folder that is a static site, then reported that
+            # its smoke test could not run because `node_modules` was missing.
+            #
+            # Deterministic and narrow: the name has to RESOLVE to a file that
+            # exists (`_locate_named_file`'s rule), so a greenfield "build me a
+            # blog" names nothing and blueprints exactly as before.
+            and not self._names_an_existing_file(clean_message)
             # Tier 1 is the free verb×noun regex. Tier 2 (Phase B) asks a model
             # the one thing a noun list cannot know — "is this a web app?" — and
             # only for messages `may_be_web_build` has already judged genuine
@@ -5645,6 +6040,7 @@ class AgentCore:
                 answer, trace = await self._run_blueprint(
                     clean_message, blueprint, at_refs
                 )
+                self._turn_flow = turnlog.FLOW_BLUEPRINT
 
         # M1: decompose a multi-task request into ordered sub-tasks so each is
         # routed and completed (with shared context), instead of only the first.
@@ -5655,6 +6051,7 @@ class AgentCore:
                 answer, trace = await self._run_subtasks(
                     subtasks[: settings.max_plan_tasks], at_refs
                 )
+                self._turn_flow = turnlog.FLOW_SUBTASKS
             elif wants_multifile(clean_message):
                 # Explicit multi-file build → _multi_file_flow (via _route_one).
                 # It has its own per-file planner that must see the FULL spec; LLM
@@ -5663,12 +6060,14 @@ class AgentCore:
                 answer, trace = await self._route_one(
                     clean_message, at_refs, on_token=on_token
                 )
+                self._turn_flow = turnlog.FLOW_MULTIFILE
             else:
                 # One task per the cheap splitter. Classify once; then for a
                 # request that reads as multi-part prose (a build spanning several
                 # files/pages, no explicit "then"/"also"), ask the LLM planner to
                 # break it into ordered steps — this is the natural-language path.
                 task_type = self.planner.classify(clean_message)
+                self._turn_task_type = task_type
                 should_plan = settings.decompose_multitask and (
                     task_type == "multi_step"
                     or (
@@ -5681,10 +6080,12 @@ class AgentCore:
                     answer, trace = await self._run_subtasks(
                         planned[: settings.max_plan_tasks], at_refs
                     )
+                    self._turn_flow = turnlog.FLOW_SUBTASKS
                 else:
                     answer, trace = await self._route_one(
                         clean_message, at_refs, task_type=task_type, on_token=on_token
                     )
+                    self._turn_flow = turnlog.FLOW_SINGLE
 
         # Blueprint coverage (weaknesses.md #3): if this turn was a blueprint
         # build, verify the whole thing shipped — create any planned file that's
@@ -5823,6 +6224,22 @@ class AgentCore:
             answer += await self._repair_view_locals(_workdir)
 
         await self.memory.add_ai(answer)
+        # T0: the rest of the record — route, tools, files, who asked, how long.
+        # Best-effort by construction (`record_turn` never raises): a history
+        # that will not write must never cost a turn whose files already landed,
+        # which is the rule `ProjectSpec.save` follows.
+        if settings.record_turns:
+            await turnlog.record_turn(
+                session_id=self.memory.session_id,
+                user_message=user_message,
+                answer=answer,
+                trace=trace,
+                source=self.turn_source,
+                project=self._project_path or "",
+                task_type=self._turn_task_type,
+                flow=self._turn_flow,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
         return answer, trace
 
     def _remember_entry_routes(self, workdir: Path) -> None:
@@ -5873,6 +6290,74 @@ class AgentCore:
             "repair pass had ended the file at the last route, so the app "
             "defined its handlers and then exited without ever listening."
         )
+
+    async def edit_pointed_element(
+        self, element, instruction: str, workdir: Path | str | None = None
+    ) -> tuple[str, list[dict]]:
+        """Apply a change to the element the user clicked in the running app.
+
+        The point of the whole pointer path: the SEARCH half of the edit is
+        lifted verbatim out of the file rather than quoted by the model, so the
+        one thing a 7B is worst at — deciding WHERE — is not asked of it at all,
+        and the one thing it is good at, writing the fragment, is all that is
+        left. Nothing here can widen: an unresolved click is reported, never
+        guessed at with a filename.
+        """
+        from app.agent.pointer import Decline, resolve_element
+
+        root = Path(workdir or self._project_path or Path.cwd())
+        # There is no turn around a `/point`, so pin the stack from the project
+        # itself — `resolve_key`'s precedence, the rule `repair_entry_before_run`
+        # follows for the same reason.
+        try:
+            self._select_stack(self._load_or_adopt_spec(root))
+        except Exception:
+            logger.debug("pointer: stack selection failed", exc_info=True)
+
+        target = resolve_element(root, self._adapter, element)
+        if isinstance(target, Decline):
+            return target.reason, []
+
+        path = root / target.path
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return f"Could not read {target.path}: {exc}", []
+        if target.search not in source:
+            # The file moved under the click (another turn, an editor, a repair
+            # pass). Re-pointing is one click; editing a stale span is a silent
+            # wrong edit.
+            return (
+                f"`{target.path}` changed since that click — nothing was edited. "
+                "Run `/point` again.",
+                [],
+            )
+
+        edited = await self._surgical_edit(
+            target.path,
+            path,
+            source,
+            instruction,
+            pinned=target.search,
+        )
+        if edited is None:
+            return (
+                f"The model returned no usable replacement for the clicked "
+                f"element in `{target.path}`. Nothing was written.",
+                [],
+            )
+        answer, trace = edited
+        where = f" (line {target.line}, matched by {target.how}" + (
+            f", inside {{% block {target.region} %}})" if target.region else ")"
+        )
+        # D3: fold the write back into project memory, exactly as the chat()
+        # seam does — a `/point` edit that adds a route must not leave the spec
+        # describing a project that no longer exists.
+        try:
+            self._sync_spec_after_writes(trace)
+        except Exception:
+            logger.debug("pointer: spec sync failed", exc_info=True)
+        return answer + where, trace
 
     async def repair_entry_before_run(
         self, workdir: Path | str | None = None

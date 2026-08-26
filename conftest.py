@@ -93,3 +93,18 @@ def _no_blueprint(monkeypatch):
     # gate MISSES, which is most test prompts, and it runs before any method a
     # blueprint test would think to patch.
     monkeypatch.setattr(settings, "web_intent_fallback", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_turn_log(monkeypatch):
+    """Default the turn log OFF in tests — the `_no_intent_check` pattern.
+
+    `record_turns` ships ON (Phase T0), and it writes into `.coder.db` — which
+    is bound to an engine built at import from `settings.sqlite_path`, so every
+    scripted `chat()` in this suite would append a `pytest_*` session to the
+    REPO's real working history. That history is a deliverable; test rows in it
+    are worse than a missing check.
+
+    `tests/test_turnlog.py` opts back in for the tests that are about it.
+    """
+    monkeypatch.setattr(settings, "record_turns", False)

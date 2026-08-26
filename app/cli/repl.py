@@ -23,7 +23,10 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from app.agent.core import AgentCore
+from app.agent.instructions import instructions_path
+from app.agent.sessions import session_registry
 from app.cli.commands import handle_command
+from app.memory import turnlog
 from config.settings import settings
 
 if TYPE_CHECKING:
@@ -127,6 +130,12 @@ class CoderREPL:
         # whole session, and the Live region to pause while prompting.
         self._session_allows: set[str] = set()
         self._active_live: Live | None = None
+        # T1/T4: the process's one registry. The REPL's own turns go through it
+        # too — otherwise the CLI would not take the project's cross-process
+        # lock, and "the bot waits for the terminal" would be false in exactly
+        # the direction that matters.
+        self.registry = session_registry()
+        self.bot = None  # set by /bot start
 
     # ------------------------------------------------------------------
     # Project loading
@@ -139,10 +148,27 @@ class CoderREPL:
             return
         with console.status(f"[cyan]Indexing {p.name}...[/cyan]"):
             stats = await self.agent.load_project(str(p))
+        # Register THIS agent as the project's session, rather than letting the
+        # registry build a second one on the bot's first message: two cores on
+        # one project each hold their own spec, and turn 2 would plan against
+        # turn 1's stale contract.
+        self.registry.adopt(p, self.agent, self.agent.memory.session_id)
         console.print(
             f"[green]Project loaded:[/green] {p.name}  "
             f"[dim]({stats.get('files', 0)} files, {stats.get('chunks', 0)} chunks)[/dim]"
         )
+        # Instructions travel with the project folder, so a cloned repo can carry
+        # a file the user never wrote. Say when one is in effect — it reaches
+        # every prompt for this project, and silence is what would make that a
+        # surprise.
+        chars = stats.get("instructions_chars")
+        if chars:
+            # escape(): a path is data — a "[" in it would parse as a style tag.
+            where = escape(str(instructions_path(p)))
+            console.print(
+                f"[cyan]Project instructions in effect:[/cyan] "
+                f"[dim]{where} ({chars} chars)[/dim]"
+            )
 
     # ------------------------------------------------------------------
     # Main loop
@@ -214,6 +240,37 @@ class CoderREPL:
             # Agent turn
             await self._agent_turn(user_input)
 
+    async def _chat_in_turn(self, user_input: str, on_token, on_status):
+        """Run one turn through the registry, so the CLI queues like anyone else.
+
+        With no project loaded there is nothing to lock and nothing to share, so
+        the call goes straight to the agent — which is exactly what it did
+        before the registry existed.
+
+        A turn the other front-end is holding WAITS rather than failing, so the
+        CLI's timeout is deliberately absent: this is a person at a keyboard who
+        can press Ctrl-C, and dropping their request after fifteen minutes would
+        lose work they are watching for.
+        """
+        # getattr: the REPL is driven by stand-in agents in the tests, and a
+        # turn that failed on a missing attribute would be a worse bug than the
+        # one the registry fixes. Same guard `/run` uses for its repair hook.
+        project = getattr(self.agent, "project_path", None)
+        if not project:
+            return await self.agent.chat(user_input, on_token=on_token)
+        async with self.registry.turn(
+            project,
+            front_end="cli",
+            source=turnlog.SOURCE_CLI,
+            message=user_input,
+            on_wait=on_status,
+            # Wait for the other front-end for as long as it takes: this is a
+            # person at a keyboard who can press Ctrl-C, and dropping their
+            # request after a timeout would lose work they are watching for.
+            timeout=float("inf"),
+        ) as agent:
+            return await agent.chat(user_input, on_token=on_token)
+
     async def _agent_turn(self, user_input: str) -> None:
         """Send message to agent and display response with tool steps.
 
@@ -263,7 +320,9 @@ class CoderREPL:
 
                 self.agent.status_hook = on_status
                 try:
-                    answer, trace = await self.agent.chat(user_input, on_token=on_token)
+                    answer, trace = await self._chat_in_turn(
+                        user_input, on_token=on_token, on_status=on_status
+                    )
                 finally:
                     self._active_live = None
                     self.agent.status_hook = None
@@ -292,6 +351,23 @@ class CoderREPL:
             console.print(
                 "[dim]Type /clear to reset if the conversation is stuck.[/dim]"
             )
+
+    async def prompt_async(self, text: str) -> str:
+        """One line of input from inside a command, without blocking the loop.
+
+        Same executor hop the main loop uses — `prompt_toolkit`'s prompt is
+        synchronous, and calling it on the event loop thread freezes everything
+        the turn is doing. Returns "" rather than raising on Ctrl-C/EOF, so a
+        cancelled sub-prompt reads as "nothing was asked for".
+        """
+        if self._session is None:
+            return ""
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self._session.prompt(text)  # type: ignore[union-attr]
+            )
+        except (EOFError, KeyboardInterrupt):
+            return ""
 
     async def _approve_tool(
         self, tool_name: str, arguments: dict, permissions: list[str]

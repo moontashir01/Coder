@@ -18,6 +18,12 @@ ollama pull qwen2.5-coder:7b
 ollama pull nomic-embed-text
 ollama pull qwen2.5vl:7b        # optional — only for @screenshot.png refs
 ```
+Optional extras, both of which reach the network (once, to install) and neither of which the
+build itself ever uses:
+```
+pip install -e ".[browser]" && python -m playwright install chromium   # W4-W7 checks + /point
+pip install -e ".[telegram]"                                          # the Telegram front-end
+```
 All Python work uses the venv (`.venv\Scripts\activate` on Windows, `source .venv/bin/activate` on Unix).
 
 ## Common Commands
@@ -194,9 +200,9 @@ protocol (see the "3B-era hardening" note below — the default is now `qwen2.5-
   - **Edit existing file → surgical first (`_surgical_edit`).** Asks `_llm_edit` (temperature 0,
     few-shot, editor-only system prompt — NOT the persona, whose "confirm what you did" rule causes
     prose) for `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` blocks. `_apply_search_replace` applies
-    them: exact substring → trailing-ws-tolerant → strip-tolerant **with replacement re-indented to
-    the file** (3B routinely drops the SEARCH indentation). One retry, then **fall back to a
-    whole-file rewrite** if no block parses/matches. NB: with `qwen2.5-coder:3b` surgical edits fire
+    them through the shared ladder in `app/agent/patch.py` (below). One retry for *unparsed* output
+    and one for *unmatched* blocks, then **fall back to a whole-file rewrite** if nothing lands.
+    NB: with `qwen2.5-coder:3b` surgical edits fire
     reliably (~3/3 in practice); a non-code model like `qwen2.5vl:3b` rarely emits valid blocks and
     keeps falling back. The path is fully unit-tested regardless of model.
 - **`@path` references** (`_extract_at_refs`): in any message, `@src/app.py` pins the edit *target*
@@ -349,6 +355,105 @@ same `app/tools/filesystem._jail_check` the file tools use before reading the by
 — the vision pipeline reads bytes directly and would otherwise bypass the executor's jail. `VISION_MODEL=llava:7b` in `.env` swaps the model with no code
 change. `tests/test_vision.py` covers all of it offline (fake `ChatOllama`, bytes in `tmp_path`).
 
+### Click the page, edit the source (`app/agent/pointer.py`, `/point`)
+
+The premise: **a 7B is not bad at writing twenty lines of markup — it is bad at deciding
+where.** `_extract_filename` → `_locate_named_file` → `_resolve_target_from_spec` →
+`_last_write_fallback` → the tool-loop escalation is five stacked heuristics answering that one
+question by inference, and each carries a comment about the live build where its guess was
+wrong. A click answers it by observation, and `/point` is the seam.
+
+The second-order effect is the bigger one. The mapping ends at a span of **real text taken out
+of the template on disk**, so the SEARCH half of the edit is *constructed*, not quoted:
+`_surgical_edit(pinned=…)` asks the model for the REPLACEMENT ONLY. A pinned SEARCH cannot be
+misquoted, cannot fail to match, and never reaches the rewrite fallback — the entire failure
+class `patch.py` exists to survive is unreachable on this path.
+
+- **The mapping is pure and the browser is not.** Everything above `capture_click` is text and
+  dataclasses in, `PointerTarget` or `Decline` out, so all of it is tested with no browser, no
+  server and no model. `Element` deliberately holds no Playwright types.
+- **URL → template goes through the graph, never a second copy of its rules.**
+  `TemplateGraph.resolve_template` was made public for this: a route stores the template NAME
+  as its source writes it (`render_template("products.html")`, `res.render("products")`) and
+  neither is a path. A path is judged against **every** matching route — `check_links`' union
+  rule, for its reason — and routes that disagree on the template are an ambiguity, so a
+  refusal.
+- **Element → span, three rules, first one with exactly ONE candidate wins**: `id`, then the
+  full class list, then verbatim visible text. Text is last because a template's text is often
+  an expression (the value is in the database, not the file), and first-tried it would match
+  the loop body of every card. Scanning runs on `verify.mask_template_tags`' masked copy — a
+  `>` inside `{% if a > b %}` otherwise truncates the tag — and the span is sliced out of the
+  **real** source, so template expressions reach the SEARCH block intact.
+- **An unbalanced document declines rather than guessing where the element ends.** Splicing at
+  a guessed boundary is exactly how a repair pass corrupts a file.
+- **A click on the nav resolves to the LAYOUT, not the page.** A child template inherits its
+  shell, so an unresolved click retries against `graph.parents(...)` before giving up — and
+  says which file it landed in.
+- **A stale click refuses.** If the pinned span is no longer in the file (another turn, an
+  editor, a repair pass), nothing is written and the answer says to point again. Editing a
+  stale span is a silent wrong edit; re-pointing is one click.
+- **The picker window is HEADED, and that is the only one in the codebase.** Everything else
+  drives Chromium headless because it is *measuring*; this is the user's own eyes. Localhost
+  is checked before launch — `browser.py`'s rule, and it matters more here because the window
+  is interactive. A missing Playwright is `install_hint()`, never a silent no-op.
+- Knobs: `point_timeout` (180s). `/point` requires `/run` first — pointing needs a live page.
+
+### One matcher for every edit, and two truncation guards (`app/agent/patch.py`)
+
+The reported failure was "it rewrites the whole file and loses my code". The block format
+already existed; what produced the rewrites was a set of defects around it, each of which
+turned a targeted edit into a full regeneration — and one that truncated the regeneration.
+
+- **The matching ladder is one module with two callers.** It lived inside
+  `core._apply_block_linewise`, so the `edit_file` **tool** — the path the native tool loop
+  takes — had none of it: `old_str not in original` refused a misquoted indent that the
+  agent's own editor would have applied, and a 7B answers a refused edit with `write_file`
+  and the file regenerated. Rungs: exact substring → trailing-ws → strip-tolerant with the
+  replacement **re-indented to the file** → normalized fuzzy at `FUZZY_RATIO` (0.90).
+  **Rung 4 refuses more than it accepts, and that is the whole safety argument for having
+  it**: never a single-line SEARCH (`return None` occurs eleven times; the first hit is a
+  coin flip), and never two candidates at that ratio. A wrong replacement is silent; a
+  refused one is reported and retried.
+- **The file is shown NUMBERED, and `strip_line_numbers` takes the gutter back off.** A
+  gutter gives a small model a way to say *where*, and creates a way for it to quote the
+  numbers into SEARCH; undoing that deterministically is what makes showing it safe. The
+  stripper is strict on purpose — every non-blank line must carry the prefix and the numbers
+  must strictly increase — so `mask = 1 | 2` is never mistaken for a gutter.
+- **A failed SEARCH is answered with the file's real lines, not with "not found".**
+  `nearest_region` names the closest window deterministically and numbers it; `_surgical_edit`
+  re-asks **only the blocks that missed** (once, against the text the successful blocks
+  already produced, so a correction cannot revert a change that landed), and `edit_file` puts
+  the same region in its error. Told only that it failed, the model rewrites the file; shown
+  the lines, it quotes them back.
+- **`max_edit_context_chars` (24000) replaced a hardcoded 6000 that was never a context
+  limit.** `llm_num_ctx` is 16384 *tokens*. All 6000 ever bought was a guaranteed miss on any
+  edit aimed past it — and a guaranteed miss falls through to the whole-file rewrite, so the
+  wrong number was not cosmetic: it decided which path ran. When a file genuinely does not
+  fit, the cut is **stated** (`_edit_view`), because an unannounced one reads to the model as
+  the whole file.
+- **The rewrite prompt pasted `full_existing[:4000]` under the words "return the COMPLETE
+  updated file".** Every file over 4000 characters was shown cut off, came back cut off, and
+  was written — the reported truncation, produced by the pipeline rather than by the model,
+  and invisible to every check because half a file parses. The paste is now whole, and above
+  `max_rewrite_chars` the rewrite is **refused** (`_rewrite_refusal`, before the LLM call)
+  rather than run against a partial view. **A rewrite that cannot see the whole file must not
+  run.**
+- **`_shrink_refused` is the last line, on both write paths.** A write keeping under
+  `shrink_guard_floor` (0.6) of the file's bytes is a truncation, not an edit — `check_file`
+  cannot see it, and neither can the intent judge. Two exemptions keep it from refusing real
+  work: files under `shrink_guard_min_chars` (400), where a three-line file legitimately
+  becomes a one-line file, and a request that **asked** for removal (`patch.wants_deletion`,
+  which is also the escape hatch — "rewrite it from scratch" writes).
+- **`apply_diff` is all-or-nothing** by design: a half-applied multi-edit leaves a file nobody
+  planned and the model cannot see what state it is in, so its next move is a rewrite. Either
+  every edit matched and the file is written once, or nothing is touched and the report names
+  the edit that missed *and* the text it came closest to.
+- `_tool_guidance` and `_EDIT_INSTRUCTIONS` state the anchoring rules the 7B needs (anchor on
+  a `def`/tag/unique string, never a bare `}`; ≥3 lines of context; never a whole-file SEARCH;
+  `write_file` on an existing file destroys every line you did not repeat). They are prompt
+  hints, so each has a deterministic backstop above — that pairing is `strip_external_assets`'
+  rule.
+
 ### Tool-call loop (native function calling)
 
 `_run_tool_loop()` binds the registry (`ToolRegistry.to_openai_tools()` → OpenAI function format)
@@ -372,7 +477,7 @@ would fight native tool calls. What remains of the hardening:
 ### Tool registry & executor — the central hub
 
 - `app/agent/tool_registry.py` — every tool (builtin, MCP-discovered, skill-unlocked) must be
-  registered here. `create_registry()` builds the default with all 13 builtin tools; `get_registry()`
+  registered here. `create_registry()` builds the default with all 14 builtin tools; `get_registry()`
   is a **lazy** cached accessor (Step 12 / A1 — no eager import-time singleton). Tools carry
   `source` = `"builtin"` | `"mcp:<server>"`
   | `"skill:<skill>"`; `unregister_by_source()` is how MCP disconnect cleans up. Every tool also
@@ -500,7 +605,8 @@ for tests.
 ### Persistence
 
 - `.chroma_db/` — ChromaDB vectors (per-project collections)
-- `.coder.db` — SQLite: conversation turns + project summaries (SQLAlchemy async / aiosqlite)
+- `.coder.db` — SQLite: conversation turns, the turn log (below) + project summaries
+  (SQLAlchemy async / aiosqlite)
 - `.symbols.db` — sqlite3: symbol/import/reference index (sync, separate from `.coder.db`)
 - `.coder_history` — prompt_toolkit history
 - `.coder_backups/` — pre-mutation snapshots for `undo_write` (pruned to `max_write_backups`).
@@ -509,6 +615,215 @@ for tests.
   loaded project the relative default resolves against cwd.
 - `.coder_embed_cache/` — persistent embedding cache, one JSON per SHA-256 (pruned to
   `max_embed_cache_entries`); gitignored
+
+### The working history (`app/memory/turnlog.py`, `/export`)
+
+Phase T0 of `docs/telegram-bot-plan.md`. `conversation_turns` stores role + content — the
+transcript a chat UI needs, and not the one the work needs. The route `chat()` took and the
+tool trace, which is where the reasoning actually is, were returned to the caller and dropped.
+Rebuilt from what was stored, the history of a turn that scaffolded a project, generated eleven
+files, repaired four and ran a smoke test was the request and the reply.
+
+`turn_events` stores the rest: `source`, `project`, `task_type`, `flow`, the compacted tool
+trace, the files written, and the duration. `/export [file]` renders it as Markdown
+(`/export sessions` lists what was recorded, `--session <id>` picks another one).
+
+- **Recording is best-effort and never raises.** `record_turn` returns False instead — it runs
+  at the `chat()` seam beside `memory.add_ai`, so a history that will not write must never cost
+  a turn whose files already landed. `ProjectSpec.save`'s rule.
+- **`source` (`"cli"`, or `"telegram:<user_id>"` once T2 lands) is the point of the table.**
+  A session driven by two front-ends otherwise reads as one actor, and "they worked on it at
+  the same time" is not checkable from the record afterwards. It is an `AgentCore` attribute
+  (`turn_source`), not a `chat()` argument, so every existing caller and test is untouched.
+- **`flow` is recorded, not re-derived.** The decision is made from state that is gone by the
+  time the answer comes back — the spec, the blueprint, the compound splitter's verdict — so
+  `chat()` stamps each branch as it takes it. Both per-turn fields are reset at the TOP of
+  `chat()`, so a turn that raises cannot leave its route attached to the next one.
+- **`render_transcript` is pure** — plain dicts in, a string out, no DB and no event loop — so
+  the format is unit-tested directly. Tool results are capped (`MAX_RESULT_CHARS`): the trace is
+  stored for the record, not for replay, and an unbounded blob makes the table larger than the
+  project it describes.
+- The DB tests pass an explicit `session_factory`. `AsyncSessionLocal` is bound to an engine
+  built at import from `settings.sqlite_path`, so monkeypatching the setting would not move it
+  and the suite would write into the repo's real history.
+
+### Two front-ends, one machine (`app/agent/sessions.py`, `projectlock.py`, `scope.py`)
+
+Phase T1 of `docs/telegram-bot-plan.md`, and deliberately built **before** the bot that needs
+it: "the app and the bot at the same time" is a property of this seam, not a retrofit onto a
+transport. Nothing here is Telegram-specific — a second front-end is just a second caller.
+
+`SessionRegistry` maps a resolved project path to **one** `AgentCore`, one `asyncio.Lock` and a
+last-used stamp. `registry.turn(path, source=…)` is an async context manager that holds
+everything a turn needs and puts it back:
+
+```
+async with registry.turn(project, front_end="telegram", source="telegram:42") as agent:
+    answer, trace = await agent.chat(msg)
+```
+
+- **One core per project, shared by every front-end.** Two cores would each hold their own
+  `_spec`, and turn 2's amendment would plan against turn 1's stale contract — the staleness
+  the multi-turn eval suite exists to catch. `adopt()` is how the REPL joins with the core it
+  already built rather than creating a second one for the same folder.
+- **Turns on one project are serialized; turns on different projects overlap.** `AgentCore`
+  carries per-turn state (`_blueprint`, `_spec_doc`, `_entry_routes`, `_last_write_path`), so
+  two interleaved turns on one core read each other's.
+- **The sandbox root is a `ContextVar`, not a saved-and-restored global** (`scope.py`,
+  `effective_sandbox_root()`, read by `filesystem._jail_check` and `_backup_root`). A
+  save/restore of `settings.sandbox_root` was written first and **measured failing**: two
+  concurrent turns on two projects, and the second turn's assignment moved the FIRST turn's
+  jail while it was still writing. The lock cannot prevent that — different projects are
+  supposed to overlap. Each asyncio Task gets its own copy of the context, which is the
+  property a global cannot have. `settings.sandbox_root` stays the fallback, so a
+  single-front-end session, a library import and every existing test are unchanged.
+  `project_settings()` also restores the global regardless, because `load_project` assigns it.
+- **`<project>/.coder/coder.lock` is the cross-process half.** An `asyncio.Lock` cannot see a
+  `--bot-only` daemon in another terminal. A held lock makes the other front-end **wait and say
+  who holds it** (`on_wait`, `LockInfo.describe`) — never barge, never fail silently; past
+  `turn_lock_timeout` the caller gets `TurnBusy` with the holder named.
+- **Stale locks are reclaimed by PID liveness, not age.** A build turn legitimately runs for
+  minutes. `turn_lock_stale_after` is only the PID-reuse backstop, and a lock written by a
+  different **host** is never reclaimed. **Windows liveness goes through `OpenProcess`, never
+  `os.kill(pid, 0)`** — on Windows that is `TerminateProcess`, i.e. the probe would kill the
+  other front-end mid-turn. `tests/test_sessions.py` drives an actual second process for this,
+  because every other test uses our own PID and so proves the policy rather than that it sees a
+  foreign process at all.
+- **A lock is released only by the process still holding it** (each acquire writes a random
+  token), so a process whose lock was reclaimed cannot delete its successor's.
+- **`init_db` sets WAL + `busy_timeout`.** Two processes appending turns to `.coder.db` are
+  otherwise a `database is locked` on the write that records the answer.
+- Knobs: `cross_process_lock` (kill switch), `turn_lock_timeout` (900s), `turn_lock_stale_after`
+  (3600s), `session_idle_timeout` (1800s — `close_idle` stops the watcher on projects nobody is
+  using; a session with a turn in flight is never closed).
+
+### The Telegram front-end (`app/bot/`)
+
+Phase T2 of `docs/telegram-bot-plan.md`. A second front-end over the T1 seam, and **nothing
+about it is special**: it calls `registry.turn(...)` and `agent.chat(...)` exactly as the REPL
+does, so "the app and the bot on one project" is already true before the bot exists.
+
+Four files, and the split is the point:
+- **`render.py` is pure** — answer markdown to Telegram HTML, and chunking.
+- **`transport.py` is the only file that imports `telegram`**, behind a `Transport` protocol
+  (`send`/`edit`/`typing`/`ask`).
+- **`service.py` holds every decision** and talks only to the protocol, so the whole of it is
+  tested with a fake transport, a fake agent, no token and the library not installed.
+- **`telegram_bot.py` is wiring.** A rule that ends up there has ended up where the suite
+  cannot reach it.
+
+- **Off by default** (`telegram_enabled`), and the first dependency that talks to the network —
+  an optional extra (`pip install -e ".[telegram]"`). It is a real exception to the offline
+  rule and is scoped: the model, the index and every file operation stay local; what leaves the
+  machine is the conversation, which is what a chat front-end *is*. `transport.available()` /
+  `install_hint()` follow `browser.py` — a missing library is a loud reason, never a silent
+  no-op.
+- **HTML parse mode, not MarkdownV2.** MarkdownV2 needs sixteen characters escaped *including
+  inside code spans*, and one miss makes the API reject the whole message — so an answer full
+  of code would routinely fail to send at all. HTML needs `&<>`.
+- **Chunking splits the SOURCE and reopens an open fence**, so no message carries an unbalanced
+  `<pre>` (Telegram rejects it, and the rest of the answer then arrives as unformatted text).
+  The budget is measured on the ESCAPED length: `&` becomes `&amp;`, so a source-length cap
+  under-counts by five times on exactly the text — a diff, a URL query — already near the limit.
+- **Streaming is one message, edited on a timer** (`LiveMessage`, `telegram_edit_interval`).
+  `on_token` cannot await, so it only buffers and a `pump` task does the editing; an unchanged
+  preview is not re-sent (Telegram rejects it); the preview shows the stream's **tail**.
+  `status_hook` lines ride above it, so `[vision] Analyzing …` reaches the phone.
+- **Approvals reuse `executor.approval_hook`** — an inline keyboard instead of the REPL's
+  prompt. **Anything that is not an explicit Allow is a Deny**: a timeout, a dismissed
+  keyboard, an unrecognised payload. "Allow for session" is remembered **per chat**, and the
+  question names the TARGET (`write_file` on *which* file).
+- **The hook is cleared in a `finally`.** In the embedded mode the CLI shares that executor, so
+  a hook left installed would send the terminal's next write to Telegram for approval.
+- **Authorization is the numeric `user_id`, never `@username`** (reassignable — an allowlist of
+  names is an impersonation surface), and **empty means nobody**: an unconfigured bot refuses
+  everyone including its owner. T3 adds pairing, roles and audit; until then the allowlist is
+  the whole story, so the bot is never open in between. A callback button is an authorization
+  decision too and is checked the same way.
+- **`handle()` never raises** — an exception escaping it kills the poller for every chat — and
+  each message runs as its own task, so a minutes-long build does not stop the bot answering.
+- Knobs: `telegram_token` (env only, never printed), `telegram_allowed_users`,
+  `telegram_poll_timeout`, `telegram_edit_interval` (1.5s), `telegram_approval_timeout` (120s),
+  `telegram_max_concurrent_turns` (2), `telegram_rate_burst`/`telegram_rate_seconds`.
+- Long polling, never a webhook: a webhook needs an inbound public port and a certificate —
+  a worse security story, and undemonstrable on a laptop.
+
+### Bot authentication and authorization (`app/bot/auth.py`, `audit.py`)
+
+Phase T3. **A role is a projection onto enforcement that already exists, never a new gate.**
+`viewer` is not "the bot refuses to write" — it is `fs:write`/`fs:delete`/`shell` in the
+executor's deny set, so the refusal happens in `Executor.execute` before the tool is reached
+and would still happen if every line of `service.py` were wrong.
+`tests/test_bot_auth.py::test_a_viewers_write_is_refused_by_the_EXECUTOR` is the load-bearing
+test: it drives the executor directly and asserts the handler never ran.
+
+| role | enforcement |
+| --- | --- |
+| `viewer` | denied `fs:write`, `fs:delete`, `shell` — refused before the tool runs |
+| `developer` | denies nothing outright; writes go through the approval keyboard |
+| `owner` | plus the `OWNER_ONLY` commands — `/load`, `/model`, `/mcp`, `/pair`, `/users`, `/revoke`, `/stack` |
+
+- **The deny list rides the turn scope, not the setting** (`scope.effective_denied_permissions`,
+  read by `Executor.execute`). Same reason as the sandbox root one layer up, with worse
+  consequences: a `viewer`'s turn and an `owner`'s turn can overlap, and a global would let
+  whichever started last decide what BOTH may do — privilege escalation produced by timing.
+  **A scope may only ADD refusals** — it unions with `settings.denied_permissions`, so it can
+  never be a way to ask for more than the process was started with.
+- **Identity is the numeric `user_id`.** A `@username` is reassignable, so an allowlist of
+  names is an impersonation surface.
+- **`telegram_allowed_users` is the bootstrap and outranks the table** — otherwise a paired
+  user could demote the owner by acquiring a row. It is edited in `.env`, so `/revoke` reports
+  `False` for those ids rather than pretending. **Empty means nobody**, and `preflight()`
+  refuses to start in that state: nobody could pair either, because minting is owner-only.
+- **Everyone else arrives by pairing.** `/pair` mints a single-use, TTL'd code stored **hashed**
+  (`.coder.db` travels with the project; a plaintext code in it is a live grant to whoever
+  looks). `/login <code>` is the ONE thing an unauthorized user may do, and it is not a way in
+  by itself — someone with the machine minted the code. **Every refusal reads identically**:
+  distinguishing expired from used from unknown only helps someone guessing. A code is marked
+  used **before** the grant, so a code shown to somebody cannot stay live after a failed
+  redemption. A store that cannot be read denies rather than admits.
+- **`audit.py` is separate from `turnlog` on purpose.** The turn log records what a TURN did
+  and is the deliverable transcript; the audit log records what ACCESS CONTROL did — including
+  the refusals that never became a turn, which is exactly the half a transcript cannot show.
+  JSON Lines, append-only, per project under `.coder/` (already skipped by the indexer, so an
+  audit log is never embedded or picked as an edit target), best-effort but logged on failure.
+- What no role can do, because none of it is reachable from the prompt or from a chat: widen
+  the path jail (`allow_outside_root` is a process flag), reach outside `sandbox_root`, or lift
+  the shell denylist. **A remote caller is strictly less trusted than the terminal, never more.**
+- Knobs: `telegram_pairing_ttl` (300s), `bot_audit_log` (`.coder/bot_audit.log`).
+
+### Running both front-ends (`--bot`, `--bot-only`, `/bot`)
+
+Phase T4 — the entry points, and the one change that makes the earlier phases *true* rather
+than merely possible: **the REPL's own turn now goes through the registry**
+(`CoderREPL._chat_in_turn`). It called `agent.chat` directly, so the CLI never took the
+project's lock and "the bot waits for the terminal" was false in exactly the direction that
+matters.
+
+- **`coder --bot`** (or `/bot start`) runs the bot in the REPL's process, sharing
+  `session_registry()` — hence one `AgentCore`, one lock, one conversation for the loaded
+  project. Bot messages print into the terminal (`on_activity`), so one screen recording shows
+  both front-ends.
+- **`coder --bot-only`** is the headless daemon: no REPL and no `AgentCore` of its own, each
+  chat picks its folder with `/load`, and the registry gives each one its own agent, lock and
+  jail. Its loop does nothing but `close_idle()` — the library's updater owns the polling.
+- **`/bot pair [role]`** mints a code from the machine itself. Without it the first remote user
+  could never get in: minting over Telegram is owner-only, and an owner has to exist first.
+- **`session_registry()` is a lazy cached accessor**, never a module-level singleton — the
+  `get_registry`/`get_retriever` rule, and `tests/test_no_import_side_effects.py`'s.
+- **`load_project` calls `registry.adopt(...)`** so the bot reuses the REPL's agent instead of
+  building a second one for the same folder.
+- **The CLI waits without a timeout** (`float("inf")`), unlike the bot's `turn_lock_timeout`:
+  this is a person at a keyboard who can press Ctrl-C, and dropping their request after fifteen
+  minutes would lose work they are watching.
+- **A bot turn RESTORES the executor's approval hook, it does not clear it**
+  (`Executor.approval_hook` exists for this). In the embedded mode both front-ends share one
+  executor; clearing would leave the terminal with no hook, and no hook means the executor's
+  default — allow. A front-end silently losing its approval prompt is the worst way for this to
+  fail, and `tests/test_bot_runmodes.py` pins it.
+- `tests/test_bot_runmodes.py::test_the_bot_waits_for_the_terminals_turn` drives both paths on
+  one project in one process and asserts they overlap and then serialize;
+  `test_two_projects_progress_at_once` asserts the opposite for two projects.
 
 ### MCP servers (`app/mcp/`)
 
@@ -1443,6 +1758,9 @@ generated app's one dependency lives in the venv Coder runs from, so that stack 
   `pageaudit.py`'s reason: a syntax error in an embedded `node -e` script fails silently and in the
   direction that reads as success.
 
+`/point` is the other half of the demo surface — see "Click the page, edit the source" above.
+It needs `/run` first, because it drives the app the runner is already serving.
+
 `/plan` gained an amendment preview (`AgentCore.preview_amendment`): with a spec loaded, a change
 request shows the delta, the new files, and a table of **existing** files that will be updated with
 the reason for each, before anything happens. Costs the same single delta call the real amendment
@@ -1646,6 +1964,48 @@ a skill needs a restart. Per turn, `match_skills()` scores each enabled skill (0
 0.5·embedding-cosine, threshold 0.25, **max 2** injected) and the result is injected as a system
 prompt block.
 
+### Project instructions the USER writes (`app/agent/instructions.py`)
+
+`<project>/.coder/INSTRUCTIONS.md` — the third kind of project knowledge, and neither of the
+other two could hold it. The **ProjectSpec** records what the project *contains* and is written
+by the agent from the files; **skills** are matched per turn by keyword and are global to the
+install. Missing was *how the user wants work done here* — "this repo uses tabs", "never touch
+`vendor/`", "tests go beside the module". Not derivable from code, not keyword-triggered: it
+must simply be true for every turn in this project.
+
+`load_project` reads it into `AgentCore._instructions` (and nothing else assigns it, so opening
+a second project cannot leave the first one's conventions in effect); `_instructions_context()`
+states it at **all three** generation sites — `_build_messages`, `_file_op_flow`'s generation
+prompt, and `_surgical_edit`'s editor prompt. A convention that reached only some of them would
+look like the model ignoring it at random, so `tests/test_instructions.py` pins the call-site
+count. `/instructions` prints exactly what the model got, `/help` documents it, and
+`settings.project_instructions` is the kill switch.
+
+- **It is CONVENTIONS, never capability**, and the block says so. What makes that more than a
+  hope is that nothing here touches the enforcement layers: the executor's permission gate,
+  `denied_permissions`, the approval hook, the path jail and the shell denylist all sit *below*
+  the prompt and are unreachable from it. An instruction file cannot unlock a tool, widen the
+  sandbox or approve a write — at worst it wastes a turn.
+- **Deliberately NOT wrapped in `<untrusted_data>`.** It is the user's configuration, like a
+  skill, not file text the model happened to retrieve — framing it as data would mean telling
+  the model to ignore the instructions it was just given. The file does travel with the folder,
+  though, so a cloned repo can carry one: loading it is therefore **reported** (`load_project`
+  returns `instructions_chars`, the REPL prints the path and size). It grants nothing and it is
+  never silent — those two together are the trust argument.
+- **Bounded, and a cut says so** (`max_instructions_chars`, 4000). This text is prepended to
+  every prompt in the project, so an unbounded file evicts the sibling/RAG context the answer
+  depends on. Truncation is stated in the block — `_requirements_doc_context`'s rule: a silently
+  halved file is a rule the model will not follow and nobody will know is missing.
+- **Containment is checked even though the path is constructed.** The argument is never
+  user-supplied, but a symlink at `.coder/INSTRUCTIONS.md` would put an arbitrary file into
+  every prompt for this project, so the resolved path must be inside the root.
+- **Every failure is `""`** — missing, empty, a directory, unreadable, undecodable — and the
+  prompt then reads exactly as it did before the file could exist.
+- **`.coder/` is a dot-directory**, so the RAG indexer, `project_memory._scan_project` and
+  `_locate_named_file` already skip it: the instructions are never embedded and retrieved back
+  as if they were source, and never picked as an edit target.
+- **No hot-reload**, same as skills: `/index` (or a reload) picks up an edit.
+
 ### Config
 
 `config/settings.py` — single pydantic-settings `Settings` instance reading `.env`. Import as
@@ -1664,6 +2024,9 @@ Verified in the request payload via `_chat_params(...)["options"]["num_ctx"]`. I
 the next step of a multi-file build — see `_sibling_context`. `extract_build_spec` (default on)
 allows the one extra pre-planning LLM call that distils the shared nav/design spec
 (`app/agent/buildspec.py`); turning it off reverts multi-file builds to the pre-spec behavior.
+`project_instructions` (default on) reads `<project>/.coder/INSTRUCTIONS.md` into every prompt
+for that project, capped by `max_instructions_chars` (4000) — see "Project instructions the USER
+writes" above; false ignores the file entirely.
 Full-stack web knobs (`docs/fullstack-web-plan.md`): `expand_requirements` and
 `blueprint_smoke_test` both ship **on** (Phase 0); **`web_stack` (default `"node"`) forces the
 backend stack** rather than probing for one — `detect_stack(prefer=…)`, see "Forcing the stack"
@@ -1686,7 +2049,12 @@ N times and keep the best-scoring candidate; `planner_model` / `judge_model` (bo
 `llm_model`, i.e. exactly today's behaviour) put a different model on the reasoning calls.
 `max_context_tokens` is the per-prompt token budget enforced by `app/agent/context_budget.py`
 (oldest history dropped first in `_build_messages`); `max_repair_attempts` caps the
-verify-and-repair loop; `backups_dir` / `max_write_backups` configure safe-write snapshots. RAG
+verify-and-repair loop; `backups_dir` / `max_write_backups` configure safe-write snapshots.
+Surgical-edit knobs (`app/agent/patch.py`): `max_edit_context_chars` (24000) is how much of a
+file the SEARCH/REPLACE editor is shown, `max_rewrite_chars` (24000) the largest file a
+whole-file rewrite may regenerate — above it the rewrite is refused rather than run against a
+partial view — and `shrink_guard` / `shrink_guard_floor` (0.6) / `shrink_guard_min_chars` (400)
+reject a write that keeps too little of the file unless the request asked for a deletion. RAG
 knobs: `embed_cache_dir` / `max_embed_cache_entries` (persistent embedding cache),
 `max_index_file_bytes` (indexer size cap), `max_read_file_bytes` (`read_file` truncation cap).
 Vision knobs: `vision_model` / `vision_enabled` (kill switch) / `vision_num_ctx` /

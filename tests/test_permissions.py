@@ -26,6 +26,7 @@ from config.settings import settings
         ("find_references", "fs:read"),
         ("write_file", "fs:write"),
         ("edit_file", "fs:write"),
+        ("apply_diff", "fs:write"),
         ("create_file", "fs:write"),
         ("undo_write", "fs:write"),
         ("delete_file", "fs:delete"),

@@ -27,8 +27,24 @@ AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
 
 
 async def init_db() -> None:
-    """Create all tables defined on Base."""
+    """Create all tables defined on Base, and make the DB safe for two writers.
+
+    T1: with a second front-end there are two PROCESSES appending turns to this
+    file, and sqlite's default rollback journal locks the whole database for the
+    duration of a write — so the turn that records the answer fails with
+    "database is locked" while the other front-end is mid-write. WAL lets a
+    writer and readers proceed together, and `busy_timeout` makes the remaining
+    writer-writer overlap wait instead of raising.
+
+    Best-effort: a filesystem that cannot do WAL (some network shares) keeps the
+    old journal mode rather than failing startup.
+    """
     async with engine.begin() as conn:
+        try:
+            await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+            await conn.exec_driver_sql("PRAGMA busy_timeout=5000")
+        except Exception:  # pragma: no cover - depends on the filesystem
+            pass
         await conn.run_sync(Base.metadata.create_all)
 
 

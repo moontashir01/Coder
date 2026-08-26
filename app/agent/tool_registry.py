@@ -107,6 +107,7 @@ class ToolRegistry:
 
 def _build_builtin_tools() -> list[ToolDefinition]:
     from app.tools.filesystem import (
+        apply_diff,
         create_file,
         delete_file,
         edit_file,
@@ -155,21 +156,80 @@ def _build_builtin_tools() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="edit_file",
-            description="Find-and-replace a unique string in a file.",
+            description=(
+                "Replace one block of text in an existing file. PREFER this over "
+                "write_file for any change to a file that already exists — "
+                "write_file replaces the whole file and loses everything you did "
+                "not repeat."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "old_str": {
                         "type": "string",
-                        "description": "Exact string to find (must be unique in file)",
+                        "description": (
+                            "Lines copied verbatim from the file, including "
+                            "indentation, and unique within it. Include the line "
+                            "that changes plus 2-3 lines above and below; anchor "
+                            "on a distinctive line (a def/function/class line, a "
+                            "tag, a unique string), never on a bare '}' or "
+                            "'return'."
+                        ),
                     },
-                    "new_str": {"type": "string", "description": "Replacement string"},
+                    "new_str": {
+                        "type": "string",
+                        "description": (
+                            "The replacement for those lines, in full and in the "
+                            "file's own indentation style."
+                        ),
+                    },
                 },
                 "required": ["path", "old_str", "new_str"],
             },
             source="builtin",
             handler=edit_file,
+            permissions=["fs:write"],
+        ),
+        ToolDefinition(
+            name="apply_diff",
+            description=(
+                "Apply several search/replace edits to ONE file in a single call. "
+                "Every edit must match or the file is left untouched, so a "
+                "multi-part change never lands half-applied."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "edits": {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": "The edits, applied in order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "search": {
+                                    "type": "string",
+                                    "description": (
+                                        "Lines copied verbatim from the file and "
+                                        "unique within it — same rules as "
+                                        "edit_file's old_str."
+                                    ),
+                                },
+                                "replace": {
+                                    "type": "string",
+                                    "description": "What those lines become.",
+                                },
+                            },
+                            "required": ["search", "replace"],
+                        },
+                    },
+                },
+                "required": ["path", "edits"],
+            },
+            source="builtin",
+            handler=apply_diff,
             permissions=["fs:write"],
         ),
         ToolDefinition(

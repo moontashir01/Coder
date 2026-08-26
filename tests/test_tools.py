@@ -1,4 +1,5 @@
 """Tests for built-in tools: filesystem, terminal, git."""
+
 import pytest
 
 from app.tools import filesystem as fs
@@ -9,6 +10,7 @@ from config.settings import settings
 # ---------------------------------------------------------------------------
 # Filesystem tools
 # ---------------------------------------------------------------------------
+
 
 def test_write_then_read_file(tmp_path):
     target = tmp_path / "hello.txt"
@@ -140,6 +142,7 @@ def test_search_files_skips_vendored_dirs(tmp_path):
 # Terminal tool
 # ---------------------------------------------------------------------------
 
+
 def test_run_command_echo():
     res = run_command("echo coder_test_marker")
     assert res["success"] is True
@@ -153,7 +156,9 @@ def test_run_command_blocked():
     assert "blocked" in res["error"].lower()
 
 
-@pytest.mark.parametrize("cmd", ["rm -rf /", "sudo rm x", "dd if=/dev/zero of=/dev/sda", "format c:"])
+@pytest.mark.parametrize(
+    "cmd", ["rm -rf /", "sudo rm x", "dd if=/dev/zero of=/dev/sda", "format c:"]
+)
 def test_run_command_blocks_dangerous(cmd):
     res = run_command(cmd)
     assert res["success"] is False
@@ -162,7 +167,7 @@ def test_run_command_blocks_dangerous(cmd):
 
 def test_run_command_format_substring_not_blocked():
     # "format" appears only as a method call argument — must NOT be blocked
-    res = run_command('python -c "print(\'{}\'.format(42))"')
+    res = run_command("python -c \"print('{}'.format(42))\"")
     assert res["success"] is True
     assert "42" in res["result"]
 
@@ -237,6 +242,7 @@ def test_chained_network_command_blocked(monkeypatch):
 # Git tool
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def git_repo(tmp_path):
     """Initialise a git repo with a committer identity, or skip if git missing."""
@@ -286,3 +292,100 @@ def test_git_status_non_repo(tmp_path):
     res = git_tool.git_status(str(tmp_path))
     assert res["success"] is False
     assert "not a git repository" in res["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Tolerant editing + apply_diff
+#
+# The tools are the tool loop's only way to change a file without replacing it.
+# Exact-only matching meant a misquoted indent was refused here while the
+# agent's own editor would have applied the same edit — and a refused edit is
+# answered by a 7B with write_file and the whole file regenerated.
+# ---------------------------------------------------------------------------
+
+
+def test_edit_file_tolerates_a_misquoted_indent(tmp_path):
+    target = tmp_path / "code.py"
+    target.write_text('def greet(name):\n    return "hi"\n', encoding="utf-8")
+    # The model dropped the file's leading indentation when copying old_str.
+    res = fs.edit_file(str(target), 'return "hi"', 'return "hello"')
+    assert res["success"] is True
+    assert (
+        target.read_text(encoding="utf-8") == 'def greet(name):\n    return "hello"\n'
+    )
+
+
+def test_edit_file_strips_a_line_number_gutter(tmp_path):
+    target = tmp_path / "code.py"
+    target.write_text("a = 1\nb = 2\n", encoding="utf-8")
+    res = fs.edit_file(str(target), "   2 | b = 2", "b = 99")
+    assert res["success"] is True
+    assert target.read_text(encoding="utf-8") == "a = 1\nb = 99\n"
+
+
+def test_edit_file_failure_shows_the_nearest_text(tmp_path):
+    """An error the next call can act on, rather than one that ends the turn."""
+    target = tmp_path / "code.py"
+    target.write_text(
+        "def alpha():\n    return 1\n\ndef beta():\n    return 2\n", "utf-8"
+    )
+    res = fs.edit_file(str(target), "def beta(request):\n    return compute(2)", "x")
+    assert res["success"] is False
+    assert "not found" in res["error"].lower()
+    assert "def beta():" in res["error"]  # the real lines, numbered
+
+
+def test_edit_file_still_refuses_an_ambiguous_target(tmp_path):
+    target = tmp_path / "dup.txt"
+    target.write_text("x\nx\n", encoding="utf-8")
+    res = fs.edit_file(str(target), "x", "y")
+    assert res["success"] is False
+    assert "ambiguous" in res["error"].lower()
+    assert target.read_text(encoding="utf-8") == "x\nx\n"
+
+
+def test_apply_diff_applies_several_edits_at_once(tmp_path):
+    target = tmp_path / "code.py"
+    target.write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
+    res = fs.apply_diff(
+        str(target),
+        [
+            {"search": "a = 1", "replace": "a = 11"},
+            {"search": "c = 3", "replace": "c = 33"},
+        ],
+    )
+    assert res["success"] is True
+    assert target.read_text(encoding="utf-8") == "a = 11\nb = 2\nc = 33\n"
+
+
+def test_apply_diff_is_all_or_nothing(tmp_path):
+    """A half-applied multi-edit leaves a file nobody planned."""
+    target = tmp_path / "code.py"
+    original = "a = 1\nb = 2\n"
+    target.write_text(original, encoding="utf-8")
+    res = fs.apply_diff(
+        str(target),
+        [
+            {"search": "a = 1", "replace": "a = 11"},
+            {"search": "zzz = 9", "replace": "zzz = 0"},
+        ],
+    )
+    assert res["success"] is False
+    assert "edits[1]" in res["error"]
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_apply_diff_rejects_an_empty_edit_list(tmp_path):
+    target = tmp_path / "code.py"
+    target.write_text("a = 1\n", encoding="utf-8")
+    assert fs.apply_diff(str(target), [])["success"] is False
+
+
+def test_apply_diff_backs_up_before_writing(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "backups_dir", str(tmp_path / "backups"))
+    target = tmp_path / "code.py"
+    target.write_text("a = 1\n", encoding="utf-8")
+    fs.apply_diff(str(target), [{"search": "a = 1", "replace": "a = 2"}])
+    undone = fs.undo_write(str(target))
+    assert undone["success"] is True
+    assert target.read_text(encoding="utf-8") == "a = 1\n"

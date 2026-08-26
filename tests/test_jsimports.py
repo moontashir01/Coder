@@ -197,3 +197,48 @@ def test_req_session_with_the_middleware_mounted_is_not():
         "req.session.userId = user.id;\n"
     )
     assert middleware_gaps(source) == []
+
+
+# ── browser globals are not undefined names ─────────────────────────────────
+#
+# Measured on a live static build: four of six correct files came back with
+# "may not meet: uses undefined name(s) at runtime — document, window,
+# requestAnimationFrame". A false failure is worse than no check.
+
+
+def test_browser_globals_are_not_reported():
+    source = """
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+function loop() {
+  requestAnimationFrame(loop);
+  ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+}
+loop();
+"""
+    assert undefined_names(source) == []
+
+
+def test_the_web_audio_names_are_not_reported():
+    source = """
+const audio = new (window.AudioContext || window.webkitAudioContext)();
+const osc = audio.createOscillator();
+osc.connect(audio.destination);
+osc.start();
+"""
+    assert undefined_names(source) == []
+
+
+def test_a_genuinely_undefined_name_is_still_reported():
+    """The check must not have been widened into silence."""
+    source = """
+document.addEventListener("click", () => {
+  fireLaser();
+});
+"""
+    assert "fireLaser" in undefined_names(source)
+
+
+def test_a_missing_npm_package_is_still_reported():
+    source = 'const ok = bcrypt.compareSync(a, b);\n'
+    assert "bcrypt" in undefined_names(source)

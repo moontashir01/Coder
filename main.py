@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from app import __version__
 from app.agent.core import AgentCore
+from app.cli.commands import handle_command
 from app.cli.repl import CoderREPL
 from app.mcp.manager import MCPManager
 from app.models.llm import test_connection
@@ -104,6 +105,16 @@ def main(
         "--no-index",
         help="Don't auto-load/index the current directory on startup",
     ),
+    bot: bool = typer.Option(
+        False,
+        "--bot",
+        help="Also run the Telegram front-end, sharing this session's project",
+    ),
+    bot_only: bool = typer.Option(
+        False,
+        "--bot-only",
+        help="Run ONLY the Telegram front-end (no REPL); each chat picks its project",
+    ),
     update: bool = typer.Option(
         False, "--update", help="Update Coder to the latest version and exit"
     ),
@@ -144,6 +155,12 @@ def main(
         typer.echo(f"[ERROR] {e}", err=True)
         raise typer.Exit(code=1)
 
+    # --bot-only has no terminal to drive, so it never builds a REPL or an
+    # AgentCore of its own: the registry makes one per project a chat opens.
+    if bot_only:
+        asyncio.run(_run_bot_only(project or str(Path.cwd())))
+        return
+
     mcp_manager = MCPManager()
     skill_loader = SkillLoader()
     skill_loader.load_all()
@@ -158,11 +175,52 @@ def main(
         try:
             if startup_project:
                 await repl.load_project(startup_project)
+            if bot:
+                # Same as typing `/bot start`: one process, one registry, hence
+                # one AgentCore and one lock for the loaded project.
+                await handle_command("/bot start", repl)
             await repl.run()
         finally:
+            if repl.bot is not None:
+                await repl.bot.stop()
             agent.close()  # stop the live-reindex file watcher
 
     asyncio.run(_run())
+
+
+async def _run_bot_only(default_project: str) -> None:
+    """Headless: the Telegram front-end and nothing else.
+
+    This is the "different projects at the same time" mode — each chat points
+    itself at a folder with `/load`, and the registry gives each one its own
+    agent, its own lock and its own jail. It idles rather than polling: the
+    library's updater owns the loop, and the only periodic work here is closing
+    projects nobody has touched (which otherwise keeps a file watcher alive per
+    folder the bot ever saw).
+    """
+    from app.agent.sessions import session_registry
+    from app.bot.telegram_bot import CoderBot
+
+    registry = session_registry()
+    coder_bot = CoderBot(registry=registry, default_project=default_project)
+    reason = await coder_bot.start()
+    if reason:
+        typer.echo(f"[ERROR] {reason}", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo("Telegram bot running. Ctrl-C to stop.")
+    try:
+        while True:
+            await asyncio.sleep(60)
+            closed = await registry.close_idle()
+            for root in closed:
+                typer.echo(f"[idle] closed {root}")
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        await coder_bot.stop()
+        await registry.close_all()
+        typer.echo("Stopped.")
 
 
 # ---------------------------------------------------------------------------

@@ -128,6 +128,7 @@ def test_create_registry_has_all_builtins():
         "read_file",
         "write_file",
         "edit_file",
+        "apply_diff",
         "create_file",
         "delete_file",
         "list_directory",

@@ -396,6 +396,19 @@ class TemplateGraph:
 
     # -- structure ------------------------------------------------------
 
+    def resolve_template(self, name: str) -> str:
+        """A template NAME as a route writes it → its project-relative path.
+
+        `routes` stores what the source says — `render_template("products.html")`
+        on Flask, `res.render("products")` on Express — and neither is a path.
+        Public because `pointer.py` starts from a route rather than from a
+        template, and re-deriving this rule outside the graph is how two
+        answers to one question start to differ. Returns "" when the name
+        matches nothing, which is the same "no edge, never a wrong edge" answer
+        `parents` gives.
+        """
+        return self._resolve(name)
+
     def parents(self, template: str) -> list[str]:
         """What this template extends/includes, as project-relative paths."""
         info = self.templates.get(_norm(template))

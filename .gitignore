@@ -5,6 +5,10 @@ __pycache__/
 .env
 .chroma_db/
 .coder.db
+# WAL sidecars — init_db switches the DB to WAL so two front-ends can both
+# append turns (docs/telegram-bot-plan.md T1).
+.coder.db-shm
+.coder.db-wal
 .symbols.db
 .coder_history
 .coder_errors.log

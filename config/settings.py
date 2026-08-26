@@ -110,6 +110,40 @@ class Settings(BaseSettings):
     # decomposes it. max_plan_tasks caps how many sub-tasks one turn will run.
     decompose_multitask: bool = True
     max_plan_tasks: int = 10
+    # Per-project instructions the USER writes (`<project>/.coder/INSTRUCTIONS.md`,
+    # app/agent/instructions.py): conventions that must hold on every turn in this
+    # project and are derivable neither from the code (so the ProjectSpec cannot
+    # hold them) nor from keywords (so a skill is the wrong shape). Loaded once by
+    # load_project and stated in the prompt. The cap matters: this text is
+    # prepended to EVERY prompt in the project, so an unbounded file would evict
+    # the sibling/RAG context the answer depends on — and a truncation is stated
+    # in the block rather than silently applied. Set false to ignore the file.
+    project_instructions: bool = True
+    max_instructions_chars: int = 4000
+    # Surgical editing (app/agent/patch.py). How much of an existing file is
+    # shown to the SEARCH/REPLACE editor. This was 6000 and is NOT a context
+    # limit — llm_num_ctx is 16384 tokens, roughly 65k characters — so the only
+    # thing the old number bought was a guaranteed miss on every edit whose
+    # target sat past it, and a guaranteed miss falls through to the whole-file
+    # rewrite, which is the behaviour this whole path exists to avoid.
+    max_edit_context_chars: int = 24000
+    # The largest file a whole-file REWRITE may regenerate. Above it the rewrite
+    # is REFUSED rather than run against a truncated copy of the file: the old
+    # code pasted `full_existing[:4000]` under the words "return the COMPLETE
+    # updated file", so any larger file came back cut off and was written that
+    # way. A rewrite that cannot see the whole file must not run.
+    max_rewrite_chars: int = 24000
+    # Reject a write that keeps less than this fraction of a file's bytes unless
+    # the request asked for a deletion — a truncation parses perfectly, so no
+    # other stage can see it. Files under min_chars are exempt (a three-line
+    # file legitimately becomes a one-line file).
+    shrink_guard: bool = True
+    shrink_guard_floor: float = 0.6
+    shrink_guard_min_chars: int = 400
+    # `/point` — click the running page, edit the source behind it
+    # (app/agent/pointer.py). How long the picker window waits for a click
+    # before giving up; it is a person choosing, so this is generous.
+    point_timeout: int = 180
     # Verify-and-repair: how many LLM repair passes to run when a just-written
     # file fails its syntax/structure check.
     max_repair_attempts: int = 2
@@ -381,6 +415,57 @@ class Settings(BaseSettings):
     # U6: when history overflows max_context_tokens, summarize the dropped
     # oldest turns into a compact note instead of silently forgetting them.
     summarize_history: bool = True
+    # T0: record what each turn DID — route, tools, files written, who asked —
+    # into `turn_events`, which is what `/export` renders. Off restores the
+    # pre-T0 behaviour exactly (the conversation is still stored); the test
+    # suite defaults it off so a scripted turn does not append to the repo's
+    # real history, and tests/test_turnlog.py opts back in.
+    record_turns: bool = True
+    # T1 — two front-ends on one machine (app/agent/sessions.py).
+    # `cross_process_lock` is the advisory `<project>/.coder/coder.lock` that
+    # stops a REPL and a `--bot-only` daemon interleaving writes into the same
+    # project; off leaves only the in-process `asyncio.Lock`, which is all a
+    # single process ever needed. `turn_lock_timeout` is how long to WAIT for
+    # the other front-end's turn — long, because a build turn is minutes.
+    # `turn_lock_stale_after` is the PID-REUSE backstop and nothing else: a
+    # lock whose holder is dead is reclaimed immediately regardless of age, and
+    # this only governs a lock whose pid is alive but implausibly old.
+    cross_process_lock: bool = True
+    turn_lock_timeout: float = 900.0
+    turn_lock_stale_after: float = 3600.0
+    # Close a project's agent (and its file watcher) after this long untouched.
+    # A long-running bot would otherwise hold one watcher, one Chroma
+    # collection and one AgentCore per project it ever saw. 0 disables.
+    session_idle_timeout: float = 1800.0
+    # T2 — the Telegram front-end (app/bot/). OFF by default: it is the one
+    # dependency that talks to the network, and it carries the conversation
+    # (including file contents quoted in a reply) off the machine. Nothing
+    # about GENERATION reaches the network either way — the model, the index
+    # and every file operation stay local.
+    telegram_enabled: bool = False
+    # Never hardcode this and never print it: set TELEGRAM_TOKEN in .env.
+    telegram_token: str = ""
+    # Numeric Telegram user ids, never @usernames — a username is reassignable,
+    # so an allowlist of names is an impersonation surface. EMPTY MEANS NOBODY:
+    # an unconfigured bot refuses everyone, including its owner.
+    telegram_allowed_users: list[int] = []
+    telegram_poll_timeout: float = 30.0
+    # How often the streaming message is edited. Telegram rate-limits edits to
+    # one message, and a stream produces hundreds of tokens a second.
+    telegram_edit_interval: float = 1.5
+    # An approval nobody answers is a DENY, not a stall — but the question has
+    # to stay open long enough to reach a phone.
+    telegram_approval_timeout: float = 120.0
+    telegram_max_concurrent_turns: int = 2
+    telegram_rate_burst: int = 5
+    telegram_rate_seconds: float = 60.0
+    telegram_max_tool_lines: int = 20
+    # T3 — pairing and audit. A code is minted on the machine (`/bot pair`),
+    # stored HASHED, single-use, and short-lived: it is a live grant until it is
+    # redeemed. The audit log is per project (relative paths resolve against the
+    # project root) and lives in `.coder/`, which the indexer already skips.
+    telegram_pairing_ttl: float = 300.0
+    bot_audit_log: Path = Path(".coder/bot_audit.log")
 
     # Safety
     # Safe writes (Tier 3 #8): mutating file tools back up the previous

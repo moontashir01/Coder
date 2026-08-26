@@ -52,6 +52,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The Telegram front-end (app/bot/, docs/telegram-bot-plan.md). OPTIONAL and
+# off by default: it is the only dependency that talks to the network, and a
+# Coder install that never uses a bot should not carry it. `transport.py`
+# imports it lazily and reports its absence with an install command, the way
+# app/agent/browser.py reports a missing Playwright.
+telegram = [
+    "python-telegram-bot>=21",
+]
+# The browser layer: the W4-W7 page checks and `/point`. OPTIONAL, and the
+# second dependency that needs the network — once, to fetch Chromium
+# (`python -m playwright install chromium`), which no wheel can carry. A
+# machine without it behaves exactly as before: `browser.available()` is False,
+# the checks report `install_hint()` rather than passing, and `/point` says so.
+browser = [
+    "playwright>=1.40",
+]
 dev = [
     "pytest>=9.0",
     "pytest-asyncio>=1.4",

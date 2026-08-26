@@ -13,6 +13,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
+from app.agent.instructions import instructions_path
 from app.agent.stacks import describe_stacks, get_adapter, resolve_key, stack_keys
 from config.settings import settings
 
@@ -30,12 +31,18 @@ HELP_TEXT = """
   /index                Re-index the current project
   /spec                 Show what the agent remembers about this project
                         (tables, routes, pages — from .coder/project.json)
+  /instructions         Show this project's conventions, which you write in
+                        .coder/INSTRUCTIONS.md and which apply to every turn
   /stack [flask|node]   Show or choose the stack a build targets. A project
                         that already has a spec keeps ITS stack regardless
   /run [restart|stop|status]  Start the generated app and keep it up across
                         turns; prints the URL to open. Does whatever setup the
                         project needs first (on Node: installs its packages,
                         creates its database, loads demo data)
+  /point [change]       Click a part of the running page and change it. Opens
+                        the app, waits for a click, and edits exactly the
+                        template lines behind what you picked — no guessing at
+                        which file. Needs /run first
 
 [yellow]Tools & Context[/yellow]
   /tools                List all registered tools (builtin + MCP)
@@ -43,6 +50,10 @@ HELP_TEXT = """
   /model [name]         Show or switch the Ollama model (e.g. qwen2.5-coder:14b)
   /undo [path]          Undo the last file write/edit/delete (restores backup)
   /history              Show recent conversation turns
+  /export [file]        Write this session's full working history to Markdown —
+                        every turn, the route it took, the tools it ran and the
+                        files it wrote. [dim]/export sessions[/dim] lists what was
+                        recorded; [dim]--session <id>[/dim] exports another one
   /clear                Clear conversation history
 
 [yellow]MCP Servers[/yellow]
@@ -54,6 +65,12 @@ HELP_TEXT = """
   /skills list          List all discovered skills
   /skills enable <name> Enable a skill
   /skills disable <name> Disable a skill
+
+[yellow]Telegram bot[/yellow]
+  /bot start            Run the Telegram front-end alongside this terminal —
+                        same project, same memory, one turn at a time
+  /bot stop  /bot status
+  /bot pair [role]      Mint a one-time invite code (viewer|developer|owner)
 
 [yellow]Session[/yellow]
   /help                 Show this help
@@ -223,6 +240,56 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
             console.print(f"[red]{message}[/red]")
         return True
 
+    # ── /point ─────────────────────────────────────────────────────────
+    # Click the page, say what to change. The whole value is that the TARGET
+    # stops being inferred: `app/agent/pointer.py` turns the click into the
+    # exact span of template source behind it, so the model is never asked
+    # which file, which block, or which lines — only what the replacement says.
+    if cmd == "point":
+        from app.agent.apprunner import get_runner
+        from app.agent.pointer import Decline, capture_click
+
+        runner = get_runner()
+        if not runner.is_running:
+            console.print(
+                "[yellow]The app is not running.[/yellow] Start it with "
+                "[cyan]/run[/cyan] first — pointing needs a live page."
+            )
+            return True
+
+        console.print(
+            f"[cyan]Opening[/cyan] {runner.url} — click the part you want to "
+            "change. [dim](Close the window to cancel.)[/dim]"
+        )
+        # Playwright's sync API refuses to run in a thread that owns a live
+        # event loop, and this one is inside the REPL's — `browser.py`'s rule,
+        # and the `to_thread` worker does not own one.
+        clicked = await asyncio.to_thread(
+            capture_click, runner.url, float(settings.point_timeout)
+        )
+        if isinstance(clicked, Decline):
+            console.print(f"[yellow]{escape(clicked.reason)}[/yellow]")
+            return True
+
+        label = clicked.text[:60] or clicked.element_id or clicked.tag
+        console.print(f"[green]Picked[/green] <{clicked.tag}> {escape(label)}")
+
+        instruction = " ".join(args).strip()
+        if not instruction:
+            instruction = (await repl.prompt_async("  change it to: ")).strip()
+        if not instruction:
+            console.print("[yellow]No change described — nothing was done.[/yellow]")
+            return True
+
+        answer, _trace = await repl.agent.edit_pointed_element(
+            clicked, instruction, repl.agent.project_path
+        )
+        console.print(escape(answer))
+        console.print(
+            "[dim]`/run restart` to see it.[/dim]" if runner.is_running else ""
+        )
+        return True
+
     # ── /plan ──────────────────────────────────────────────────────────
     if cmd == "plan":
         if not args:
@@ -285,6 +352,43 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
         return True
 
     # ── /spec ──────────────────────────────────────────────────────────
+    # ── /instructions ──────────────────────────────────────────────────
+    # Shows EXACTLY what reaches the prompt — already capped and, if it was
+    # cut, carrying its own truncation note. A command that re-read the file
+    # would show text the model never saw, which is the opposite of the point.
+    if cmd == "instructions":
+        if not repl.agent.project_path:
+            console.print("[yellow]No project loaded. Use /load <path>[/yellow]")
+            return True
+        # escape(): a path is data, and a "[" anywhere in it would otherwise be
+        # parsed as a Rich style tag (the `[vision]` status-line rule).
+        path = escape(str(instructions_path(repl.agent.project_path)))
+        text = repl.agent.instructions
+        if not text:
+            reason = (
+                "disabled (project_instructions=false)"
+                if not settings.project_instructions
+                else "no such file"
+            )
+            console.print(
+                f"[yellow]No project instructions[/yellow] [dim]({reason})[/dim]\n"
+                f"[dim]Write conventions for this project — coding style, "
+                f"directories to leave alone, where tests go — into:[/dim]\n"
+                f"  [cyan]{path}[/cyan]\n"
+                "[dim]They then apply to every turn in this project. Reload the "
+                "project ([cyan]/index[/cyan]) after editing.[/dim]"
+            )
+            return True
+        console.print(
+            Panel(
+                escape(text),
+                title=f"[bold]{path}[/bold]",
+                subtitle=f"[dim]{len(text)} chars, in every prompt[/dim]",
+                border_style="cyan",
+            )
+        )
+        return True
+
     # The visible proof that the agent REMEMBERS the project between turns
     # (docs/fullstack-web-plan.md Phase 2). Small command, disproportionate
     # value: it is the answer to "does it actually know what it built?"
@@ -450,6 +554,16 @@ async def handle_command(line: str, repl: CoderREPL) -> bool:
             console.print(f"[{role_color}]{label}:[/{role_color}] {t['content'][:120]}")
         return True
 
+    # ── /export ────────────────────────────────────────────────────────
+    if cmd == "export":
+        await _handle_export(args, repl)
+        return True
+
+    # ── /bot ───────────────────────────────────────────────────────────
+    if cmd == "bot":
+        await _handle_bot(args, repl)
+        return True
+
     # ── /mcp ───────────────────────────────────────────────────────────
     if cmd == "mcp":
         if not args:
@@ -583,3 +697,182 @@ def _get_skill_loader(repl: CoderREPL):
     if loader is None:
         console.print("[yellow]Skills loader not initialised.[/yellow]")
     return loader
+
+
+async def _handle_export(args: list[str], repl: CoderREPL) -> None:
+    """`/export` — write this session's full working history to Markdown.
+
+    The record is what `turnlog` stored: every turn, the route it took, the
+    tools it ran, the files it wrote and who asked for it. `/history` shows the
+    conversation; this is the part of it that is evidence.
+    """
+    from app.memory import turnlog
+
+    session_id = repl.agent.memory.session_id
+    out_path: Path | None = None
+    rest: list[str] = []
+
+    i = 0
+    while i < len(args):
+        if args[i] in ("--session", "-s") and i + 1 < len(args):
+            session_id = args[i + 1]
+            i += 2
+            continue
+        rest.append(args[i])
+        i += 1
+
+    if rest and rest[0].lower() == "sessions":
+        recorded = {s["session_id"]: s for s in await turnlog.list_sessions()}
+        # Conversations too, not only turn logs: a project built before the
+        # turn log existed has a full conversation and no `turn_events`, and
+        # that is exactly the history someone wants to hand in.
+        chats = await turnlog.conversation_sessions()
+        if not recorded and not chats:
+            console.print("[yellow]Nothing recorded yet.[/yellow]")
+            return
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Session")
+        table.add_column("Turns", justify="right")
+        table.add_column("Messages", justify="right")
+        table.add_column("Last")
+        seen = set()
+        for row in chats:
+            sid = row["session_id"]
+            seen.add(sid)
+            turns = recorded.get(sid, {}).get("turns", 0)
+            table.add_row(
+                sid, str(turns or "—"), str(row["messages"]), row["last"][:19]
+            )
+        for sid, row in recorded.items():
+            if sid not in seen:
+                table.add_row(sid, str(row["turns"]), "—", row["last"][:19])
+        console.print(table)
+        return
+
+    if rest:
+        out_path = Path(rest[0]).expanduser()
+
+    turns = await turnlog.load_turns(session_id)
+    note = ""
+    if not turns:
+        # Fall back to the plain conversation. A project built before the turn
+        # log existed still has its questions and answers stored, and refusing
+        # to export them because the richer table is empty would lose the only
+        # record there is. What is missing is stated in the file, not implied.
+        turns = await turnlog.load_conversation(session_id)
+        note = (
+            "rebuilt from the stored conversation — this session predates the "
+            "turn log, so the route each turn took, the tools it ran and the "
+            "files it wrote were never recorded and are absent here."
+        )
+    if not turns:
+        console.print(
+            f"[yellow]Nothing recorded for session '{session_id}'.[/yellow] "
+            "Try [cyan]/export sessions[/cyan]."
+        )
+        return
+
+    if out_path is None:
+        out_path = Path(f"coder-transcript-{session_id}.md")
+    if out_path.is_dir():
+        out_path = out_path / f"coder-transcript-{session_id}.md"
+
+    text = turnlog.render_transcript(turns, session_id=session_id, note=note)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        console.print(f"[red]Could not write {escape(str(out_path))}: {exc}[/red]")
+        return
+
+    files = sorted({f for t in turns for f in t.get("files_written") or []})
+    console.print(
+        f"[green]Wrote {len(turns)} turn(s) to[/green] {escape(str(out_path.resolve()))} "
+        f"[dim]({len(files)} file(s) written across the session)[/dim]"
+    )
+
+
+async def _handle_bot(args: list[str], repl: CoderREPL) -> None:
+    """`/bot` — run the Telegram front-end alongside this terminal.
+
+    Embedded on purpose: the bot shares this process's `SessionRegistry`, hence
+    ONE `AgentCore` and one lock for the loaded project. That is what makes
+    "the app and the bot at the same time" a single conversation with a single
+    memory rather than two agents racing over one folder.
+    """
+    from app.bot.auth import UserStore
+    from app.bot.telegram_bot import CoderBot
+
+    action = args[0].lower() if args else "status"
+
+    if action == "pair":
+        # Minted from the machine itself, which is the point: the bot never
+        # grants access to itself, and this is how the FIRST remote user gets
+        # in without an owner already existing on the Telegram side.
+        role = args[1] if len(args) > 1 else "developer"
+        code, ttl = await UserStore().mint_code(role, created_by="cli")
+        console.print(
+            Panel(
+                f"[bold cyan]/login {code}[/bold cyan]\n\n"
+                f"[dim]Send this to the person you are inviting. It grants "
+                f"[/dim][cyan]{role}[/cyan][dim], works once, and expires in "
+                f"{int(ttl // 60)} minutes.[/dim]",
+                title="[bold]Pairing code[/bold]",
+                border_style="cyan",
+            )
+        )
+        return
+
+    if action in ("stop", "kill"):
+        if repl.bot is None:
+            console.print("[yellow]The bot is not running.[/yellow]")
+            return
+        await repl.bot.stop()
+        repl.bot = None
+        console.print("[green]Telegram bot stopped.[/green]")
+        return
+
+    if action == "status":
+        running = repl.bot is not None and repl.bot.running
+        console.print(
+            f"[cyan]Telegram bot:[/cyan] {'running' if running else 'stopped'}"
+        )
+        if not running:
+            reason = CoderBot(
+                repl.registry, repl.agent.project_path or Path.cwd()
+            ).preflight()
+            if reason:
+                console.print(f"[yellow]{escape(reason)}[/yellow]")
+        return
+
+    if action != "start":
+        console.print("[red]Usage: /bot start | stop | status | pair [role][/red]")
+        return
+
+    if repl.bot is not None and repl.bot.running:
+        console.print("[yellow]The bot is already running.[/yellow]")
+        return
+
+    def on_activity(user_id: int, username: str, text: str) -> None:
+        # Printed into THIS terminal so one screen recording shows both
+        # front-ends working on the same project.
+        who = f"@{username}" if username else str(user_id)
+        console.print(
+            f"[dim magenta][telegram][/dim magenta] {escape(who)}: "
+            f"{escape(text[:120])}"
+        )
+
+    bot = CoderBot(
+        registry=repl.registry,
+        default_project=repl.agent.project_path or Path.cwd(),
+        on_activity=on_activity,
+    )
+    reason = await bot.start()
+    if reason:
+        console.print(f"[red]{escape(reason)}[/red]")
+        return
+    repl.bot = bot
+    console.print(
+        "[green]Telegram bot started.[/green] "
+        "[dim]Messages appear here as they arrive; /bot stop ends it.[/dim]"
+    )
