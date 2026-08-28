@@ -1,7 +1,7 @@
 import asyncio
+import dataclasses
 import hashlib
 import json
-import dataclasses
 import logging
 import os
 import re
@@ -67,16 +67,14 @@ from app.agent.pageaudit import (
     repair_plan,
 )
 from app.agent.patch import (
-    wants_deletion,
     apply_block,
     is_catastrophic_shrink,
     nearest_region,
     numbered,
     strip_line_numbers,
+    wants_deletion,
 )
 from app.agent.planner import Planner, _extract_json
-from app.agent.rules import rules_from_data
-from app.agent.rules import to_context_block as rules_context_block
 from app.agent.projectspec import (
     README_MARKER,
     Entity,
@@ -104,11 +102,14 @@ from app.agent.references import (
     rewrite_reference,
     set_active_link,
 )
+from app.agent.rules import rules_from_data
+from app.agent.rules import to_context_block as rules_context_block
 from app.agent.runtime_probe import detect_stack
 from app.agent.scaffold import BlockRegion, is_web_app, project_name
 from app.agent.smoke import ProbeCheck, run_smoke_test
 from app.agent.stacks import get_adapter, probe_prefer, resolve_key
 from app.agent.templatedeps import TemplateGraph, build_graph
+from app.agent.todos import TodoStore, build_todo_tool
 from app.agent.tool_registry import ToolRegistry, create_registry
 from app.agent.verify import (
     check_file,
@@ -159,6 +160,17 @@ def _tool_guidance(workdir: str) -> str:
     Tool schemas are provided via ChatOllama.bind_tools — no JSON protocol
     text belongs here, only behavioral guidance.
     """
+    todo_note = (
+        (
+            "\n\nFor any task with 3 or more steps, FIRST call update_todos "
+            "listing every step, then keep it current — mark the step you are "
+            'on "working" and each finished step "done". The list is shown '
+            "back to you after every tool result; use it to pick the next step "
+            "and do not give a final answer while any item is unfinished."
+        )
+        if settings.todo_tool
+        else ""
+    )
     return f"""Working directory: {workdir}
 
 You have access to real tools via native function calling. Use a tool when the
@@ -183,7 +195,7 @@ whole file.
 The user's message may contain SEVERAL distinct requests. First enumerate every
 one of them, then use tools to complete ALL of them before you give a final
 answer. Do not stop after the first — a text response with no tool call is only
-final once every requested task is done."""
+final once every requested task is done.{todo_note}"""
 
 
 def _load_system_prompt() -> str:
@@ -773,6 +785,7 @@ def _extract_filename(message: str) -> str | None:
 # `@path` references, e.g. "change @src/app.py" (Claude-Code style file mention).
 _AT_REF_RE = re.compile(r"(?<!\w)@([\w./\\-]+)")
 
+
 # Prose extensions that make an @-ref a REQUIREMENTS DOCUMENT rather than a file
 # to edit — "build the site described in @PRD.md". Deliberately excludes every
 # source extension: an `@app.py` on a build request is code to work from, and
@@ -780,7 +793,9 @@ _AT_REF_RE = re.compile(r"(?<!\w)@([\w./\\-]+)")
 # the product. See `AgentCore._requirements_doc_context`.
 def _pascal_words(name: str) -> str:
     """`order_items` -> `OrderItems`, the shape `crud_node` names its helpers."""
-    return "".join(part[:1].upper() + part[1:] for part in re.split(r"[^A-Za-z0-9]+", name) if part)
+    return "".join(
+        part[:1].upper() + part[1:] for part in re.split(r"[^A-Za-z0-9]+", name) if part
+    )
 
 
 # Every template directory any stack of ours uses. A delta naming one of these
@@ -834,21 +849,19 @@ def _drop_example_echoes(delta: "SpecDelta", message: str = "") -> "SpecDelta":
             e
             for e in delta.add_entities
             if not (
-                (e.name.lower() in _DELTA_EXAMPLE_ENTITIES
-                 or e.table.lower() in _DELTA_EXAMPLE_ENTITIES)
+                (
+                    e.name.lower() in _DELTA_EXAMPLE_ENTITIES
+                    or e.table.lower() in _DELTA_EXAMPLE_ENTITIES
+                )
                 and e.name.lower() not in said
                 and e.table.lower() not in said
             )
         ),
         add_pages=tuple(
-            pg
-            for pg in delta.add_pages
-            if not _is_example_echo(pg.template, pg.route)
+            pg for pg in delta.add_pages if not _is_example_echo(pg.template, pg.route)
         ),
         add_endpoints=tuple(
-            e
-            for e in delta.add_endpoints
-            if not _is_example_echo(e.template, e.path)
+            e for e in delta.add_endpoints if not _is_example_echo(e.template, e.path)
         ),
         new_files=tuple(
             (name, instruction)
@@ -884,6 +897,7 @@ def _names_a_spec_doc(filename: str, message: str) -> bool:
         return should_blueprint(message)
     except Exception:  # noqa: BLE001 — a routing hint must never raise
         return False
+
 
 # `{% import "_macros.html" as ui %}` — required per template, because Jinja's
 # import is NOT inherited from `base.html`. See `AgentCore._fix_macro_import`.
@@ -1307,6 +1321,14 @@ class AgentCore:
         self.retriever = retriever or get_retriever()
         self.pm = pm or project_memory
         self.memory = ConversationMemory(session_id=session_id)
+        # The turn's own task list (app/agent/todos.py). The tool's handler is
+        # closed over THIS core's store, so it is registered here rather than in
+        # `_build_builtin_tools` — a shared registry must never carry one
+        # agent's state. Registered before the Executor so it resolves by name
+        # like every other builtin.
+        self._todos = TodoStore()
+        if settings.todo_tool:
+            self.registry.register(build_todo_tool(self._todos))
         self.executor = Executor(self.registry)
         self.planner = Planner()
         # Tool loop uses native function calling (bind_tools) — plain mode, NOT
@@ -1842,17 +1864,39 @@ class AgentCore:
                     ToolMessage(content=feedback, tool_call_id=call_id)
                 )
 
+            # Restate the model's own task list EVERY round, riding the last
+            # tool result (a ToolMessage must pair with a call, so this is the
+            # one legal place to put it). Stated once it would be the first
+            # thing history eviction deletes; restated, step 9 still knows what
+            # remains. Skipped when the round's last call was update_todos —
+            # its own result already shows the list.
+            todo_block = self._todos.render() if settings.todo_tool else ""
+            if (
+                todo_block
+                and tool_calls
+                and tool_calls[-1].get("name") != "update_todos"
+            ):
+                last = current_messages[-1]
+                if isinstance(last, ToolMessage):
+                    last.content = f"{last.content}\n\n{todo_block}"
+
             if give_up:
                 return give_up, tool_trace
 
         # M4: ran out of rounds. Report what happened instead of an opaque
         # "reached maximum steps" so a partially-completed multi-part request is
-        # visible rather than silently truncated.
+        # visible rather than silently truncated. The model's own task list, if
+        # it kept one, NAMES what is left — strictly more actionable than a
+        # count, and free.
         acted = sum(1 for t in tool_trace if (t.get("result") or {}).get("success"))
+        unfinished = self._todos.remaining() if settings.todo_tool else []
+        left_note = (
+            " Unfinished tasks: " + "; ".join(unfinished) + "." if unfinished else ""
+        )
         return (
             f"Stopped after {max_steps} tool-call rounds ({acted} action(s) "
-            f"completed) — the request may not be fully finished. Re-run any "
-            f"remaining parts, or raise settings.max_tool_steps.",
+            f"completed) — the request may not be fully finished.{left_note} "
+            f"Re-run any remaining parts, or raise settings.max_tool_steps.",
             tool_trace,
         )
 
@@ -2967,7 +3011,11 @@ class AgentCore:
             if failed:
                 answer += f" ({failed} block(s) didn't match the file)"
             note, extra = await self._verify_and_repair(
-                target_path, filename, user_message, extra_context, previous=full_content
+                target_path,
+                filename,
+                user_message,
+                extra_context,
+                previous=full_content,
             )
             trace.extend(extra)
             if note:
@@ -3542,9 +3590,7 @@ class AgentCore:
                 "write_file", {"path": str(target_path), "content": placeholder}
             )
             if result.get("success"):
-                trace.append(
-                    {"tool": "write_file", "args": {"path": str(target_path)}}
-                )
+                trace.append({"tool": "write_file", "args": {"path": str(target_path)}})
                 return (
                     "verification failed after "
                     f"{settings.max_repair_attempts} repair attempt(s): "
@@ -4128,9 +4174,7 @@ class AgentCore:
         # filenames too, and had not been.
         messages = [
             SystemMessage(
-                content=_load_amend_prompt()
-                + "\n\n"
-                + self._adapter.blueprint_layout()
+                content=_load_amend_prompt() + "\n\n" + self._adapter.blueprint_layout()
             ),
             HumanMessage(
                 content=(
@@ -4793,9 +4837,7 @@ class AgentCore:
             if not spec.is_empty() and spec.save(workdir):
                 self._spec = spec
                 self._write_readme(workdir, spec)
-                rule_note = (
-                    f", {len(spec.rules)} rule(s)" if spec.rules else ""
-                )
+                rule_note = f", {len(spec.rules)} rule(s)" if spec.rules else ""
                 answer += (
                     f"\n\nRemembered this project ({len(spec.entities)} table(s), "
                     f"{len(spec.endpoints)} route(s), {len(spec.pages)} page(s)"
@@ -6381,6 +6423,10 @@ class AgentCore:
 
         self._build_spec = None  # this turn's shared spec, set by _multi_file_flow
         self._blueprint = None  # this turn's blueprint, set by _run_blueprint
+        # The model's task list is per-turn state like the two above: last
+        # turn's finished checklist restated into this turn's prompts would
+        # read as work still owed (or already done — either misleads).
+        self._todos.clear()
         # Every route this turn's entry file has held, and its source. Per-turn
         # by design: across turns a route may be deleted on purpose, but WITHIN
         # one the repair passes only ever add.
@@ -7135,7 +7181,11 @@ class AgentCore:
                 path = f"/{stem}"
             if ("GET", path) in taken:
                 continue
-            if path not in linked and stem not in tables and not stem.startswith("new_"):
+            if (
+                path not in linked
+                and stem not in tables
+                and not stem.startswith("new_")
+            ):
                 continue
             locals_js = ""
             if stem in tables:
@@ -7180,7 +7230,9 @@ class AgentCore:
                 text = view.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
-            for match in re.finditer(r"""href\s*=\s*["'](/[A-Za-z0-9_./-]*)["']""", text):
+            for match in re.finditer(
+                r"""href\s*=\s*["'](/[A-Za-z0-9_./-]*)["']""", text
+            ):
                 out.add(match.group(1).rstrip("/") or "/")
         return out
 
@@ -7194,8 +7246,17 @@ class AgentCore:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 return set()
-            return set(re.findall(r"(?:^|[\s,{])([A-Za-z_$][\w$]*)\s*[,}]", text.split("module.exports")[-1])) | set(
-                re.findall(r"^(?:async\s+)?(?:function|def)\s+([A-Za-z_$][\w$]*)", text, re.MULTILINE)
+            return set(
+                re.findall(
+                    r"(?:^|[\s,{])([A-Za-z_$][\w$]*)\s*[,}]",
+                    text.split("module.exports")[-1],
+                )
+            ) | set(
+                re.findall(
+                    r"^(?:async\s+)?(?:function|def)\s+([A-Za-z_$][\w$]*)",
+                    text,
+                    re.MULTILINE,
+                )
             )
         return set()
 

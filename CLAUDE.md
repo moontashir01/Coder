@@ -474,6 +474,29 @@ would fight native tool calls. What remains of the hardening:
   fenced), it is executed as a tool call; anything else is a final answer. Upgrading Ollama makes
   native `tool_calls` arrive and this fallback stop firing — do not widen it into a JSON repairer.
 
+**The model's own task list (`app/agent/todos.py`, `settings.todo_tool`).** The loop used to
+execute blind: step 7 saw only the ToolMessage history, never "3 of 6 done, next is X", and on a
+long turn the early steps fell out of the context window — every deterministic repair pass
+(`_verify_blueprint_coverage`, `_repair_dead_references`, `_wire_missing_endpoints`) is a patch
+for a step the model forgot. `update_todos` is a builtin that stores a checklist in a per-core
+`TodoStore` and nothing else — no file, no shell, `permissions=[]`, so no gate ever fires and a
+bot `viewer` may use it. Zero extra LLM calls: the model updates the list inside calls it already
+makes. Rules, all inherited:
+- **The list is restated after EVERY tool round**, riding the round's last ToolMessage (the one
+  legal place — a ToolMessage must pair with a call). Stated once, it is the first thing history
+  eviction deletes; that restatement IS the mechanism.
+- **An unparseable update keeps the old list** (`parse_verdict`'s rule), and the handler **always
+  returns success** — a failed tool counts toward `max_tool_failures`, so two note-taking slips
+  would otherwise end the whole turn.
+- **A hint to the model, never a gate.** Nothing downstream trusts it: a todo marked done that
+  wasn't is still caught by the deterministic checks. Unknown status reads as `todo`, never
+  `done` — the misreading that makes the model finish the item.
+- **Capped** (20 items, 160 chars each): the block recurs every round, and an unbounded list
+  evicts the file context the work depends on (`_sibling_context`'s lesson).
+- **Per-turn state**, cleared at the top of `chat()` beside `_blueprint`/`_build_spec`; the
+  max-steps give-up message names the unfinished items instead of only a count. Registered in
+  `AgentCore.__init__` (closure over that core's store), never in the shared `get_registry()`.
+
 ### Tool registry & executor — the central hub
 
 - `app/agent/tool_registry.py` — every tool (builtin, MCP-discovered, skill-unlocked) must be

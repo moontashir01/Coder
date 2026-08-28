@@ -103,6 +103,11 @@ class Settings(BaseSettings):
     # stops. Raised from the old hard-coded 8 so genuinely multi-part work has
     # room to finish every step.
     max_tool_steps: int = 12
+    # The model's own per-turn task list (app/agent/todos.py): an `update_todos`
+    # builtin plus the list restated after every tool round, so a long tool-loop
+    # turn does not forget its remaining steps. Zero extra LLM calls; False
+    # skips registering the tool and every prompt reads as before.
+    todo_tool: bool = True
     # M1: split a compound request ("do A, then B, and C") into ordered
     # sub-tasks and route each one, instead of only handling the first. When the
     # cheap regex splitter sees a single task but the request still reads as
