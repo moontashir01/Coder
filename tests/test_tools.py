@@ -139,6 +139,110 @@ def test_search_files_skips_vendored_dirs(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# search_files ranking + caps — the best matches, not the first 2000 chars
+# ---------------------------------------------------------------------------
+
+
+def test_search_ranks_definition_line_above_mention(tmp_path):
+    # "zz_" prefix makes the mention file sort FIRST in the walk — the old
+    # first-N-chars behaviour would have led with it.
+    (tmp_path / "a_caller.py").write_text("x = handle_auth()\n", encoding="utf-8")
+    (tmp_path / "zz_impl.py").write_text(
+        "def handle_auth():\n    pass\n", encoding="utf-8"
+    )
+    res = fs.search_files(str(tmp_path), "handle_auth")
+    first = res["result"].splitlines()[0]
+    assert "zz_impl.py" in first
+    assert "def handle_auth" in first
+
+
+def test_search_ranks_filename_hit_above_unrelated_file(tmp_path):
+    (tmp_path / "a_random.py").write_text("login = True\n", encoding="utf-8")
+    (tmp_path / "zz_login.py").write_text("login = False\n", encoding="utf-8")
+    res = fs.search_files(str(tmp_path), "login")
+    assert "zz_login.py" in res["result"].splitlines()[0]
+
+
+def test_search_prefers_shallow_over_deep(tmp_path):
+    deep = tmp_path / "a" / "b" / "c"
+    deep.mkdir(parents=True)
+    (deep / "deep.py").write_text("needle = 1\n", encoding="utf-8")
+    (tmp_path / "shallow.py").write_text("needle = 2\n", encoding="utf-8")
+    res = fs.search_files(str(tmp_path), "needle")
+    assert "shallow.py" in res["result"].splitlines()[0]
+
+
+def test_search_caps_matches_and_counts_the_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "max_search_matches", 3)
+    for i in range(5):
+        (tmp_path / f"f{i}.py").write_text("needle\nneedle\n", encoding="utf-8")
+    res = fs.search_files(str(tmp_path), "needle")
+    lines = res["result"].splitlines()
+    assert len(lines) == 4  # 3 matches + the dropped-count note
+    assert "7 more match(es) in" in lines[-1]
+    assert "narrow the pattern" in lines[-1]
+
+
+def test_search_under_cap_has_no_dropped_note(tmp_path):
+    (tmp_path / "a.py").write_text("needle\n", encoding="utf-8")
+    res = fs.search_files(str(tmp_path), "needle")
+    assert "more match" not in res["result"]
+
+
+def test_search_truncates_a_minified_line(tmp_path):
+    (tmp_path / "app.min.js").write_text(
+        "var needle=" + "x" * 5000 + ";\n", encoding="utf-8"
+    )
+    res = fs.search_files(str(tmp_path), "needle")
+    first = res["result"].splitlines()[0]
+    assert "x" * 250 not in first  # the 5000-char body was cut
+    assert first.endswith("…")
+
+
+def test_search_ranking_is_deterministic(tmp_path):
+    for i in range(4):
+        (tmp_path / f"f{i}.py").write_text("needle\n", encoding="utf-8")
+    a = fs.search_files(str(tmp_path), "needle")["result"]
+    b = fs.search_files(str(tmp_path), "needle")["result"]
+    assert a == b
+
+
+# ---------------------------------------------------------------------------
+# list_directory caps — recursive skips vendored dirs, both count what's cut
+# ---------------------------------------------------------------------------
+
+
+def test_list_recursive_skips_vendored_and_says_so(tmp_path):
+    (tmp_path / "app.py").write_text("x", encoding="utf-8")
+    vendor = tmp_path / "node_modules" / "lib"
+    vendor.mkdir(parents=True)
+    (vendor / "index.js").write_text("y", encoding="utf-8")
+    res = fs.list_directory(str(tmp_path), recursive=True)
+    assert "app.py" in res["result"]
+    assert "index.js" not in res["result"]
+    assert "skipped" in res["result"]
+
+
+def test_list_non_recursive_still_shows_vendored_entry(tmp_path):
+    # One level down is the truth about THIS directory — only the recursive
+    # flood is filtered.
+    (tmp_path / "node_modules").mkdir()
+    res = fs.list_directory(str(tmp_path))
+    assert "node_modules" in res["result"]
+
+
+def test_list_caps_entries_and_counts_the_rest(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "max_list_entries", 3)
+    for i in range(6):
+        (tmp_path / f"f{i}.txt").write_text("x", encoding="utf-8")
+    res = fs.list_directory(str(tmp_path))
+    lines = res["result"].splitlines()
+    assert len(lines) == 4  # 3 entries + the count note
+    assert "3 more entries not shown" in lines[-1]
+    assert "subdirectory" in lines[-1]
+
+
+# ---------------------------------------------------------------------------
 # Terminal tool
 # ---------------------------------------------------------------------------
 

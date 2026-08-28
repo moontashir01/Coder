@@ -575,6 +575,22 @@ keeps the existing dot/`__pycache__`/`node_modules` skips. `read_file` truncates
 `settings.max_read_file_bytes` with a "truncated" note; `search_files` skips binary files (NUL byte
 in the first 1 KiB) and vendored/hidden dirs.
 
+**Ranked, capped tool output (`search_files` / `list_directory`).** Both used to return
+EVERYTHING and the tool loop then kept `_truncate_context`'s first 2000 characters — i.e.
+whatever the sorted walk found first (the alphabetically earliest folder), not the relevant hit,
+with `... [context truncated]` as the only evidence anything was cut. Now the tool itself decides
+what is worth the window, deterministically (pure sorting — no LLM, no latency, the
+`crud.py`-over-prompting trade): matches are scored (a definition line beats a mention, a hit in
+a file NAMED like the pattern beats one deep in an unrelated file, shallow beats deep; ties keep
+walk order, so the same search returns the same answer), the top `settings.max_search_matches`
+(8) are returned, each line capped at 200 chars so one minified-JS line cannot eat the budget —
+and **what was dropped is COUNTED, never silent** (`... 43 more match(es) in 12 file(s)`), which
+tells the model to narrow the pattern rather than trust a first-N accident as the whole truth.
+`list_directory` caps at `settings.max_list_entries` (200) the same way; its **recursive** walk
+now also skips vendored/hidden dirs (the indexer's own rule — a Node project's recursive listing
+was dominated by `node_modules`) and reports the skip, while the **non-recursive** form stays
+unfiltered: one level down is the truth about that directory.
+
 **Live auto-reindex (Step 4 / P3):** `AgentCore.load_project` starts a `ProjectWatcher`
 ([app/rag/watcher.py](app/rag/watcher.py)) — a debounced `watchdog` observer on the project root
 that feeds changes into `retriever.index_file`/`delete_file`. Its filtering (suffix, dotfile,

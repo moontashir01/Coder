@@ -388,14 +388,76 @@ def list_directory(path: str, recursive: bool = False) -> ToolResult:
 
         entries = sorted(p.rglob("*") if recursive else p.iterdir())
         lines: list[str] = []
+        skipped_vendored = 0
         for entry in entries:
             rel = entry.relative_to(p)
+            # A recursive listing of a real project is dominated by
+            # node_modules/.git/__pycache__ — thousands of entries the model
+            # read once and can do nothing with, evicting the context the turn
+            # needs (the indexer and search_files already skip these for the
+            # same reason). One level down (non-recursive) stays unfiltered:
+            # the caller asked what THIS directory holds, so show the truth.
+            if recursive and any(
+                part in _IGNORE_DIRS or part.startswith(".") for part in rel.parts
+            ):
+                skipped_vendored += 1
+                continue
             prefix = "DIR  " if entry.is_dir() else "FILE "
             lines.append(f"{prefix}{rel}")
+
+        # Cap the listing, and COUNT the remainder — "... [context truncated]"
+        # tells the model nothing, while a number tells it to list a
+        # subdirectory instead.
+        cap = settings.max_list_entries
+        dropped = len(lines) - cap
+        if dropped > 0:
+            lines = lines[:cap]
+            lines.append(
+                f"... {dropped} more entr{'y' if dropped == 1 else 'ies'} not "
+                f"shown — list a subdirectory to see them."
+            )
+        if skipped_vendored:
+            lines.append(
+                f"({skipped_vendored} entries in vendored/hidden dirs skipped)"
+            )
 
         return _ok("\n".join(lines) if lines else "(empty directory)")
     except Exception as e:
         return _err(str(e))
+
+
+# search_files ranking: pick the matches worth the model's context window,
+# deterministically. The tool used to return EVERY matching line and the tool
+# loop then kept the first 2000 characters — i.e. whatever the sorted walk
+# found first, usually the alphabetically earliest folder rather than the
+# relevant hit. Ranking is pure sorting (no LLM, no latency): a definition
+# line beats a mention, a hit in a file NAMED like the pattern beats one deep
+# in an unrelated file, and shallow paths beat deep ones. Ties keep walk
+# order, so two runs of the same search return the same answer.
+_DEF_LINE_RE = re.compile(
+    r"^\s*(?:async\s+def|def|class|function|const|let|var|interface|type|"
+    r"public|private|export)\b"
+    r"|^\s*@\w+"  # a decorator line (e.g. @app.route) is a definition site
+)
+_MAX_MATCH_LINE_CHARS = 200  # one minified-JS line must not eat the budget
+
+
+def _pattern_tokens(pattern: str) -> set[str]:
+    """The identifier-ish words in a regex, for filename affinity. Regex
+    syntax contributes nothing (`\\bdef\\b` yields only sane tokens because
+    escapes are split away from the word characters)."""
+    return {t.lower() for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", pattern)}
+
+
+def _match_score(rel_parts: tuple[str, ...], line: str, tokens: set[str]) -> float:
+    stem = Path(rel_parts[-1]).stem.lower() if rel_parts else ""
+    score = 0.0
+    if tokens and any(t in stem for t in tokens):
+        score += 3.0
+    if _DEF_LINE_RE.match(line):
+        score += 2.0
+    score -= 0.25 * (len(rel_parts) - 1)  # depth penalty
+    return score
 
 
 def search_files(path: str, pattern: str) -> ToolResult:
@@ -408,7 +470,11 @@ def search_files(path: str, pattern: str) -> ToolResult:
             return _err(f"Path not found: {path}")
 
         regex = re.compile(pattern)
-        matches: list[str] = []
+        tokens = _pattern_tokens(pattern)
+        # (score, walk_index, rendered_line, file) per match; scored now,
+        # ranked once at the end.
+        scored: list[tuple[float, int, str, Path]] = []
+        order = count()
 
         is_dir = root.is_dir()
         targets = root.rglob("*") if is_dir else [root]
@@ -417,6 +483,7 @@ def search_files(path: str, pattern: str) -> ToolResult:
                 continue
             # Skip vendored/hidden dirs and binary files (C4). When searching a
             # single file directly, honor the caller and don't second-guess it.
+            rel_parts = (file.name,)
             if is_dir:
                 rel_parts = file.relative_to(root).parts
                 if any(
@@ -431,13 +498,35 @@ def search_files(path: str, pattern: str) -> ToolResult:
                     file.read_text(encoding="utf-8", errors="replace").splitlines(), 1
                 ):
                     if regex.search(line):
-                        matches.append(f"{file}:{i}: {line.rstrip()}")
+                        text = line.rstrip()
+                        if len(text) > _MAX_MATCH_LINE_CHARS:
+                            text = text[:_MAX_MATCH_LINE_CHARS] + "…"
+                        scored.append(
+                            (
+                                _match_score(rel_parts, line, tokens),
+                                next(order),
+                                f"{file}:{i}: {text}",
+                                file,
+                            )
+                        )
             except Exception:
                 continue
 
-        if not matches:
+        if not scored:
             return _ok(f"No matches for pattern {pattern!r} in {path}")
-        return _ok("\n".join(matches))
+
+        # Best first; ties in walk order (stable — same search, same answer).
+        scored.sort(key=lambda m: (-m[0], m[1]))
+        cap = settings.max_search_matches
+        kept, dropped = scored[:cap], scored[cap:]
+        lines = [m[2] for m in kept]
+        if dropped:
+            in_files = len({m[3] for m in dropped})
+            lines.append(
+                f"... {len(dropped)} more match(es) in {in_files} file(s) not "
+                f"shown — narrow the pattern or search a subdirectory."
+            )
+        return _ok("\n".join(lines))
     except re.error as e:
         return _err(f"Invalid regex pattern: {e}")
     except Exception as e:

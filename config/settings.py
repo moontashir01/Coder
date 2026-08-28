@@ -84,6 +84,18 @@ class Settings(BaseSettings):
     # indexing; read_file truncates its output at the same ceiling.
     max_index_file_bytes: int = 1_000_000
     max_read_file_bytes: int = 1_000_000
+    # Tool-output caps (app/tools/filesystem.py): the tool loop pastes every
+    # result into the conversation history for the rest of the turn, and the
+    # old arrangement — return EVERYTHING, then `_truncate_context` keeps the
+    # first 2000 chars — kept whatever the sorted walk found first, which is
+    # the alphabetically earliest folder, not the relevant hit. search_files
+    # now RANKS matches (definition lines and filename hits first) and returns
+    # the top `max_search_matches`, NAMING how many were dropped so the model
+    # narrows the pattern instead of guessing; recursive list_directory skips
+    # vendored/hidden dirs (the indexer's own rule) and both listings cap at
+    # `max_list_entries` with the remainder counted, never silent.
+    max_search_matches: int = 8
+    max_list_entries: int = 200
 
     # Agent config
     # qwen2.5-coder:7b handles a larger context window than the old 3B default;
