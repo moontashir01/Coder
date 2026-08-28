@@ -408,6 +408,50 @@ class FlaskAdapter:
     ) -> tuple[str, list[str]]:
         return reinstate_routes(source, blocks)
 
+    def strip_layout_include(self, source: str) -> tuple[str, bool]:
+        """Nothing to do on Flask: a child template says `{% extends %}`, and
+        `convert_to_child_template` already owns the equivalent defect."""
+        return source or "", False
+
+    def repair_model_calls(self, source: str, root: Path) -> tuple[str, list[str]]:
+        """Not implemented for Flask: declines, so nothing changes."""
+        return source or "", []
+
+    def call_arity_mismatches(self, root: Path) -> list[str]:
+        """Not implemented for Flask: `unresolved_local_calls` is `ast`-based
+        there and this check has not been measured on that stack."""
+        return []
+
+    def normalize_render_names(
+        self, source: str, root: Path
+    ) -> tuple[str, list[str]]:
+        """Nothing to do on Flask: `render_template("x.html")` names a PATH
+        under `templates/`, so the value Express rejects is the correct one
+        here."""
+        return source or "", []
+
+    def restore_data_layer_api(self, root: Path, spec: "ProjectSpec") -> list[str]:
+        """Not implemented for Flask: declines, so nothing changes.
+
+        The same hole exists in `models.py` and the same generator could fill
+        it; it is left until the failure has been measured on this stack, the
+        way the Node one was.
+        """
+        return []
+
+    def wire_view_route(
+        self, source: str, path: str, stem: str, locals_js: str = ""
+    ) -> tuple[str, bool]:
+        """Not implemented for Flask: declines, so nothing changes.
+
+        The defect is real on both stacks, but `restore_page_routes` already
+        covers the Flask case this was written for (a route that VANISHED), and
+        adding one that never existed is a different question there — Jinja
+        renders an undefined name as empty, so the page does not 500 and the
+        evidence this pass keys on is missing.
+        """
+        return source or "", False
+
     def orphan_templates(self, root: Path) -> list[str]:
         return _scaffold.templates_without_inheritance(root)
 
@@ -419,6 +463,17 @@ class FlaskAdapter:
         from app.agent.templatedeps import build_graph
 
         return build_graph(root, self.entry_file)
+
+    def route_edit_region(self, filename: str, text: str, user_message: str):
+        """None on Flask, for now.
+
+        The defect this prevents was measured on Express, where a route is one
+        `app.post(...)` call and `_route_spans` already slices them. `app.py`'s
+        equivalent is a decorated function, which `view_bodies` can find — but
+        the guard is not yet needed here and a region computed by a second,
+        untested slicer would be the risk it exists to remove.
+        """
+        return None
 
     def template_edit_region(self, filename: str, text: str):
         return _scaffold.template_edit_region(filename, text)

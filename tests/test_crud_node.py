@@ -696,3 +696,148 @@ def test_the_scaffold_turns_a_rejected_async_handler_into_a_500(tmp_path):
     assert ".catch(next)" in source
     # Wrapped BEFORE any route is defined, or the routes below are not covered.
     assert source.index(".catch(next)") < source.index('app.get("/"')
+
+
+# ---------------------------------------------------------------------------
+# The seed must satisfy the schema it was generated beside
+# ---------------------------------------------------------------------------
+
+
+def _constrained_spec() -> ProjectSpec:
+    """Two tables in the shape a real PRD produces: an enumeration and an FK."""
+    users = Entity(
+        name="user",
+        table="users",
+        fields=(
+            Field(name="id", type="TEXT", pk=True),
+            Field(name="email", type="TEXT", required=True, unique=True),
+        ),
+    )
+    items = Entity(
+        name="item",
+        table="items",
+        fields=(
+            Field(name="id", type="TEXT", pk=True),
+            Field(name="seller_id", type="TEXT", required=True, references="users(id)"),
+            Field(
+                name="status",
+                type="TEXT",
+                required=True,
+                check=("DRAFT", "ACTIVE", "SOLD"),
+            ),
+        ),
+    )
+    return ProjectSpec(name="Market", entities=(users, items))
+
+
+def test_a_seeded_value_is_one_the_check_constraint_allows():
+    """`condition_rating` was seeded as "Demo condition_rating 1" against a
+    column whose CHECK names five values, and PostgreSQL refused the row — which
+    aborted the whole seed, so every page of the OpenBazaar build came up empty
+    on a schema that was otherwise correct."""
+    source = crud_node.seed_source(_constrained_spec())
+    assert '"DRAFT"' in source
+    assert "Demo status" not in source
+
+
+def test_a_foreign_key_is_seeded_with_an_id_that_exists():
+    """`gen_random_uuid()` mints the parent id, so it cannot be known when the
+    file is written: the child insert has to use the id the parent insert
+    RETURNED. Before this the value was the string "Demo seller_id 1"."""
+    source = crud_node.seed_source(_constrained_spec())
+    assert "RETURNING id" in source
+    assert "pickId(usersIds, 1)" in source
+    assert '"Demo seller_id' not in source
+
+
+def test_a_second_run_still_has_parent_ids():
+    """`ON CONFLICT DO NOTHING` returns NO row for one already stored, so a
+    re-run would bind null into a NOT NULL foreign key unless the ids are read
+    back."""
+    source = crud_node.seed_source(_constrained_spec())
+    assert "if (usersIds.length === 0)" in source
+    assert "SELECT id FROM users LIMIT" in source
+
+
+def test_a_child_of_an_unseeded_parent_is_skipped_with_its_reason():
+    """Emitting the insert anyway is a guaranteed foreign-key violation, and one
+    failed insert takes every later one with it."""
+    orphan = Entity(
+        name="bid",
+        table="bids",
+        fields=(
+            Field(name="id", type="TEXT", pk=True),
+            Field(
+                name="auction_id", type="TEXT", required=True, references="auctions(id)"
+            ),
+        ),
+    )
+    source = crud_node.seed_source(ProjectSpec(name="M", entities=(orphan,)))
+    assert "not seeded" in source and "auctions" in source
+    assert "INSERT INTO bids" not in source
+
+
+# ---------------------------------------------------------------------------
+# ...and an edit to models.js must not be able to delete the API
+# ---------------------------------------------------------------------------
+
+
+def test_a_helper_an_edit_deleted_is_put_back():
+    """Turn 2 of the OpenBazaar build: asked to add one column to the users
+    queries, the model returned a models.js a third shorter, and every page
+    answered `TypeError: models.listUsers is not a function`."""
+    spec = _constrained_spec()
+    full = crud_node.models_source(spec)
+    # The shape of the real failure: one entity's helpers are simply gone.
+    truncated = full.split("async function listItems")[0] + "module.exports = {\n};\n"
+    assert "listItems" not in truncated
+
+    repaired, restored = crud_node.restore_model_api(truncated, spec)
+
+    assert "listItems" in restored
+    assert "async function listItems" in repaired
+    assert "listUsers" in repaired  # what survived is untouched
+    assert repaired.count("async function listUsers") == 1
+
+
+def test_it_refills_holes_and_never_takes_anything_away():
+    spec = _constrained_spec()
+    source = crud_node.models_source(spec) .replace(
+        "module.exports = {", "async function findLatest() {\n  return [];\n}\n\nmodule.exports = {\n  findLatest,"
+    )
+    repaired, restored = crud_node.restore_model_api(source, spec)
+    assert restored == []  # nothing was missing
+    assert repaired == source
+
+
+def test_a_file_that_still_has_everything_is_returned_byte_for_byte():
+    spec = _constrained_spec()
+    source = crud_node.models_source(spec)
+    repaired, restored = crud_node.restore_model_api(source, spec)
+    assert (repaired, restored) == (source, [])
+
+
+def test_a_helper_the_file_defines_but_never_exported_is_exported():
+    """A helper that is written and not exported is
+    `models.listAuctions is not a function` — the same 500 as one that was
+    deleted, from the opposite cause, and the turn that added it reports success
+    either way. Measured: the two helpers a repair turn was asked for landed in
+    the file and never reached `module.exports`."""
+    spec = _constrained_spec()
+    source = crud_node.models_source(spec).replace(
+        "module.exports = {",
+        "async function listAuctions() {\n  return [];\n}\n\nmodule.exports = {",
+    )
+    repaired, restored = crud_node.restore_model_api(source, spec)
+    assert "listAuctions" in restored
+    exports = repaired.split("module.exports")[1]
+    assert "listAuctions" in exports
+
+
+def test_a_private_helper_is_not_exported():
+    """`nullIfBlank` is a detail of the file, not part of its API."""
+    spec = _constrained_spec()
+    source = crud_node.models_source(spec)
+    repaired, restored = crud_node.restore_model_api(source, spec)
+    assert restored == []
+    assert repaired == source

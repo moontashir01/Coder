@@ -739,10 +739,18 @@ async def test_wiring_puts_the_index_route_back(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     a._llm_edit = ScriptedLLM(["no blocks"])
-    a._llm_direct = ScriptedLLM(  # a rewrite that drops "/", as 7B builds do
+    # The rewrite keeps "/" — one that drops it is now REFUSED outright by
+    # the route-loss guard in `_verify_and_repair`, so it never reaches the
+    # restore this test was written to exercise. Both rules are wanted: the
+    # guard stops the loss, and `_restore_scaffold_invariants` is the
+    # backstop for the paths it does not cover.
+    a._llm_direct = ScriptedLLM(
         [
             "FILENAME: app.py\n"
             + _flask_app(
+                '@app.route("/")\n'
+                "def index():\n"
+                '    return render_template("index.html")\n\n'
                 '@app.route("/categories/new")\n'
                 "def new_category():\n"
                 '    return render_template("new_category.html")\n'
@@ -781,13 +789,33 @@ async def test_wiring_reverts_an_edit_that_breaks_the_entry_file(tmp_path, monke
     )
     (tmp_path / "app.py").write_text(source, encoding="utf-8")
     a._llm_edit = ScriptedLLM(["no blocks"])
-    a._llm_direct = ScriptedLLM(["FILENAME: app.py\ndef broken(:\n"])
+    # ScriptedLLM repeats its LAST output forever, and the coverage pass makes
+    # a second generation call for the template the restored route renders.
+    # Without a distinct second answer that call writes `def broken(:` back
+    # over the file this test has already reverted, and the test then
+    # "reproduces" a failure it caused itself.
+    a._llm_direct = ScriptedLLM(
+        [
+            "FILENAME: app.py\ndef broken(:\n",
+            "FILENAME: templates/new_category.html\n<p>new</p>\n",
+        ]
+    )
     bp = _bp_with(["app.py"], endpoints=[Endpoint("GET", "/categories/new")])
 
     note, _ = await a._verify_blueprint_coverage(bp, [])
 
-    assert (tmp_path / "app.py").read_text() == source  # reverted, byte-for-byte
-    assert "reverted" in note
+    # The broken edit did not land. Not byte-for-byte any more: the same pass
+    # also restores the `/` route the scaffold ships, which is a separate
+    # invariant and a wanted one — so the check is that the REWRITE was
+    # undone, not that nothing else was written.
+    written = (tmp_path / "app.py").read_text()
+    assert "def broken(" not in written
+    assert '@app.route("/categories")' in written  # what the edit destroyed
+    compile(written, "app.py", "exec")  # …and it parses
+    # …and the turn says the route is still missing rather than claiming it
+    # was wired. (The revert itself now happens one layer down, in
+    # `_verify_and_repair`, so the word appears in that stage's note.)
+    assert "still no route" in note or "aren't defined" in note
 
 
 async def test_wiring_reports_what_it_could_not_fix(tmp_path, monkeypatch):

@@ -13,7 +13,13 @@ from pathlib import Path
 import pytest
 
 from app.agent import core as core_module
-from app.agent.ejslocals import free_identifiers, render_locals, repair_view_locals
+from app.agent.ejslocals import (
+    add_render_locals,
+    default_for,
+    free_identifiers,
+    render_locals,
+    repair_view_locals,
+)
 from app.agent.stacks.flask_adapter import FLASK
 from app.agent.stacks.node_adapter import NODE
 
@@ -154,8 +160,19 @@ def test_core_runs_the_view_check_after_every_route_pass():
     """It learns what each view is given by reading `res.render` out of the
     entry file, so a route restored later would otherwise be invisible to it."""
     source = Path(core_module.__file__).with_suffix(".py").read_text(encoding="utf-8")
-    tail = source[source.index("_restore_entry_route_note()") :][:1600]
-    assert "_repair_view_locals" in tail
+    tail = source[source.index("_restore_entry_route_note()") :]
+    # LAST of the entry-file passes, not merely present: it reads the file's
+    # `res.render` calls, so anything that can add or repoint a route has to
+    # have run already. Checked by position rather than by proximity — new
+    # passes land in this chain and a fixed window would fail on the next one.
+    where = tail.index("_repair_view_locals")
+    for earlier in (
+        "_route_unrouted_views",
+        "_normalize_render_names",
+        "_repair_model_calls",
+    ):
+        assert earlier in tail, f"{earlier} is no longer in the chain"
+        assert tail.index(earlier) < where, f"{earlier} must run before the view check"
     assert tail.index("_reinstate_entry_routes") < tail.index("_repair_view_locals")
 
 
@@ -207,3 +224,46 @@ def test_a_brace_inside_a_string_does_not_end_the_render_object():
 
 def test_a_render_with_no_locals_is_still_recorded():
     assert render_locals('res.render("new_order");\n') == {"new_order": set()}
+
+
+# ---------------------------------------------------------------------------
+# The route is where a missing local gets fixed
+# ---------------------------------------------------------------------------
+
+
+def test_a_missing_local_is_added_to_the_routes_render_call():
+    """`new_item.ejs` branched on `sale_type` to decide which price fields were
+    required; no route passed one, so the "create a listing" page — the most
+    important page in a marketplace — was a 500 from the moment it was written.
+    `repair_view_locals` can only blank a bare `ui.*()` argument, so it reported
+    this and the page stayed broken."""
+    source = 'app.get("/items/new", (req, res) => {\n  res.render("new_item", { title: "New" });\n});\n'
+    out, added = add_render_locals(source, "new_item", {"sale_type": '""'})
+    assert added == ["sale_type"]
+    assert 'sale_type: ""' in out
+    assert 'title: "New"' in out  # nothing else moves
+
+
+def test_a_render_with_no_locals_object_gets_one():
+    out, added = add_render_locals('res.render("bids");', "bids", {"rows": "[]"})
+    assert added == ["rows"]
+    assert 'res.render("bids", { rows: [] });' in out
+
+
+def test_a_name_the_route_already_passes_is_left_alone():
+    source = 'res.render("items", { items: rows });'
+    out, added = add_render_locals(source, "items", {"items": "[]"})
+    assert (out, added) == (source, [])
+
+
+def test_another_views_route_is_not_touched():
+    source = 'res.render("items", { a: 1 });\nres.render("bids", { b: 2 });\n'
+    out, _ = add_render_locals(source, "items", {"x": '""'})
+    assert 'res.render("bids", { b: 2 });' in out
+
+
+def test_the_default_is_read_off_how_the_view_uses_the_name():
+    """`""` where a view calls `.forEach` swaps a ReferenceError for a
+    TypeError, which is not a repair."""
+    assert default_for("items", "<% items.forEach(i => { %>") == "[]"
+    assert default_for("sale_type", '<%= sale_type === "FIXED" %>') == '""'

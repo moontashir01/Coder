@@ -564,6 +564,12 @@ class BlockRegion:
     end: int
     body: str
     siblings: tuple[str, ...] = ()
+    # "block" for a Jinja `{% block %}`; "route" for one handler in the entry
+    # file. The splice is identical either way — this only decides how the
+    # prompt describes what the model is looking at, and a prompt that calls an
+    # Express route a Jinja block is one the model will answer in the wrong
+    # language.
+    kind: str = "block"
 
     def splice(self, source: str, new_body: str) -> str:
         """``source`` with this region's body replaced. The only writer."""

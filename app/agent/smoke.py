@@ -193,6 +193,7 @@ def run_smoke_test(
     warmup: float = 1.5,
     spec=None,
     on_serving=None,
+    adapter=None,
 ) -> SmokeResult:
     """Start ``server_file`` in ``workdir``, see if it runs, probe it, kill it.
 
@@ -284,6 +285,18 @@ def run_smoke_test(
                             checks = tuple(functional_probe(spec, port))
                         except Exception:
                             checks = ()  # best-effort: never fail a turn here
+                        try:
+                            # …and the rules, which is the only check in the
+                            # pipeline that can fail on a behaviour rather than
+                            # on a shape. Same best-effort rule: an exception
+                            # here must never cost a turn whose files landed.
+                            checks += tuple(
+                                behaviour_probe(
+                                    spec, port, adapter=adapter, root=workdir
+                                )
+                            )
+                        except Exception:
+                            pass
                     if on_serving is not None:
                         try:
                             checks += tuple(on_serving(port) or ())
@@ -409,6 +422,15 @@ def server_error(text: str) -> str:
     return ""
 
 
+def _is_parameterised(route: str) -> bool:
+    """Does this route carry a placeholder segment rather than a real value?
+
+    Both spellings this codebase meets: Express's `/users/:id` and Flask's
+    `/users/<int:id>`.
+    """
+    return ":" in route or "<" in route
+
+
 def _request(
     port: int,
     method: str,
@@ -462,6 +484,283 @@ def _sample_value(field) -> str:
     return f"{PROBE_MARKER} {field.name}"
 
 
+def _post_form(port: int, path: str, fields: dict, timeout: float):
+    """POST a urlencoded form. Returns (status, body)."""
+    from urllib.parse import urlencode
+
+    return _request(
+        port,
+        "POST",
+        path,
+        timeout,
+        body=urlencode(fields).encode(),
+        content_type="application/x-www-form-urlencoded",
+    )
+
+
+def _write_path_for(spec, table: str) -> str:
+    """The POST route that creates a row in ``table``, or "".
+
+    Read off the spec's own endpoints, by entity first and by path second. A
+    guess would post the probe's payload at some unrelated handler and report
+    its 500 as a broken rule.
+    """
+    endpoints = list(getattr(spec, "endpoints", ()) or ())
+    entity = spec.entity(table)
+    names = {table.lower()}
+    if entity is not None:
+        names.add(entity.name.lower())
+    for endpoint in endpoints:
+        if endpoint.method != "POST":
+            continue
+        if (endpoint.entity or "").lower() in names:
+            return endpoint.path
+    for endpoint in endpoints:
+        if endpoint.method != "POST" or _is_parameterised(endpoint.path):
+            continue
+        if any(name in endpoint.path.lower() for name in names):
+            return endpoint.path
+    return ""
+
+
+def _child_of(spec, table: str):
+    """The entity whose rows point AT ``table`` and carry an amount.
+
+    A rule about auctions is enforced when a *bid* is posted, not when an item
+    is. The link is the foreign key, which `Field.references` already records.
+    """
+    from app.agent import rules as _rules
+
+    for entity in getattr(spec, "entities", ()) or ():
+        if entity.table == table:
+            continue
+        points_at = any(
+            (f.references or "").split("(", 1)[0].strip() == table
+            for f in entity.fields
+        )
+        if points_at and _rules.amount_column(entity):
+            return entity
+    return None
+
+
+def _child_fields(child, parent_table: str, parent_id) -> dict:
+    """A plausible body for creating one ``child`` row against ``parent_id``."""
+    fields = {f.name: _sample_value(f) for f in child.fields if not f.pk}
+    for f in child.fields:
+        if (f.references or "").split("(", 1)[0].strip() == parent_table:
+            fields[f.name] = str(parent_id)
+    return fields
+
+
+def behaviour_probe(
+    spec, port: int, adapter=None, root=None, timeout: float = 4.0
+) -> list[ProbeCheck]:
+    """Exercise the spec's RULES against the running app.
+
+    The gap this closes was measured end to end on the OpenBazaar build: a
+    `/bids/new` that stores a bid without comparing it to
+    `current_highest_bid + bid_increment_step` parses, routes, renders 200 and
+    persists — identical under every check that existed to one that enforces the
+    rule. With no failing check there is no error text, and Coder's repair loop
+    is check → error → regenerate. It fixed dozens of structural defects on that
+    build precisely because those had checks; the behaviours had none, so they
+    were never written and nothing ever said so.
+
+    Two shapes are exercised, the two `rules.classify_rule` will label:
+
+    * `min_increment` — post a value that does NOT clear the step and require
+      the app to refuse it. "Refuse" is a 4xx **or** no new row: a handler that
+      answers 302 and silently drops the bid is enforcing it too.
+    * `extend_deadline` — move one row's deadline to a minute from now, post a
+      valid child, and require the deadline to have moved.
+
+    **Every uncertainty is a stated skip, never a failure.** No adapter, no
+    database, no rows, no write route, an unreadable column: each means the
+    check could not run, and reporting one as a broken rule would send
+    `_smoke_repair_instruction` at code that works — `functional_probe` step 3's
+    lesson, which cost a live build a rewrite of a correct file.
+    """
+    from app.agent import rules as _rules
+
+    checks: list[ProbeCheck] = []
+    rules = list(getattr(spec, "rules", ()) or ())
+    if not rules:
+        return checks
+
+    run_sql = getattr(adapter, "run_sql", None) if adapter is not None else None
+    for rule in rules:
+        label = f"RULE {rule.entity}: {rule.trigger[:48]}"
+        entity = spec.entity(rule.entity)
+        # Classify here when the stored rule carries no label: a spec written
+        # before `kind` existed, or one built in code, is still checkable, and
+        # the entity is in hand now — which is what makes the answer better than
+        # the one `_load_rules` could give without it.
+        kind = rule.kind or _rules.classify_rule(rule, entity)
+        if not kind:
+            continue
+        if entity is None:
+            checks.append(ProbeCheck(label, True, "not probed - no such table"))
+            continue
+        if run_sql is None or root is None:
+            checks.append(
+                ProbeCheck(
+                    label, True, "not probed - no database access on this stack"
+                )
+            )
+            continue
+
+        if kind == _rules.KIND_MIN_INCREMENT:
+            checks.append(
+                _probe_min_increment(spec, rule, entity, port, run_sql, root, timeout)
+            )
+        elif kind == _rules.KIND_EXTEND_DEADLINE:
+            checks.append(
+                _probe_extend_deadline(spec, rule, entity, port, run_sql, root, timeout)
+            )
+    return checks
+
+
+def _probe_min_increment(spec, rule, entity, port, run_sql, root, timeout):
+    """A value that does not clear the step must be refused."""
+    from app.agent import rules as _rules
+
+    label = f"RULE {entity.table}: a value below the increment is refused"
+    amount = _rules.amount_column(entity)
+    step = _rules.increment_column(entity)
+    child = _child_of(spec, entity.table)
+    if not (amount and step and child is not None):
+        return ProbeCheck(label, True, "not probed - the columns this needs are absent")
+    path = _write_path_for(spec, child.table)
+    if not path:
+        return ProbeCheck(label, True, "not probed - no route creates a row here")
+
+    rows = run_sql(
+        root,
+        f"SELECT id, {amount} AS amount, {step} AS step FROM {entity.table} LIMIT 1",
+    )
+    if not rows:
+        return ProbeCheck(label, True, "not probed - could not read the table")
+    row = rows[0]
+    try:
+        current = float(row.get("amount") or 0)
+    except (TypeError, ValueError):
+        return ProbeCheck(label, True, "not probed - the value is not a number")
+
+    before = run_sql(root, f"SELECT count(*)::int AS n FROM {child.table}")
+    if not before:
+        return ProbeCheck(label, True, "not probed - could not count the rows")
+
+    fields = _child_fields(child, entity.table, row.get("id"))
+    child_amount = _rules.amount_column(child)
+    if child_amount:
+        # Equal to the current value, so it does NOT clear the step.
+        fields[child_amount] = str(current)
+    status, _body = _post_form(port, path, fields, timeout)
+
+    after = run_sql(root, f"SELECT count(*)::int AS n FROM {child.table}")
+    if not after:
+        return ProbeCheck(label, True, "not probed - could not re-count the rows")
+    stored = int(after[0].get("n") or 0) > int(before[0].get("n") or 0)
+    if status is not None and status >= 500:
+        # A crash is not a refusal. The route erroring is `functional_probe`'s
+        # finding and it reports it already; counting it here would turn a
+        # broken handler into evidence that the rule is enforced — the most
+        # expensive kind of false pass, because it hides the defect behind a
+        # green check.
+        return ProbeCheck(
+            label, True, f"not probed - the route errored (HTTP {status})"
+        )
+    if status is not None and 400 <= status < 500:
+        return ProbeCheck(label, True, f"refused with HTTP {status}")
+    if not stored:
+        return ProbeCheck(label, True, "refused - nothing was written")
+    return ProbeCheck(
+        label,
+        False,
+        f"POST {path} accepted {child_amount}={current} while "
+        f"{entity.table}.{amount} was already {current} and "
+        f"{entity.table}.{step} must be cleared - the rule is not enforced "
+        f"({rule.effect[:70]})",
+    )
+
+
+def _probe_extend_deadline(spec, rule, entity, port, run_sql, root, timeout):
+    """An action close to the deadline must push the deadline out."""
+    from app.agent import rules as _rules
+
+    label = f"RULE {entity.table}: a late action moves the deadline"
+    deadline = _rules.deadline_column(entity)
+    child = _child_of(spec, entity.table)
+    if not (deadline and child is not None):
+        return ProbeCheck(label, True, "not probed - the columns this needs are absent")
+    path = _write_path_for(spec, child.table)
+    if not path:
+        return ProbeCheck(label, True, "not probed - no route creates a row here")
+
+    rows = run_sql(root, f"SELECT id FROM {entity.table} LIMIT 1")
+    if not rows:
+        return ProbeCheck(label, True, "not probed - could not read the table")
+    row_id = rows[0].get("id")
+    # One demo row is moved to a minute from now so the rule's window is real.
+    # The probe already inserts rows through the app; this is the same licence,
+    # and the value is a bound parameter, never interpolated.
+    moved = run_sql(
+        root,
+        f"UPDATE {entity.table} SET {deadline} = now() + interval '60 seconds' "
+        "WHERE id = $1 RETURNING id",
+        [row_id],
+    )
+    if not moved:
+        return ProbeCheck(label, True, "not probed - could not set up the deadline")
+
+    amount = _rules.amount_column(entity)
+    step = _rules.increment_column(entity)
+    bump = 1.0
+    if amount and step:
+        current = run_sql(
+            root,
+            f"SELECT {amount} AS amount, {step} AS step FROM {entity.table} "
+            "WHERE id = $1",
+            [row_id],
+        )
+        if current:
+            try:
+                bump = (
+                    float(current[0].get("amount") or 0)
+                    + float(current[0].get("step") or 0)
+                    + 1
+                )
+            except (TypeError, ValueError):
+                bump = 1.0
+
+    fields = _child_fields(child, entity.table, row_id)
+    child_amount = _rules.amount_column(child)
+    if child_amount:
+        fields[child_amount] = str(bump)
+    _post_form(port, path, fields, timeout)
+
+    after = run_sql(
+        root,
+        f"SELECT extract(epoch from ({deadline} - now()))::int AS left_s "
+        f"FROM {entity.table} WHERE id = $1",
+        [row_id],
+    )
+    if not after:
+        return ProbeCheck(label, True, "not probed - could not re-read the deadline")
+    try:
+        left = int(after[0].get("left_s") or 0)
+    except (TypeError, ValueError):
+        return ProbeCheck(label, True, "not probed - the deadline is not a time")
+    if left > 70:
+        return ProbeCheck(label, True, f"extended - {left}s left after the bid")
+    return ProbeCheck(
+        label,
+        False,
+        f"a bid one minute before {entity.table}.{deadline} left it at {left}s - "
+        f"the rule is not enforced ({rule.effect[:70]})",
+    )
+
+
 def functional_probe(spec, port: int, timeout: float = 4.0) -> list[ProbeCheck]:
     """Exercise the running app against its own contract.
 
@@ -491,6 +790,23 @@ def functional_probe(spec, port: int, timeout: float = 4.0) -> list[ProbeCheck]:
     for page in getattr(spec, "pages", ()) or ():
         route = page.route or ""
         if not route.startswith("/"):
+            continue
+        if _is_parameterised(route):
+            # `/users/:id` is a PATTERN, not a URL. Fetching it literally asks
+            # for the user whose id is the string ":id", and the app correctly
+            # answers 404 — reported here as a broken page, which then sends
+            # the repair loop at code that works. Measured on the OpenBazaar
+            # build: four detail pages, all of them fine, all of them failing.
+            # Stated rather than skipped silently: a check that did not run has
+            # verified nothing.
+            checks.append(
+                ProbeCheck(
+                    f"GET {route}",
+                    True,
+                    "not probed - the route takes an id, and this check has no "
+                    "real one to put in it",
+                )
+            )
             continue
         status, text = _request(port, "GET", route, timeout)
         if status is None:

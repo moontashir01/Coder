@@ -15,6 +15,7 @@
 const path = require("path");
 const express = require("express");
 const expressLayouts = require("express-ejs-layouts");
+const session = require("express-session");
 
 const db = require("./db");
 const models = require("./models");
@@ -41,10 +42,33 @@ app.locals.projectName = "{{PROJECT_NAME}}";
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
+app.use(express.static(path.join(__dirname, "public")));
+
+// Signed cookie sessions, mounted here so `req.session` exists on every route.
+// A generated app that signs users in needs somewhere to keep who they are, and
+// `req.session` is a property of a parameter — nothing static can see that it
+// is undefined, so the failure is a 500 on the first successful login and not
+// before. The store is in memory: fine for one process, and the thing to
+// replace before this is deployed anywhere real.
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || "{{SECRET_KEY}}",
+    resave: false,
+    saveUninitialized: false,
+    cookie: { httpOnly: true, sameSite: "lax", maxAge: 1000 * 60 * 60 * 24 },
+  })
+);
+
+// Whoever is signed in, available to every view as `currentUser` without each
+// route having to remember to pass it.
+app.use((req, res, next) => {
+  res.locals.currentUser = req.session.user || null;
+  next();
+});
+
 // Static files. `public/css/style.css` holds the components and
 // `public/css/theme.css` the colour and font variables; theme.css is linked
 // LAST by the layout, so it wins, and it is the only file a restyle touches.
-app.use(express.static(path.join(__dirname, "public")));
 
 // Express 4 does not forward a REJECTED promise from an `async` handler to the
 // error middleware below: the rejection goes unhandled, and Node 15+ treats

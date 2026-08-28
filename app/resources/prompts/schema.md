@@ -28,6 +28,11 @@ shape:
         {"name": "image_path", "type": "IMAGE"}
       ]
     }
+  ],
+  "rules": [
+    {"entity": "product",
+     "trigger": "a bid is placed on an auction",
+     "effect": "it must be at least the current highest bid plus the bid increment step, or it is rejected"}
   ]
 }
 
@@ -95,6 +100,22 @@ Rules:
   to display. "Keep it small" is about not inventing tables nobody asked for —
   it is **never** a reason to drop one the document asks for, or a rule it
   places on one.
+
+- **`rules` is for what the app must DO, not what it stores.** A table says a
+  bid has an amount; a rule says which amounts are allowed. Write one entry for
+  every behaviour the request or the document states as a requirement — a
+  validation ("a bid must beat the current one by the increment"), a
+  consequence ("a refused delivery drops the buyer's score by 25"), a timing
+  rule ("a bid in the last 3 minutes extends the auction by 3 minutes"), a
+  transition ("an expired auction above the reserve creates an order"). Name the
+  entity it governs, state the `trigger` and the `effect` in the words the
+  request used, and do not turn them into code.
+
+  This is the half that is most often lost. A column with no rule behind it is a
+  form field; the product is the rules. If the document describes a behaviour,
+  it belongs here even when it needs no new column — and **especially** then,
+  because nothing else in the pipeline will remember it. Leave `rules` empty
+  only when the request genuinely asks for storage and nothing more.
 
 - **If the request stores nothing at all** — a purely static page — reply with
   `{"summary": "...", "entities": []}`. An empty list is a valid answer and far

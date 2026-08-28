@@ -423,3 +423,67 @@ async def test_blueprint_call_states_the_stack_s_own_file_layout(tmp_path, monke
     prompt = llm.prompts[0]
     assert "server.js" in prompt and "views/layout.ejs" in prompt
     assert "templates/base.html" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# ...and naming it does not read as "this is an edit"
+# ---------------------------------------------------------------------------
+
+
+async def test_the_build_gate_survives_a_named_requirements_document(
+    tmp_path, monkeypatch
+):
+    """`_names_an_existing_file` vetoes the blueprint for a message that names a
+    file the project already has. A requirements document IS such a file, so
+    "build the site described in @PRD.md" — the shape this whole module exists
+    to serve — declined to build and fell through to a single-file edit.
+
+    Measured on a real 12.5 KB PRD: the turn's entire output was
+    "Edited `PRD.md`: 1 change(s) applied".
+    """
+    monkeypatch.chdir(tmp_path)
+    _write_prd(tmp_path)
+    a = AgentCore(session_id="pytest_doc_gate")
+    a._project_path = str(tmp_path)
+
+    assert a._names_an_existing_file("build the marketplace described in PRD.md") is False
+    # The ordinary veto still works: a real source file named in a build-ish
+    # request is an edit to what exists.
+    (tmp_path / "app.js").write_text("// x\n", encoding="utf-8")
+    assert a._names_an_existing_file("build the marketplace described in app.js") is True
+
+
+async def test_file_op_flow_will_not_write_the_document_it_was_built_from(
+    tmp_path, monkeypatch
+):
+    """The name arrives as plain TEXT once `_strip_at_refs` has run, so
+    `_resolve_ref(exclude_docs=...)` is not enough on its own —
+    `_extract_filename` reads "PRD.md" straight out of the message and
+    `_file_op_flow` then sends the user's requirements document to
+    `_surgical_edit`."""
+    monkeypatch.chdir(tmp_path)
+    _write_prd(tmp_path)
+    a = AgentCore(session_id="pytest_doc_write")
+    a._project_path = str(tmp_path)
+
+    edited = {}
+
+    async def _fake_surgical(*args, **kwargs):
+        edited["ran"] = args[0] if args else kwargs.get("filename")
+        return "edited", []
+
+    monkeypatch.setattr(a, "_surgical_edit", _fake_surgical)
+
+    async def _fake_tool_loop(messages):
+        return "tool loop", []
+
+    monkeypatch.setattr(a, "_run_tool_loop", _fake_tool_loop)
+    monkeypatch.setattr(a, "_build_messages", lambda *a_, **k_: _amessages())
+
+    async def _amessages():
+        return []
+
+    await a._file_op_flow("build the marketplace website described in PRD.md")
+
+    assert "ran" not in edited, f"the PRD was edited: {edited}"
+    assert (tmp_path / "PRD.md").read_text(encoding="utf-8") == PRD

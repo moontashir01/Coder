@@ -14,16 +14,16 @@ changes that thing, and use `[]` or omit it otherwise.
      "add_fields": [{"name": "<column>", "type": "TEXT|INTEGER|REAL|IMAGE", "required": false}]}
   ],
   "endpoints": [
-    {"method": "POST", "path": "/admin/products",
-     "request": "{title, price, image}", "response": "302 -> /admin/products",
-     "template": "templates/admin_products.html", "entity": "product"}
+    {"method": "POST", "path": "/admin/widgets",
+     "request": "{title, price, image}", "response": "302 -> /admin/widgets",
+     "template": "templates/admin_widgets.html", "entity": "widget"}
   ],
   "pages": [
-    {"route": "/admin/products", "template": "templates/admin_products.html",
-     "nav_label": "Admin", "purpose": "form to add a product", "reads": ["product"]}
+    {"route": "/admin/widgets", "template": "templates/admin_widgets.html",
+     "nav_label": "Admin", "purpose": "form to add a widget", "reads": ["widget"]}
   ],
   "new_files": [
-    {"filename": "templates/admin_products.html",
+    {"filename": "templates/admin_widgets.html",
      "instruction": "<what this NEW file must contain>"}
   ]
 }
@@ -54,5 +54,10 @@ Rules:
 - Keep it minimal: the smallest set of changes that satisfies the request. If the
   request changes nothing structural, return `{"summary": "..."}` and nothing
   else.
+
+- **The shapes above are a FORMAT, not a suggestion.** `admin_widgets`,
+  `/admin/widgets` and `product` are there to show where each value goes.
+  Never copy one into your answer: use the names this request and the contract
+  below actually use.
 
 - Output ONLY the JSON. No prose, no markdown fences.

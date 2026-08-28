@@ -31,11 +31,13 @@ be silent and on turn 2.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from app.agent import crud_node as _crud_node
 from app.agent import scaffold as _scaffold
 from app.agent.crud_node import (
     adds_column,
@@ -251,6 +253,66 @@ def _shadows(param_path: str, literal_path: str) -> bool:
         elif seg_a != seg_b:
             return False
     return saw_param
+
+
+# `<%- include("../layout", { … }) %>` — a view wrapping itself in the shell
+# that already wraps it.
+_LAYOUT_INCLUDE_RE = re.compile(
+    r"""<%[-=]?\s*include\s*\(\s*["'][^"']*layout[^"']*["'][^%]*%>\s*"""
+)
+
+# `res.render("<view>"` — the name only, quotes excluded.
+_RENDER_NAME_RE = re.compile(
+    r"""res\s*\.\s*render\s*\(\s*["'](?P<view>[^"']+)["']"""
+)
+
+
+def _function_block(text: str, name: str) -> str:
+    """`async function name(…) { … }` out of ``text``, doc comment included."""
+    match = re.search(
+        r"(?:^/\*\*(?:(?!\*/).)*\*/\s*)?^(?:async\s+)?function\s+"
+        + re.escape(name)
+        + r"\s*\(",
+        text,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        return ""
+    brace = text.find("{", match.end())
+    if brace == -1:
+        return ""
+    depth = 0
+    for index in range(brace, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[match.start() : index + 1]
+    return ""
+
+
+def _names_route(message: str, method: str, path: str) -> bool:
+    """Does ``message`` name this route?
+
+    The path has to appear as a whole segment path — `/items` must not match
+    `/items/new`, or "fix /items" would edit two handlers and pick one. A method
+    word narrows it when the message uses one, which is how `POST /items/new`
+    and `GET /items/new` are told apart.
+    """
+    low = message.lower()
+    if path.lower() not in low:
+        return False
+    # `/items` inside `/items/new` is a prefix, not a mention: require the
+    # character after the match to end the path.
+    at = low.index(path.lower())
+    after = low[at + len(path) :][:1]
+    if after and (after.isalnum() or after in "/-_"):
+        return False
+    spoken = re.findall(r"\b(get|post|put|patch|delete)\b", low)
+    if spoken and method.lower() not in spoken:
+        return False
+    return True
 
 
 def _insertion_point(text: str) -> int | None:
@@ -497,6 +559,25 @@ class NodeAdapter:
         # source: db.js ships a *commented* `ensureColumn(client, "widgets", …)`
         # example, and counting that as a real migration is the `_creates_table`
         # trap one stack over.
+        # An entity the delta INTRODUCED has no table yet, and `ALTER TABLE` on
+        # a table that does not exist is a hard failure inside `initDb()` —
+        # which the generated app treats as fatal, so the whole site stops
+        # booting. Measured on turn 2 of the OpenBazaar build: the delta added a
+        # `seller` entity, db.js got two `ensureColumn(client, "sellers", …)`
+        # calls and nothing that creates `sellers`, and every page went down
+        # with `relation "sellers" does not exist`. A new table is a CREATE, not
+        # an ALTER; `creates_table` reads string literals for the `_creates_table`
+        # trap's reason.
+        created: list[str] = []
+        for entity in spec.entities:
+            if creates_table(source, entity.table):
+                continue
+            if not any(f.added_in > since for f in entity.fields):
+                continue  # not this revision's business
+            statement = entity.to_ddl(POSTGRES)
+            indented = "\n".join("      " + line for line in statement.splitlines())
+            created.append(f"    await client.query(`\n{indented}\n    `);")
+
         pending = [
             (entity.table, f.name, f.type)
             for entity in spec.entities
@@ -504,12 +585,18 @@ class NodeAdapter:
             if f.added_in > since
             and not f.pk
             and not adds_column(source, entity.table, f.name)
+            # …and never a column of a table this same block is creating: the
+            # CREATE already has every one of them.
+            and creates_table(source, entity.table)
         ]
-        if not pending:
+        if not pending and not created:
             return ""
         block = "\n".join(
-            f"    {POSTGRES.migration_call(table, column, kind)};"
-            for table, column, kind in pending
+            created
+            + [
+                f"    {POSTGRES.migration_call(table, column, kind)};"
+                for table, column, kind in pending
+            ]
         )
         updated, changed = apply_block(source, block)
         if not changed or not self.write_source_if_valid(db_path, updated):
@@ -928,6 +1015,76 @@ client
   });
 """
 
+    _SQL_SCRIPT = """
+"use strict";
+function say(o) { console.log("CODER_SQL " + JSON.stringify(o)); }
+let url = process.env.DATABASE_URL || "";
+try { url = require("./db").DATABASE_URL || url; } catch (e) {}
+if (!url) { say({ ok: false, code: "CODER_NO_URL" }); process.exit(2); }
+let pg;
+try { pg = require("pg"); }
+catch (e) { say({ ok: false, code: "CODER_NO_PG" }); process.exit(2); }
+const payload = JSON.parse(process.env.CODER_SQL_PAYLOAD || "{}");
+const client = new pg.Client({ connectionString: url, connectionTimeoutMillis: TIMEOUT_MS });
+client
+  .connect()
+  .then(function () { return client.query(payload.sql, payload.params || []); })
+  .then(function (r) { say({ ok: true, rows: r.rows || [], count: r.rowCount }); process.exit(0); })
+  .catch(function (e) {
+    say({ ok: false, code: String(e.code || ""), message: String(e.message || "").split("\\n")[0] });
+    process.exit(1);
+  });
+"""
+
+    def run_sql(self, root: Path, sql: str, params: list | None = None):
+        """Run one parameterised statement against the project's own database.
+
+        The transport is N5's: `node -e` with the project's `pg` and the URL out
+        of its own `db.js`, so this measures the database the app really uses
+        rather than one guessed from settings. Values are BOUND — the caller
+        passes `$1`-style placeholders — and the only thing interpolated into
+        `sql` by callers is an identifier they took from the spec, which
+        `projectspec._ident` has already validated.
+
+        Returns the rows as dicts, or **None for every uncertainty**: no node, no
+        `pg`, no URL, a timeout, a crash, unparseable output. `smoke.py` reads
+        None as "could not check" and says so — `database_reason`'s rule, and it
+        matters more here, because a behaviour probe that mistook an unreachable
+        database for a broken rule would send the repair loop at correct code.
+        """
+        import json
+        import subprocess
+
+        timeout = max(1.0, float(getattr(settings, "db_probe_timeout", 6.0)))
+        script = self._SQL_SCRIPT.replace("TIMEOUT_MS", str(int(timeout * 1000)))
+        env = dict(os.environ)
+        env["CODER_SQL_PAYLOAD"] = json.dumps({"sql": sql, "params": params or []})
+        try:
+            proc = subprocess.run(
+                ["node", "-e", script],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=timeout + 3.0,
+                env=env,
+            )
+        except Exception:
+            logger.debug("run_sql: could not start node", exc_info=True)
+            return None
+        for line in (proc.stdout or "").splitlines():
+            if not line.startswith("CODER_SQL "):
+                continue
+            try:
+                payload = json.loads(line[len("CODER_SQL ") :])
+            except Exception:
+                return None
+            if not payload.get("ok"):
+                logger.debug("run_sql refused: %s", payload.get("code"))
+                return None
+            rows = payload.get("rows")
+            return rows if isinstance(rows, list) else []
+        return None
+
     def _probe_database(self, root: Path) -> dict | None:
         """Run the probe and return its payload, or None when it said nothing.
 
@@ -1165,6 +1322,31 @@ client
         if not self.source_is_valid(path.name, source):
             logger.warning("declined to write invalid source to %s", path.name)
             return False
+        # …and for the ENTRY FILE, that it still serves what it served. Every
+        # deterministic pass writes through here, and several of them rewrite
+        # the file wholesale — so a pass that was asked to add one route can
+        # take ten out, and the only evidence is a 404 much later. Measured on
+        # the OpenBazaar build more than once, most expensively at the end:
+        # `POST /register` and `POST /login` vanished from a turn whose job was
+        # to fix a third handler. None of these passes has any business
+        # REMOVING a route, so losing one means the rewrite went wrong.
+        if path.name == self.entry_file:
+            try:
+                current = path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                current = ""
+            if current.strip():
+                had = {(m, p_) for m, p_, _v, _t in self.routes_from_source(current)}
+                now = {(m, p_) for m, p_, _v, _t in self.routes_from_source(source)}
+                lost = had - now
+                if lost:
+                    logger.warning(
+                        "declined a write to %s that would lose %d route(s): %s",
+                        path.name,
+                        len(lost),
+                        ", ".join(sorted(f"{m} {p_}" for m, p_ in lost))[:200],
+                    )
+                    return False
         try:
             before = (
                 path.read_text(encoding="utf-8", errors="replace")
@@ -1413,6 +1595,35 @@ client
                 ],
             )
 
+        # The route SECTION is everything above the terminal handlers, and only
+        # that. Slicing from the first route to the last one is what this used
+        # to do, and when an earlier pass had left a route below the 404
+        # handler that slice swallowed the startup block with it: rebuilding
+        # the span from route text alone then deleted `db.initDb()` and
+        # `app.listen`, and the app defined its handlers and exited in silence.
+        # Measured on the OpenBazaar build — the repair that moved one route
+        # took the whole server down.
+        boundary = _insertion_point(text)
+        if boundary is not None:
+            below = [s for s in spans if s[2] >= boundary]
+            if below:
+                # A route registered after the 404 handler never matches
+                # anything anyway, so lifting it is a repair in its own right.
+                lifted = "".join(
+                    text[s[2] : s[3]].strip("\n") + "\n\n" for s in below
+                )
+                for s in sorted(below, key=lambda s: s[2], reverse=True):
+                    text = text[: s[2]] + text[s[3] :]
+                at = _insertion_point(text)
+                if at is None:
+                    return source, [], []
+                text = text[:at] + lifted + text[at:]
+                spans = self._route_spans(text)
+                boundary = _insertion_point(text)
+            spans = [s for s in spans if boundary is None or s[3] <= boundary]
+        if len(spans) < 2:
+            return (text, sorted(f"{m} {p}" for m, p in shadowing), []) if text != source else (source, [], [])
+
         start, end = spans[0][2], spans[-1][3]
         # A stable sort by one bit: a route that shadows a literal sibling goes
         # to the BOTTOM of the route section, everything else keeps the order it
@@ -1420,7 +1631,7 @@ client
         # meaning this cannot see, so it moves only what is provably wrong.
         ordered = sorted(spans, key=lambda s: (s[0], s[1]) in shadowing)
         if ordered == spans:
-            return source, [], []
+            return (text, sorted(f"{m} {p}" for m, p in shadowing), []) if text != source else (source, [], [])
         body = "\n\n".join(text[s[2] : s[3]].strip("\n") for s in ordered)
         moved = sorted(f"{m} {p}" for m, p in shadowing)
         return text[:start] + body + "\n" + text[end:], moved, []
@@ -1562,6 +1773,302 @@ client
             restored
         )
 
+    def strip_layout_include(self, source: str) -> tuple[str, bool]:
+        """Remove a view's own `include("layout")` — the layout already wraps it.
+
+        `express-ejs-layouts` renders every `res.render()` inside
+        `views/layout.ejs`, so a view that includes the layout as well renders
+        the shell inside itself: at best two navigations, and in practice the
+        page 500s because the layout expects a `body` the include does not
+        provide. `blueprint_layout` states the rule and a 7B writes it anyway —
+        measured on `views/seller_listings.ejs`, whose first line was
+        `<%- include("../layout", { title: "Create Listing" }) %>`.
+
+        Only an include of the LAYOUT is removed; a partial (`_filters`) is a
+        real include and is left alone.
+        """
+        text = source or ""
+        out = _LAYOUT_INCLUDE_RE.sub("", text)
+        return (out.lstrip("\n") if out != text else text), out != text
+
+    def repair_model_calls(self, source: str, root: Path) -> tuple[str, list[str]]:
+        """`models.getItemById(id)` -> `models.getItem(id)`.
+
+        The data layer is GENERATED, so the name of every query helper is known
+        exactly; a route calling something else is a `TypeError: … is not a
+        function`, i.e. a 500 on that page. The one shape worth repairing is the
+        one the model reaches for constantly and that means precisely one thing
+        — a `ById` suffix on a getter that exists without it. Measured on the
+        OpenBazaar build: five detail routes, five 500s, five names one suffix
+        away from the helper sitting in `models.js`.
+
+        Everything else is left alone and reported by `unresolved_local_calls`:
+        `listAuctions` names a query nobody wrote, and inventing one is
+        generation, not repair.
+        """
+        text = source or ""
+        models = Path(root) / "models.js"
+        if not models.is_file():
+            return text, []
+        try:
+            exported = set(
+                re.findall(
+                    r"function\s+([A-Za-z_$][\w$]*)",
+                    models.read_text(encoding="utf-8", errors="replace"),
+                )
+            )
+        except Exception:
+            return text, []
+        if not exported:
+            return text, []
+
+        fixes: list[str] = []
+        for name in sorted(set(re.findall(r"models\.([A-Za-z_$][\w$]*)\s*\(", text))):
+            if name in exported:
+                continue
+            # Two shapes, each meaning exactly one thing: a `ById` suffix on a
+            # getter that exists without it, and `getThings` where the generated
+            # list helper is `listThings`. Measured: `/items` answered
+            # `models.getItems is not a function` with `listItems` defined four
+            # lines away.
+            if name.endswith("ById"):
+                target = name[: -len("ById")]
+            elif name.startswith("get"):
+                target = "list" + name[len("get") :]
+            else:
+                continue
+            if target not in exported:
+                continue
+            text = re.sub(
+                r"models\.%s\s*\(" % re.escape(name), f"models.{target}(", text
+            )
+            fixes.append(f"{name} -> {target}")
+        return text, fixes
+
+    def _recover_called_helpers(self, root: Path, source: str) -> str:
+        """Splice back a helper the entry file calls and this file has lost.
+
+        Read out of `.coder_backups` — the newest snapshot of `models.js` that
+        still defines the name — so the restored function is the one that
+        worked, character for character, rather than a fresh guess at what it
+        did. Returns "" when there is nothing to do.
+        """
+        entry = root / self.entry_file
+        if not entry.is_file():
+            return ""
+        try:
+            calls = set(
+                re.findall(r"models\.([A-Za-z_$][\w$]*)\s*\(", entry.read_text(
+                    encoding="utf-8", errors="replace"
+                ))
+            )
+        except Exception:
+            return ""
+        missing = sorted(
+            name
+            for name in calls
+            if not re.search(r"function\s+" + re.escape(name) + r"\s*\(", source)
+        )
+        if not missing:
+            return ""
+
+        backups = sorted(
+            (root / ".coder_backups").glob("*models.js"),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        ) if (root / ".coder_backups").is_dir() else []
+        out = source
+        for name in missing:
+            for backup in backups:
+                try:
+                    text = backup.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                block = _function_block(text, name)
+                if not block:
+                    continue
+                out = _crud_node._insert_before_exports(out, block)
+                break
+        return out if out != source else ""
+
+    def call_arity_mismatches(self, root: Path) -> list[str]:
+        """`models.createUser(a, b)` against a helper that takes eight columns.
+
+        The data layer is generated, so each helper's parameter list is known
+        exactly. A call with the wrong count still resolves, still parses and
+        still routes — it fails at request time, inserting nulls into NOT NULL
+        columns. Measured on the finished OpenBazaar build: `POST /register`,
+        the one page a new user has to get through, answered 500 for this and
+        nothing in the pipeline said why.
+
+        Report only, and deliberately conservative: a call is flagged only when
+        it passes FEWER arguments than the helper declares (a trailing optional
+        is a real pattern, an omitted required column is not), and a helper
+        whose parameter list cannot be read is skipped.
+        """
+        models = Path(root) / "models.js"
+        entry = Path(root) / self.entry_file
+        if not (models.is_file() and entry.is_file()):
+            return []
+        try:
+            defs = dict(
+                re.findall(
+                    r"function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)",
+                    models.read_text(encoding="utf-8", errors="replace"),
+                )
+            )
+            source = entry.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return []
+
+        out: list[str] = []
+        for name, args in re.findall(
+            r"models\.([A-Za-z_$][\w$]*)\s*\(([^()]*)\)", source
+        ):
+            if name not in defs:
+                continue  # `unresolved_local_calls` owns that one
+            expected = [a for a in (p.strip() for p in defs[name].split(",")) if a]
+            passed = [a for a in (p.strip() for p in args.split(",")) if a]
+            if len(passed) < len(expected):
+                out.append(
+                    f"{self.entry_file} calls models.{name} with "
+                    f"{len(passed)} argument(s); it takes {len(expected)} "
+                    f"({', '.join(expected)})"
+                )
+        return sorted(set(out))
+
+    def normalize_render_names(
+        self, source: str, root: Path
+    ) -> tuple[str, list[str]]:
+        """`res.render("views/login.ejs")` -> `res.render("login")`.
+
+        Express resolves a view name against the configured views directory and
+        appends the engine's extension, so a value carrying either is a lookup
+        failure — `Failed to lookup view "views/login.ejs"`, a 500 on a page
+        whose file is right there. `blueprint_layout` states the rule and the
+        route-restoring stub obeys it; a route the MODEL wrote is where it goes
+        wrong, and measured it did, on the login page of the OpenBazaar build.
+
+        Only rewrites a name that resolves to a view that really exists, so a
+        subdirectory this stack does not use, or a name that is already right,
+        is never touched.
+        """
+        text = source or ""
+        views = Path(root) / self.template_dir
+        fixes: list[str] = []
+
+        def replace(match):
+            raw = match.group("view")
+            stem = Path(raw).name
+            if stem.endswith(self.template_ext):
+                stem = stem[: -len(self.template_ext)]
+            if not (views / f"{stem}{self.template_ext}").is_file():
+                # The build wrote `views/item_detail.ejs` and the route renders
+                # "item": Express reports `Failed to lookup view`, which is a
+                # 500 on every detail page of the site. Repointed only when
+                # EXACTLY ONE view could be meant — `references._name_key`'s
+                # rule, for its reason: sending a route to the wrong page is
+                # worse than the error it replaces.
+                # `<name>_detail` is what `derive_pages_from_entities` calls a
+                # detail page, so it is tried first and by name. Only if there
+                # is no such file does a prefix match get a look, and then only
+                # when exactly one view could be meant — `new_item` and
+                # `item_detail` both look like "item", and guessing between
+                # them would send a route to the wrong page.
+                detail = f"{stem}_detail"
+                if (views / f"{detail}{self.template_ext}").is_file():
+                    stem = detail
+                else:
+                    # Both directions, because the model errs both ways: it
+                    # renders "item" for `item_detail.ejs`, and "items_list" for
+                    # `items.ejs`. Either way EXACTLY ONE view may match, or the
+                    # name is left alone and reported.
+                    candidates = sorted(
+                        path.stem
+                        for path in views.glob(f"*{self.template_ext}")
+                        if path.stem.startswith(f"{stem}_")
+                        or stem.startswith(f"{path.stem}_")
+                    )
+                    if len(candidates) != 1:
+                        return match.group(0)
+                    stem = candidates[0]
+            if stem == raw:
+                return match.group(0)
+            fixes.append(f"{raw} -> {stem}")
+            return match.group(0).replace(raw, stem)
+
+        out = _RENDER_NAME_RE.sub(replace, text)
+        return out, fixes
+
+    def restore_data_layer_api(self, root: Path, spec: "ProjectSpec") -> list[str]:
+        """Refill query helpers an edit to `models.js` deleted.
+
+        `db.js` is never handed to the model; `models.js` still is, and turn 2
+        of the OpenBazaar build shows the price — one added column, a rewrite a
+        third shorter, and every page 500ing on `models.listUsers is not a
+        function`. Deterministic and additive: see `crud_node.restore_model_api`.
+        """
+        path = Path(root) / "models.js"
+        if not path.is_file():
+            return []
+        try:
+            current = path.read_text(encoding="utf-8", errors="replace")
+            repaired, restored = _crud_node.restore_model_api(current, spec)
+            # A helper the spec does not imply — one a later turn was asked for
+            # by name, like `listAuctions` — is invisible to the generator, so
+            # once an edit drops it nothing above can put it back. The entry
+            # file still calls it, and a previous version of this file still
+            # defines it: that is enough to restore it exactly, with no model
+            # and no guessing.
+            recovered = self._recover_called_helpers(Path(root), repaired)
+            if recovered:
+                repaired, extra = _crud_node.restore_model_api(recovered, spec)
+                restored = sorted(set(restored + extra + ["(from a backup)"]))
+        except Exception:
+            return []
+        if not restored or repaired == current:
+            return []
+        # The same rule every repair here follows: a fix that will not parse is
+        # not a fix. `models.js` is required by the entry file, so a broken one
+        # takes the whole app down rather than one page.
+        if not self.write_source_if_valid(path, repaired):
+            return []
+        return restored
+
+    def wire_view_route(
+        self, source: str, path: str, stem: str, locals_js: str = ""
+    ) -> tuple[str, bool]:
+        """Add `app.get(path)` rendering `stem`, above the terminal handlers.
+
+        A view nothing renders is a page that was written, styled, checked and
+        linked to from the site's own navigation, and then served a 404 —
+        measured on the OpenBazaar build for `/orders` and `/auctions`, both of
+        them in the nav of every page. Nothing else could repair it:
+        `check_links` reports the dead link, `_wire_missing_endpoints` only
+        knows the routes the SPEC declared, and coverage only knows the files
+        the plan named.
+
+        Deterministic, and it declines rather than guesses: the caller has
+        already established that exactly one view carries this stem and that
+        nothing routes to it. ``locals_js`` is the data expression, chosen by
+        the caller from the generated model helpers; without one the page still
+        renders, because a name no route passes is `add_render_locals`' job.
+        """
+        text = source or ""
+        if not path.startswith("/") or not stem:
+            return text, False
+        at = _insertion_point(text)
+        if at is None:
+            return text, False
+        title = stem.replace("_", " ").replace("-", " ").strip().title()
+        extra = f", {locals_js}" if locals_js else ""
+        block = (
+            f'app.get("{path}", async (req, res) => {{\n'
+            f'  res.render("{stem}", {{ title: "{title}"{extra} }});\n'
+            "});\n\n"
+        ).replace("\n", chr(10))
+        return text[:at] + block + text[at:], True
+
     def orphan_templates(self, root: Path) -> list[str]:
         """Views that are full `<html>` documents instead of layout fragments.
 
@@ -1612,6 +2119,57 @@ client
             template_ext=self.template_ext,
             parser=parse_ejs_template,
             routes_reader=self.routes_from_source,
+        )
+
+    def route_edit_region(self, filename: str, text: str, user_message: str):
+        """The ONE route block an edit names, as a spliceable region, or None.
+
+        The Phase W3 idea moved from templates to the entry file, and for a
+        sharper reason. A 7B asked to fix one handler answers with that handler —
+        and `_apply_search_replace` then matches its SEARCH against the whole
+        file, so the reply lands as a replacement for everything it resembles.
+        Measured on the OpenBazaar build: one "fix POST /items/new" turn came
+        back having deleted **27 routes**, and the route-loss guard had to revert
+        the whole edit, which means the requested fix did not land either.
+
+        Confining the edit to the block makes both impossible at once: the model
+        sees one handler, its SEARCH is matched against that handler, and
+        `BlockRegion.splice` copies every other byte of the file through
+        untouched. A rewrite of one route cannot lose another.
+
+        Declines — returning None for today's whole-file path — whenever the
+        answer is not certain: not the entry file, no routes parsed, the message
+        names no route, or it names more than one. Two candidates mean the
+        request was ambiguous, and editing the wrong handler is worse than
+        editing the file.
+        """
+        if Path(filename).name != self.entry_file:
+            return None
+        spans = self._route_spans(text or "")
+        if not spans:
+            return None
+        message = " ".join((user_message or "").split())
+        if not message:
+            return None
+
+        wanted = [
+            (method, path, start, end)
+            for method, path, start, end in spans
+            if _names_route(message, method, path)
+        ]
+        if len(wanted) != 1:
+            return None
+        method, path, start, end = wanted[0]
+        body = text[start:end]
+        if not body.strip():
+            return None
+        return _scaffold.BlockRegion(
+            name=f"{method} {path}",
+            start=start,
+            end=end,
+            body=body,
+            siblings=tuple(f"{m} {p}" for m, p, _s, _e in spans if p != path)[:8],
+            kind="route",
         )
 
     def template_edit_region(self, filename: str, text: str):

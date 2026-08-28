@@ -55,7 +55,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from app.agent.blueprint import Blueprint
@@ -78,6 +78,7 @@ README_MARKER = "Written by Coder from the project spec"
 # output upstream, so every list is bounded.
 MAX_ENTITIES = 12
 MAX_FIELDS = 24
+MAX_RULES = 24
 MAX_ENDPOINTS = 24
 MAX_PAGES = 24
 MAX_FEATURES = 20
@@ -492,6 +493,43 @@ class SpecFeature:
     tier: str = "core"
     files: tuple[str, ...] = ()
     added_in: int = 1
+
+
+@dataclass(frozen=True)
+class Rule:
+    """One behaviour the app must have: a trigger, and what must follow.
+
+    The gap this closes is the one the OpenBazaar build measured end to end. The
+    PRD's five tables survived turn 1 perfectly — a table is representable, so
+    `_extract_schema` had somewhere to put it. "If a bid is registered within the
+    final 3 minutes, extend the auction by 3 minutes" had nowhere to go, was
+    dropped at the first stage, and was never mentioned again by any later
+    prompt, check or repair. `Field` learned the same lesson one level down:
+    what the spec cannot represent, the build silently discards.
+
+    Three fields and no more, because each one has to be usable rather than
+    merely stored:
+
+    * `entity` ties the rule to a table, so `impact.py` can reach it and the
+      probe knows which rows to exercise;
+    * `trigger` is the condition, in the user's own words;
+    * `effect` is what must then be true — again in their words, because a rule
+      a 7B rewrites into pseudocode is one nobody can check against the PRD.
+
+    `kind` is the only derived field: a deterministic label
+    (`rules.classify_rule`) naming the shape a live probe can exercise, or "" for
+    the many rules that are prose to the model and nothing more.
+    """
+
+    entity: str
+    trigger: str
+    effect: str
+    kind: str = ""
+    added_in: int = 1
+
+    def summary(self) -> str:
+        """One line, the shape every prompt prints it in."""
+        return f"{self.entity}: when {self.trigger}, {self.effect}"
 
 
 @dataclass(frozen=True)
@@ -1224,6 +1262,8 @@ class ProjectSpec:
     revision: int = 1
     spec_version: int = SPEC_VERSION
     entities: tuple[Entity, ...] = ()
+    # What the app must DO, as opposed to what it stores. See `Rule`.
+    rules: tuple[Rule, ...] = ()
     endpoints: tuple[SpecEndpoint, ...] = ()
     pages: tuple[Page, ...] = ()
     features: tuple[SpecFeature, ...] = ()
@@ -1317,6 +1357,17 @@ class ProjectSpec:
             sections.append(
                 "### Data — these tables exist; use these EXACT names\n"
                 + "\n".join(f"- {e.summary()}" for e in self.entities)
+            )
+        if self.rules:
+            # Directly under the schema, and above the routes, because of
+            # what the budget does when it runs out: it drops from the
+            # BOTTOM. A rule is the one thing here that nothing else in the
+            # pipeline remembers — a route can be re-read off the entry file
+            # and a page off the template directory, but "extend the auction
+            # by three minutes" exists only here.
+            sections.append(
+                "### Rules this app must ENFORCE — behaviours, not tables\n"
+                + "\n".join(f"- {r.summary()}" for r in self.rules)
             )
         if self.endpoints:
             sections.append(
@@ -1656,6 +1707,7 @@ class ProjectSpec:
             "summary": self.summary,
             "stack": {"language": self.language, "backend": self.backend},
             "entities": [asdict(e) for e in self.entities],
+            "rules": [asdict(r) for r in self.rules],
             "endpoints": [asdict(e) for e in self.endpoints],
             "pages": [asdict(p) for p in self.pages],
             "features": [asdict(f) for f in self.features],
@@ -1724,6 +1776,7 @@ class ProjectSpec:
             revision=max(1, int(data.get("revision") or 1)),
             spec_version=int(data.get("spec_version") or SPEC_VERSION),
             entities=_load_entities(data.get("entities")),
+            rules=_load_rules(data.get("rules")),
             endpoints=_load_endpoints(data.get("endpoints")),
             pages=_load_pages(data.get("pages")),
             features=_load_features(data.get("features")),
@@ -1871,8 +1924,21 @@ class ProjectSpec:
             if len(pages) >= MAX_PAGES:
                 continue
             template_key = fname.split(f"{adapter.template_dir}/", 1)[-1]
-            method_path = route_map.get(fname) or route_map.get(template_key)
             stem = Path(fname).stem
+            # …and by STEM, which is how Express names a view: `routes_from_source`
+            # reports `res.render("new_item")` as the template `new_item`, while
+            # the planned file is `views/new_item.ejs`. Neither of the two keys
+            # above matches it, so every Node page fell through to
+            # `_route_for(stem)` and the spec recorded `/new-item` for a route
+            # the app serves at `/items/new`. Everything that trusts the spec
+            # then measured the wrong URL: the functional probe reported 404s
+            # for pages that work, and the endpoint wiring kept "restoring"
+            # routes nothing had asked for.
+            method_path = (
+                route_map.get(fname)
+                or route_map.get(template_key)
+                or route_map.get(stem)
+            )
             seen_templates.add(fname)
             pages.append(
                 Page(
@@ -2390,6 +2456,43 @@ def _load_pages(raw) -> tuple[Page, ...]:
             )
         )
         if len(out) >= MAX_PAGES:
+            break
+    return tuple(out)
+
+
+def _load_rules(raw) -> tuple[Rule, ...]:
+    """Validate stored/extracted rules. Anything incomplete is dropped.
+
+    A rule missing its trigger or its effect states nothing a prompt can act on
+    and nothing a probe can exercise, so it is not kept — `entities_from_data`'s
+    rule, and for the same reason: a half-remembered requirement is worse than
+    an absent one, because it reads as coverage.
+    """
+    out: list[Rule] = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        trigger = " ".join(str(item.get("trigger") or "").split())[:200]
+        effect = " ".join(str(item.get("effect") or "").split())[:200]
+        if not trigger or not effect:
+            continue
+        entity = _ident(item.get("entity") or item.get("table") or "")
+        rule = Rule(
+            entity=entity,
+            trigger=trigger,
+            effect=effect,
+            kind=str(item.get("kind") or "")[:24],
+            added_in=max(1, int(item.get("added_in") or 1)),
+        )
+        if not rule.kind:
+            # Derived, never taken from the model: the label decides which live
+            # probe runs, and a model that could name it would also be free to
+            # name one that does not fit.
+            from app.agent.rules import classify_rule
+
+            rule = replace(rule, kind=classify_rule(rule))
+        out.append(rule)
+        if len(out) >= MAX_RULES:
             break
     return tuple(out)
 

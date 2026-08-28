@@ -533,7 +533,30 @@ async def test_file_op_flow_prefers_surgical_then_falls_back(tmp_path, monkeypat
 
     # Now surgical fails (no blocks, incl. retry) → falls back to whole-file rewrite.
     a._llm_edit = ScriptedLLM(["no blocks"])
-    a._llm_direct = ScriptedLLM(["FILENAME: app.py\nWHOLE NEW FILE"])
+    a._llm_direct = ScriptedLLM(["FILENAME: app.py\nWHOLE = 'NEW FILE'"])
     answer2, trace2 = await a._file_op_flow("rewrite it", target="app.py")
-    assert f.read_text(encoding="utf-8") == "WHOLE NEW FILE"
+    # The rewrite has to be valid Python to survive: a write that does not
+    # parse is reverted to the last version that did (`_syntax_repair`),
+    # because an edit that takes the module out is worse than one that never
+    # landed.
+    assert f.read_text(encoding="utf-8") == "WHOLE = 'NEW FILE'"
     assert "Updated" in answer2
+
+
+async def test_a_rewrite_that_does_not_parse_is_reverted(tmp_path, monkeypatch):
+    """Measured on turn 7 of the OpenBazaar build: an edit to `models.js`
+    ended mid-string-literal, no repair attempt rescued it, and the module
+    stopped loading — which takes down every page rather than the one being
+    changed."""
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "app.py"
+    f.write_text("a = 1\nb = 2\n", encoding="utf-8")
+
+    a = AgentCore(session_id="pytest_revert_broken")
+    a._llm_edit = ScriptedLLM(["no blocks"])
+    # Every repair attempt returns the same broken file.
+    a._llm_direct = ScriptedLLM(["FILENAME: app.py\nWHOLE NEW FILE"])
+    answer, _ = await a._file_op_flow("rewrite it", target="app.py")
+
+    assert f.read_text(encoding="utf-8") == "a = 1\nb = 2\n"
+    assert "reverted to the version that worked" in answer

@@ -305,7 +305,10 @@ async def test_a_page_with_no_file_is_reported_not_guessed(tmp_path, monkeypatch
 def _fake_smoke(audits, findings):
     """A run_smoke_test stand-in that reports `findings` on the next run."""
 
-    def run(entry, workdir, paths, timeout, warmup, spec, hook):
+    # `adapter` arrived with the behaviour probe, which reads the project's
+    # own database through it; this double ignores it, as it ignores the
+    # rest of the arguments.
+    def run(entry, workdir, paths, timeout, warmup, spec, hook, adapter=None):
         audits.append(
             SiteAudit(ran=True, pages=("/",), widths=(390,), findings=findings)
         )

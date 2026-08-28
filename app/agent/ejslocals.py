@@ -276,3 +276,77 @@ def repair_view_locals(
         if name not in fixes
     ]
     return out, fixes, problems
+
+# ---------------------------------------------------------------------------
+# The other half of the repair: give the ROUTE the name the view needs
+# ---------------------------------------------------------------------------
+
+# `items.forEach(...)`, `items.map(...)`, `items.length` — the name is a list,
+# so the value that keeps the page rendering is an empty array, not "".
+_LISTY = ("forEach", "map", "filter", "length", "slice", "join", "some", "every")
+
+
+def default_for(name: str, view_text: str) -> str:
+    """The JS literal to pass for ``name``, read off how the view USES it.
+
+    A form page comparing `sale_type === "FIXED"` wants a string; a listing page
+    calling `items.forEach` wants an array, and `""` there swaps a ReferenceError
+    for a TypeError, which is not a repair.
+    """
+    for method in _LISTY:
+        if re.search(rf"\b{re.escape(name)}\s*\.\s*{method}\b", view_text or ""):
+            return "[]"
+    return '""'
+
+
+def add_render_locals(
+    entry_source: str, stem: str, defaults: dict[str, str]
+) -> tuple[str, list[str]]:
+    """Pass ``defaults`` to every `res.render("<stem>"…)` that omits them.
+
+    The view is not the thing to rewrite here. A free name in a template is a
+    name the ROUTE was supposed to supply, and `repair_view_locals` can only
+    blank the unambiguous shape (a bare `ui.*()` argument) — everything else it
+    reports, and the page goes on answering 500. Measured on the OpenBazaar
+    build: `new_item.ejs` branched on `sale_type` to decide which price fields
+    were required, no route passed one, and the "create a listing" page — the
+    single most important page in a marketplace — was a 500 from the moment it
+    was written.
+
+    Deliberately additive and deterministic: a name the route ALREADY passes is
+    never touched, the value is a literal chosen from how the view uses the
+    name, and nothing else in the file moves. It cannot make a working page
+    wrong — at worst it renders a field the user must fill in.
+    """
+    text = entry_source or ""
+    if not defaults:
+        return text, []
+    fixes: list[str] = []
+    # Right to left: every edit changes the offsets of everything after it.
+    for match in reversed(list(_RENDER_HEAD_RE.finditer(text))):
+        if match.group("view").rsplit("/", 1)[-1].rsplit(".", 1)[0] != stem:
+            continue
+        rest = text[match.end() :]
+        comma = re.match(r"\s*,\s*\{", rest)
+        pairs = ", ".join(f"{n}: {v}" for n, v in sorted(defaults.items()))
+        if comma:
+            at = match.end() + comma.end()  # just past the `{`
+            existing = _locals_object(text, match.end())
+            keys = {
+                key.group(1)
+                for part in existing.split(",")
+                if (key := _KEY_RE.match(part.strip()))
+            }
+            missing = {n: v for n, v in defaults.items() if n not in keys}
+            if not missing:
+                continue
+            pairs = ", ".join(f"{n}: {v}" for n, v in sorted(missing.items()))
+            text = text[:at] + " " + pairs + "," + text[at:]
+            fixes += sorted(missing)
+            continue
+        closing = re.match(r"\s*\)", rest)
+        if closing:
+            at = match.end()
+            text = text[:at] + ", { " + pairs + " }" + text[at:]
+            fixes += sorted(defaults)
+    return text, sorted(set(fixes))

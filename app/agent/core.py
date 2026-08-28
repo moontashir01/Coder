@@ -1,17 +1,19 @@
 import asyncio
 import hashlib
 import json
+import dataclasses
 import logging
 import os
 import re
 import subprocess
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+from app.agent import ejslocals
 from app.agent.blueprint import (
     ApiContract,
     Blueprint,
@@ -65,6 +67,7 @@ from app.agent.pageaudit import (
     repair_plan,
 )
 from app.agent.patch import (
+    wants_deletion,
     apply_block,
     is_catastrophic_shrink,
     nearest_region,
@@ -72,6 +75,8 @@ from app.agent.patch import (
     strip_line_numbers,
 )
 from app.agent.planner import Planner, _extract_json
+from app.agent.rules import rules_from_data
+from app.agent.rules import to_context_block as rules_context_block
 from app.agent.projectspec import (
     README_MARKER,
     Entity,
@@ -773,7 +778,112 @@ _AT_REF_RE = re.compile(r"(?<!\w)@([\w./\\-]+)")
 # source extension: an `@app.py` on a build request is code to work from, and
 # feeding it to the schema call as requirements would model the code instead of
 # the product. See `AgentCore._requirements_doc_context`.
+def _pascal_words(name: str) -> str:
+    """`order_items` -> `OrderItems`, the shape `crud_node` names its helpers."""
+    return "".join(part[:1].upper() + part[1:] for part in re.split(r"[^A-Za-z0-9]+", name) if part)
+
+
+# Every template directory any stack of ours uses. A delta naming one of these
+# is describing a page, whichever stack wrote it.
+_TEMPLATE_DIRS = frozenset({"templates", "views"})
+
+
 _SPEC_DOC_EXTS = frozenset({".md", ".markdown", ".txt", ".rst", ".adoc", ".org"})
+
+
+# The literal values `prompts/amend.md` uses to show where each field goes. A 7B
+# copies an example when the request is one it finds hard, and the copy is
+# indistinguishable from a real answer downstream: measured on turn 3 of the
+# OpenBazaar build, which asked for a create-listing page and produced
+# `views/admin_products.ejs` and a `/admin/products` route belonging to a
+# product catalogue nobody had mentioned. The prompt now says not to; this is
+# the backstop, because a prompt rule with no deterministic half is a hope.
+# `widget` is the codebase's standing "deliberately unrelated" noun (`db.js`
+# ships a commented `CREATE TABLE widgets` for the same reason), so an echo of
+# it is unmistakable. `admin_products` stays listed because the prompt used it
+# until 2026-08-27 and a spec written then can still carry the page.
+_DELTA_EXAMPLE_NAMES = frozenset({"admin_widgets", "admin_products"})
+_DELTA_EXAMPLE_PATHS = frozenset({"/admin/widgets", "/admin/products"})
+# …and the entity those examples hang off. A NEW entity by this name, in a
+# request that never says the word, is the illustration being copied rather
+# than an answer. Measured on turn 3 of the OpenBazaar build: "add a create
+# listing page" produced a `product` entity beside the `item` one the project
+# already had, and the create-listing columns went to a `products` table
+# nothing rendered — so `models.listItems` selected `specifications` from
+# `items`, which did not have it, and the home page 500d.
+_DELTA_EXAMPLE_ENTITIES = frozenset({"widget", "widgets", "product", "products"})
+
+
+def _is_example_echo(name: str = "", path: str = "") -> bool:
+    """Is this value copied straight out of the prompt's own example?"""
+    stem = PurePosixPath(str(name or "")).stem
+    return stem in _DELTA_EXAMPLE_NAMES or str(path or "") in _DELTA_EXAMPLE_PATHS
+
+
+def _drop_example_echoes(delta: "SpecDelta", message: str = "") -> "SpecDelta":
+    """Remove delta items that merely repeat the prompt's illustration.
+
+    A new ENTITY is only dropped when the request never uses the word — the
+    filter can refuse to invent, never refuse what was asked for, which is
+    `buildspec`'s rule for nav labels applied to the schema.
+    """
+    said = (message or "").lower()
+    return dataclasses.replace(
+        delta,
+        add_entities=tuple(
+            e
+            for e in delta.add_entities
+            if not (
+                (e.name.lower() in _DELTA_EXAMPLE_ENTITIES
+                 or e.table.lower() in _DELTA_EXAMPLE_ENTITIES)
+                and e.name.lower() not in said
+                and e.table.lower() not in said
+            )
+        ),
+        add_pages=tuple(
+            pg
+            for pg in delta.add_pages
+            if not _is_example_echo(pg.template, pg.route)
+        ),
+        add_endpoints=tuple(
+            e
+            for e in delta.add_endpoints
+            if not _is_example_echo(e.template, e.path)
+        ),
+        new_files=tuple(
+            (name, instruction)
+            for name, instruction in delta.new_files
+            if not _is_example_echo(name)
+        ),
+    )
+
+
+def _names_a_spec_doc(filename: str, message: str) -> bool:
+    """Is ``filename`` the prose SPECIFICATION for a greenfield build?
+
+    "Build the marketplace described in PRD.md" names a file the project really
+    has, and every heuristic that asks "does this message name an existing
+    file?" therefore answered yes and read the request as an edit. Two of them
+    did, with one turn's worth of consequences each: the blueprint gate declined
+    to build at all, and `_file_op_flow` then took the PRD as its edit target
+    and rewrote the user's requirements document with a web page.
+
+    `_resolve_ref(exclude_docs=...)` already draws this line for an `@`-ref. The
+    name reaches the rest of the pipeline as plain text as well — `_strip_at_refs`
+    keeps a text ref's name and drops only the `@` — so the same rule has to hold
+    where a bare name is read.
+
+    Deliberately narrow, and keyed exactly as `_resolve_ref` is: only a PROSE
+    extension, and only on a request `should_blueprint` reads as a greenfield
+    build. "Fix the typo in README.md" is not one, so it still targets the
+    README.
+    """
+    try:
+        if Path(filename).suffix.lower() not in _SPEC_DOC_EXTS:
+            return False
+        return should_blueprint(message)
+    except Exception:  # noqa: BLE001 — a routing hint must never raise
+        return False
 
 # `{% import "_macros.html" as ui %}` — required per template, because Jinja's
 # import is NOT inherited from `base.html`. See `AgentCore._fix_macro_import`.
@@ -1277,6 +1387,10 @@ class AgentCore:
         # the decision is made from state that is gone by the time the answer
         # comes back (the spec, the blueprint, the compound splitter's verdict).
         self._turn_flow: str = ""
+        # The behaviour rules this turn's schema call returned, and the
+        # per-session cache that mirrors `_schema_cache`.
+        self._schema_rules: tuple = ()
+        self._rules_cache: dict[str, tuple] = {}
         self._turn_task_type: str = ""
         # Progress lines for long non-streaming work (currently the vision call,
         # which swaps the loaded Ollama model and takes seconds). The REPL
@@ -1800,6 +1914,8 @@ class AgentCore:
             filename = _extract_filename(message)
             if not filename:
                 return False
+            if _names_a_spec_doc(filename, message):
+                return False
             workdir = Path(self._project_path)
             if (workdir / filename).is_file():
                 return True
@@ -2302,6 +2418,14 @@ class AgentCore:
         """
         workdir = Path(self._project_path or Path.cwd())
         filename = target or _extract_filename(user_message)
+        if filename is not None and _names_a_spec_doc(filename, user_message):
+            # The requirements document is what the build is FROM, never what it
+            # is written INTO. `_resolve_ref(exclude_docs=...)` already refuses
+            # to pin one as the target; the name also arrives as plain text once
+            # `_strip_at_refs` has run, and `_extract_filename` cannot tell the
+            # two apart. Measured: "Build the marketplace described in @PRD.md"
+            # rewrote the PRD.
+            filename = None
         if filename is not None and target is None:
             # The regex found a name; this decides whether the PROJECT has it,
             # and where. A name that resolves nowhere becomes None for a repair
@@ -2355,6 +2479,17 @@ class AgentCore:
             # it afterwards. None here (not a template, no `{% extends %}`,
             # ambiguous blocks) means today's path, unchanged.
             region = self._adapter.template_edit_region(filename, full_existing)
+            if region is None:
+                # The same idea on the ENTRY FILE, where it matters more. A 7B
+                # asked to fix one handler answers with that handler, and the
+                # whole-file matcher then lands it as a replacement for
+                # everything it resembles — measured at 27 routes deleted in a
+                # single "fix POST /items/new" turn. Inside the block the model
+                # sees one route, its SEARCH is matched against one route, and
+                # every other byte of the file is copied through by `splice`.
+                region = self._adapter.route_edit_region(
+                    filename, full_existing, user_message
+                )
             edited = await self._surgical_edit(
                 filename,
                 target_path,
@@ -2480,7 +2615,7 @@ class AgentCore:
             if choice_note:
                 answer += f" — {choice_note}"
             note, extra = await self._verify_and_repair(
-                out_path, name, user_message, extra_context
+                out_path, name, user_message, extra_context, previous=full_existing
             )
             trace.extend(extra)
             if note:
@@ -2684,6 +2819,21 @@ class AgentCore:
                 f"File: {filename}\nCurrent content:\n"
                 f"{self._edit_view(full_content)}\n\n"
             )
+        elif getattr(region, "kind", "block") == "route":
+            siblings = (
+                " The file's other routes: " + ", ".join(region.siblings) + "."
+                if region.siblings
+                else ""
+            )
+            head = (
+                f"File: {filename} — the app's routing file.{siblings}\n"
+                f"You are editing ONLY the {region.name} handler, shown below. "
+                "Every other route in the file is outside this text and cannot "
+                "be changed, so do not repeat one; SEARCH must match the text "
+                "below exactly.\n\n"
+                f"The {region.name} handler:\n"
+                f"{self._edit_view(region.body)}\n\n"
+            )
         else:
             siblings = (
                 " Its other block(s): "
@@ -2809,11 +2959,15 @@ class AgentCore:
         if result.get("success"):
             answer = f"Edited `{filename}`: {applied} change(s) applied"
             if region is not None:
-                answer += f" inside {{% block {region.name} %}}"
+                answer += (
+                    f" inside {region.name}"
+                    if getattr(region, "kind", "block") == "route"
+                    else f" inside {{% block {region.name} %}}"
+                )
             if failed:
                 answer += f" ({failed} block(s) didn't match the file)"
             note, extra = await self._verify_and_repair(
-                target_path, filename, user_message, extra_context
+                target_path, filename, user_message, extra_context, previous=full_content
             )
             trace.extend(extra)
             if note:
@@ -2830,6 +2984,7 @@ class AgentCore:
         filename: str,
         user_message: str = "",
         extra_context: str = "",
+        previous: str = "",
     ) -> tuple[str, list[dict]]:
         """Check a just-written file two ways, and repair what fails.
 
@@ -2848,6 +3003,19 @@ class AgentCore:
         Returns (status_note, extra_trace); the note is "" when neither stage
         had anything to say.
         """
+        # Before anything else: an edit to the ENTRY FILE that lost routes.
+        # Every page of the site is downstream of that one file, so a rewrite
+        # that drops handlers is not a partial success — it is an outage, and
+        # the repair passes that put routes back cost minutes and cannot
+        # recover a POST handler at all. Measured repeatedly on the OpenBazaar
+        # build, most sharply at the end: a turn asked to fix three handlers
+        # returned a `server.js` with `POST /register` simply gone.
+        lost_note = await self._revert_if_routes_were_lost(
+            target_path, filename, user_message, previous
+        )
+        if lost_note:
+            return lost_note, []
+
         # Stage 0, deterministic and free: with no network, a CDN <script> or a
         # Google Fonts <link> is dead weight that costs a DNS timeout per page
         # and then renders wrong (or, for a CDN stylesheet, completely
@@ -2857,7 +3025,7 @@ class AgentCore:
         macro_note = await self._fix_macro_import(target_path, filename)
         endpoint_note = await self._check_endpoints(target_path, filename)
 
-        note, trace = await self._syntax_repair(target_path, filename)
+        note, trace = await self._syntax_repair(target_path, filename, previous)
         if note.startswith("verification failed"):
             # Still broken after every repair attempt — the request-level
             # question is meaningless against a file that doesn't parse.
@@ -2872,6 +3040,19 @@ class AgentCore:
         # Runs LAST so it sees the final content — an intent rewrite can
         # reintroduce the very names it fixes.
         import_note = await self._repair_missing_imports(target_path, filename)
+
+        # …and once more at the END. The check at the top catches the write
+        # that got here; every stage since has been free to rewrite the same
+        # file, and `_repair_missing_imports` in particular hands it to
+        # `jsimports`, which returns a whole file. Measured: a turn asked to fix
+        # one handler came out of here having lost ten POST routes, with every
+        # stage reporting success. The comparison is against what the file held
+        # BEFORE this turn touched it, so it does not matter which stage did it.
+        lost_note = await self._revert_if_routes_were_lost(
+            target_path, filename, user_message, previous
+        )
+        if lost_note:
+            return lost_note, trace
 
         for extra_note in (
             intent_note,
@@ -3137,6 +3318,19 @@ class AgentCore:
                     "cross-module check failed for %s.%s", stem, ext, exc_info=True
                 )
 
+        # A call that RESOLVES but passes the wrong number of arguments. The
+        # data layer is generated, so every helper's arity is known exactly —
+        # and `models.createUser(username, password)` against a helper that
+        # takes eight columns inserts nulls into NOT NULL columns and answers
+        # 500 on the one page a new user has to get through. Nothing else can
+        # see it: the name exists, the file parses, the route is wired, and the
+        # failure is a database error at request time. Reported rather than
+        # repaired — mapping form fields onto columns is generation.
+        try:
+            dangling += self._adapter.call_arity_mismatches(workdir)
+        except Exception:
+            logger.debug("arity check failed", exc_info=True)
+
         try:
             # Reads SQL string literals, so it is language-independent in the
             # only way that matters: `models.js` selecting from a table `db.js`
@@ -3200,8 +3394,46 @@ class AgentCore:
             "load offline"
         )
 
+    async def _revert_if_routes_were_lost(
+        self, target_path: Path, filename: str, user_message: str, previous: str
+    ) -> str:
+        """Undo a write to the entry file that deleted routes nobody removed.
+
+        Deliberately narrow: only the stack's own entry file, only when the
+        file HAD routes and now has strictly fewer, and never when the request
+        asked for a removal (`patch.wants_deletion` — the same escape hatch
+        `_shrink_refused` uses). A route the model MOVED is not lost, because
+        the comparison is by (method, path) rather than by position.
+        """
+        adapter = self._adapter
+        if filename.replace("\\", "/").rsplit("/", 1)[-1] != adapter.entry_file:
+            return ""
+        if not previous.strip() or wants_deletion(user_message):
+            return ""
+        try:
+            before = {(m, p) for m, p, _v, _t in adapter.routes_from_source(previous)}
+            current = target_path.read_text(encoding="utf-8", errors="replace")
+            after = {(m, p) for m, p, _v, _t in adapter.routes_from_source(current)}
+        except Exception:
+            logger.debug("route-loss check failed for %s", filename, exc_info=True)
+            return ""
+        lost = sorted(f"{m} {p}" for m, p in before - after)
+        if not before or not lost:
+            return ""
+        try:
+            target_path.write_text(previous, encoding="utf-8")
+        except Exception:
+            logger.debug("could not revert %s", filename, exc_info=True)
+            return ""
+        return (
+            f"reverted: the edit removed {len(lost)} route(s) nobody asked to "
+            "remove — " + ", ".join(lost[:6]) + ". Every page of the site is "
+            f"downstream of {adapter.entry_file}, so this change did not land. "
+            "Ask for it again, naming one route"
+        )
+
     async def _syntax_repair(
-        self, target_path: Path, filename: str
+        self, target_path: Path, filename: str, previous: str = ""
     ) -> tuple[str, list[dict]]:
         """Syntax-check a just-written file; feed failures back for repair.
 
@@ -3262,11 +3494,89 @@ class AgentCore:
             ok, error = check_file(target_path)
             if ok:
                 return f"auto-repaired after {attempt} attempt(s)", trace
+
+        # Every repair attempt is spent and the file on disk is still broken.
+        # If the file HAD a working version a moment ago, that version is
+        # strictly better than what is there now: the edit was meant to add
+        # something, and instead it took the file out. Measured on turn 7 of the
+        # OpenBazaar build — an edit to `models.js` ended mid-string-literal,
+        # the repair loop could not rescue it, and the module stopped loading,
+        # which takes down every page rather than the one being changed.
+        #
+        # The old content must itself pass the check: reverting to something
+        # equally broken would only hide which write caused it.
+        if previous.strip():
+            current = ""
+            try:
+                current = target_path.read_text(encoding="utf-8", errors="replace")
+                target_path.write_text(previous, encoding="utf-8")
+                restored_ok, _ = check_file(target_path)
+            except Exception:
+                logger.debug("could not revert %s", filename, exc_info=True)
+                restored_ok = False
+            if restored_ok:
+                trace.append({"tool": "write_file", "args": {"path": str(target_path)}})
+                return (
+                    "verification failed after "
+                    f"{settings.max_repair_attempts} repair attempt(s): "
+                    f"{error[:160]} — reverted to the version that worked, so "
+                    "this change did not land. Ask for it again, in smaller "
+                    "pieces",
+                    trace,
+                )
+            try:
+                if current:
+                    target_path.write_text(current, encoding="utf-8")
+            except Exception:
+                logger.debug("could not restore %s after a failed revert", filename)
+
+        # For a TEMPLATE that means the page ships as whatever the model last
+        # said — measured on the OpenBazaar build, `views/bid_detail.ejs` was
+        # the sentence "Understood. I will proceed with the task of creating or
+        # updating exactly one file on disk", written to disk and served to
+        # visitors. A page that says nothing is better than a page that says
+        # that, and unlike the repair loop this cannot fail.
+        placeholder = self._placeholder_template(target_path)
+        if placeholder:
+            result = await self.executor.execute(
+                "write_file", {"path": str(target_path), "content": placeholder}
+            )
+            if result.get("success"):
+                trace.append(
+                    {"tool": "write_file", "args": {"path": str(target_path)}}
+                )
+                return (
+                    "verification failed after "
+                    f"{settings.max_repair_attempts} repair attempt(s): "
+                    f"{error[:160]} — replaced with an empty placeholder page, "
+                    "so the site does not serve the model's own prose. Ask for "
+                    "this page again",
+                    trace,
+                )
         return (
             f"verification failed after {settings.max_repair_attempts} repair "
             f"attempt(s): {error[:200]}",
             trace,
         )
+
+    def _placeholder_template(self, target_path: Path) -> str:
+        """A minimal, valid page for a template no repair could rescue.
+
+        Deterministic, so it is the one step in the write path that cannot
+        itself fail a check. Only for this stack's own template extension: a
+        `.py` or a `.js` that will not compile must stay broken and be reported,
+        because a placeholder MODULE would turn a loud failure into a quiet one.
+        """
+        try:
+            if target_path.suffix.lower() != self._adapter.template_ext:
+                return ""
+            title = target_path.stem.replace("_", " ").replace("-", " ").title()
+        except Exception:
+            return ""
+        return (
+            f"<h1>{title}</h1>@N"
+            '<p class="empty">This page has not been written yet.</p>@N'
+        ).replace("@N", "\n")
 
     async def _judge_intent(
         self,
@@ -3686,6 +3996,7 @@ class AgentCore:
         types_block = self._adapter.schema_types()
         key += f"\x00stack:{self._adapter.key}"
         if key in self._schema_cache:
+            self._schema_rules = self._rules_cache.get(key, ())
             return self._schema_cache[key]
 
         doc_block = f"{doc}\n\n" if doc else ""
@@ -3704,9 +4015,17 @@ class AgentCore:
         except Exception as e:
             logger.debug("schema extraction failed: %s", e)
             return ()  # NOT cached: a failure is a transient, not an answer
-        entities = entities_from_data(parsed if isinstance(parsed, dict) else None)
+        data = parsed if isinstance(parsed, dict) else None
+        entities = entities_from_data(data)
+        # The other half of the same answer, and the reason this call was worth
+        # extending rather than adding another: a rule and the table it governs
+        # are decided together or they disagree. Kept on the turn rather than
+        # returned, so every existing caller and test of this method is
+        # unchanged — `()` on any failure, exactly as before.
+        self._schema_rules = rules_from_data(data, entities)
         if entities:
             self._schema_cache[key] = entities
+            self._rules_cache[key] = self._schema_rules
         return entities
 
     async def _expand_requirements(
@@ -3802,8 +4121,17 @@ class AgentCore:
 
         Returns None on any failure, so the turn falls back to ordinary routing.
         """
+        # Every example in `prompts/amend.md` is written in Flask paths, so a Node
+        # project was amended with `templates/login.html` — a file Express never
+        # renders, beside the `views/*.ejs` it does. The planning call was given
+        # this stack's own layout for exactly this reason; the delta call decides
+        # filenames too, and had not been.
         messages = [
-            SystemMessage(content=_load_amend_prompt()),
+            SystemMessage(
+                content=_load_amend_prompt()
+                + "\n\n"
+                + self._adapter.blueprint_layout()
+            ),
             HumanMessage(
                 content=(
                     f"{spec.to_context_block()}\n\n"
@@ -3819,7 +4147,52 @@ class AgentCore:
             return None
         if not isinstance(parsed, dict):
             return None
-        return delta_from_data(parsed, spec)
+        return self._retarget_delta_paths(
+            _drop_example_echoes(delta_from_data(parsed, spec), user_message)
+        )
+
+    def _retarget_delta_paths(self, delta: "SpecDelta") -> "SpecDelta":
+        """Move a delta's template paths onto THIS stack's layout.
+
+        The deterministic half of the fix above, and the one that holds when the
+        prompt does not: `templates/login.html` in a Node project is a file
+        Express never renders, so the page the user asked for does not exist and
+        the route that should serve it has nowhere to point. Measured on turn 2
+        of the OpenBazaar build — `templates/login.html` and
+        `templates/register.html` were written, verified, reported as done, and
+        `/login` went on answering 404.
+
+        Only a path in a template directory is touched, and only its directory
+        and extension: a name the model chose is preserved exactly, because that
+        is what the pages and endpoints in the same delta refer to.
+        """
+        directory = self._adapter.template_dir.strip("/")
+        suffix = self._adapter.template_ext
+
+        def retarget(name: str) -> str:
+            if not name:
+                return name
+            path = PurePosixPath(str(name).replace("\\", "/"))
+            if len(path.parts) != 2 or path.parts[0] not in _TEMPLATE_DIRS:
+                return name
+            if path.parts[0] == directory and path.suffix == suffix:
+                return name
+            return f"{directory}/{path.stem}{suffix}"
+
+        return dataclasses.replace(
+            delta,
+            add_endpoints=tuple(
+                dataclasses.replace(e, template=retarget(e.template))
+                for e in delta.add_endpoints
+            ),
+            add_pages=tuple(
+                dataclasses.replace(pg, template=retarget(pg.template))
+                for pg in delta.add_pages
+            ),
+            new_files=tuple(
+                (retarget(name), instruction) for name, instruction in delta.new_files
+            ),
+        )
 
     async def _amend_project(
         self, user_message: str, spec: ProjectSpec, at_refs: list[str]
@@ -4335,10 +4708,17 @@ class AgentCore:
         doc_for_files = self._requirements_doc_context(
             text_refs, budget=settings.max_spec_doc_context_chars
         )
+        # The rules the schema call returned, stated to every file this build
+        # writes. On turn 1 there is no saved spec yet, so `_spec_context` — the
+        # route by which every LATER turn sees them — is empty; without this the
+        # behaviours would reach the project only from turn 2, having been
+        # extracted on turn 1.
+        rules_block = rules_context_block(self._schema_rules)
         extra = "\n\n".join(
             c
             for c in (
                 contract_block,
+                rules_block,
                 doc_for_files,
                 scaffold_block,
                 ui_block,
@@ -4404,12 +4784,22 @@ class AgentCore:
         # won't save must never cost a turn whose files were written.
         try:
             spec = ProjectSpec.from_blueprint(blueprint, workdir, project_name(workdir))
+            # The rules the schema call returned ride into the spec here rather
+            # than through `Blueprint`: `blueprint.py` may not import
+            # `projectspec` at runtime (that module imports it), and the rules
+            # are not a planning input — they are a contract the project keeps.
+            if self._schema_rules:
+                spec = dataclasses.replace(spec, rules=tuple(self._schema_rules))
             if not spec.is_empty() and spec.save(workdir):
                 self._spec = spec
                 self._write_readme(workdir, spec)
+                rule_note = (
+                    f", {len(spec.rules)} rule(s)" if spec.rules else ""
+                )
                 answer += (
                     f"\n\nRemembered this project ({len(spec.entities)} table(s), "
-                    f"{len(spec.endpoints)} route(s), {len(spec.pages)} page(s)) in "
+                    f"{len(spec.endpoints)} route(s), {len(spec.pages)} page(s)"
+                    f"{rule_note}) in "
                     "`.coder/project.json` — `/spec` shows it."
                 )
         except Exception:
@@ -4732,6 +5122,60 @@ class AgentCore:
         if not missing_paths and not missing_views:
             return ("", [])
 
+        # A GET that only has to render a template needs no model at all: the
+        # route is four lines and every one of them is derivable. Doing those
+        # deterministically first means most turns never rewrite the entry file
+        # — which is where the churn came from. Measured on the OpenBazaar
+        # build, where wiring twelve page routes rewrote server.js wholesale and
+        # the repair passes then spent minutes putting back the seventeen routes
+        # the rewrite had dropped.
+        deterministic: list[str] = []
+        source = before
+        for path_ in dict.fromkeys(missing_paths):
+            template = next(
+                (
+                    e.template
+                    for e in blueprint.contract.endpoints
+                    if e.path == path_ and e.method == "GET" and e.template
+                ),
+                "",
+            )
+            stem = Path(template).stem
+            if not stem:
+                continue
+            if not (
+                workdir / adapter.template_dir / f"{stem}{adapter.template_ext}"
+            ).is_file():
+                continue
+            patched, ok = adapter.wire_view_route(source, path_, stem)
+            if ok and adapter.source_is_valid(adapter.entry_file, patched):
+                source = patched
+                deterministic.append(path_)
+        if deterministic:
+            result = await self.executor.execute(
+                "write_file", {"path": str(entry), "content": source}
+            )
+            if result.get("success"):
+                self._reindex_after_write(entry)
+                before = source
+                known = {
+                    view
+                    for _m, _p, view, _t in adapter.routes_from_source(before)
+                    if view
+                }
+                missing_paths = self._unwired_endpoints(blueprint, workdir)
+                missing_views = self._unresolved_view_names(workdir, known)
+            else:
+                deterministic = []
+        if not missing_paths and not missing_views:
+            return (
+                f"\nServed {len(deterministic)} route(s) the build's pages needed, "
+                "without rewriting the entry file — "
+                + ", ".join(deterministic[:8])
+                + ".",
+                [],
+            )
+
         # Every endpoint declared for a path, not just the last one: a path with
         # a POST but no GET is exactly the case `_unwired_endpoints` was missing,
         # and naming only one method would ask for the half that already exists.
@@ -4988,6 +5432,10 @@ class AgentCore:
             1.5,
             spec,
             hook,
+            # The behaviour probe reads the project's own database through the
+            # stack, so it needs the adapter. Without one it reports every rule
+            # as "not probed" rather than failing it.
+            self._adapter,
         )
         repairs = 0
         while repairs < settings.max_smoke_repairs:
@@ -5016,6 +5464,7 @@ class AgentCore:
                 1.5,
                 spec,
                 hook,
+                self._adapter,
             )
 
         # What the browser saw is a defect in a template or a stylesheet, never
@@ -5100,6 +5549,10 @@ class AgentCore:
             1.5,
             spec,
             hook,
+            # The behaviour probe reads the project's own database through the
+            # stack, so it needs the adapter. Without one it reports every rule
+            # as "not probed" rather than failing it.
+            self._adapter,
         )
         after = len(audits[-1].errors()) if audits else 0
         if after > before and snapshot:
@@ -6218,6 +6671,25 @@ class AgentCore:
             # …and the startup call itself, which every one of the passes above
             # can rewrite and none of them validates.
             answer += await self._repair_entry_module_calls(_workdir)
+            # FIRST of the data-layer invariants: a query helper the entry
+            # file calls and an edit deleted. Everything below reads routes,
+            # and a route calling a function that no longer exists is a 500 no
+            # amount of routing can fix.
+            answer += self._restore_data_layer_api(_workdir)
+            # Express resolves a view by its STEM against the views directory,
+            # so `res.render("views/login.ejs")` is a lookup failure however
+            # right the path looks. The prompts say so and a 7B writes it
+            # anyway — measured on /login, which 500'd with
+            # `Failed to lookup view "views/login.ejs"`.
+            answer += await self._normalize_render_names(_workdir)
+            # …and the other half of the same failure: a route calling a query
+            # helper by a name the generated data layer does not use.
+            answer += await self._repair_model_calls(_workdir)
+            # A page the build wrote, styled and linked to, that no route
+            # serves. Before the locals repair, because the route it adds is
+            # one more `res.render` that pass has to see.
+            answer += await self._strip_layout_includes(_workdir)
+            answer += await self._route_unrouted_views(_workdir)
             # LAST: it reads the entry file's `res.render` calls to learn what
             # each view is given, so it must run after every pass that can add
             # or restore a route.
@@ -6480,6 +6952,253 @@ class AgentCore:
             "pages that link to them are reachable again."
         )
 
+    def _restore_data_layer_api(self, workdir: Path) -> str:
+        """Refill generated query helpers an edit to the data layer deleted."""
+        spec = self._spec
+        if spec is None or not spec.entities:
+            return ""
+        try:
+            restored = self._adapter.restore_data_layer_api(workdir, spec)
+        except Exception:
+            logger.debug("data-layer restore failed", exc_info=True)
+            return ""
+        if not restored:
+            return ""
+        return (
+            f"\nPut back {len(restored)} generated query helper(s) an edit had "
+            "deleted from the data layer — "
+            + ", ".join(restored[:8])
+            + ". Every route that calls one answers 500 without it."
+        )
+
+    async def _normalize_render_names(self, workdir: Path) -> str:
+        """Rewrite a render call that names a PATH into the view name it means."""
+        adapter = self._adapter
+        entry = workdir / adapter.entry_file
+        if not entry.is_file():
+            return ""
+        try:
+            source = entry.read_text(encoding="utf-8", errors="replace")
+            fixed, fixes = adapter.normalize_render_names(source, workdir)
+        except Exception:
+            logger.debug("render-name normalisation failed", exc_info=True)
+            return ""
+        if not fixes or fixed == source:
+            return ""
+        if not adapter.source_is_valid(adapter.entry_file, fixed):
+            return ""
+        result = await self.executor.execute(
+            "write_file", {"path": str(entry), "content": fixed}
+        )
+        if not result.get("success"):
+            return ""
+        self._reindex_after_write(entry)
+        return (
+            f"\nPointed {len(fixes)} render call(s) at the view name rather than "
+            "its path — " + ", ".join(fixes[:6]) + ". A view is resolved by stem, "
+            "so the page answered 500 until now."
+        )
+
+    async def _repair_model_calls(self, workdir: Path) -> str:
+        """Point a route at the query helper the data layer really defines."""
+        adapter = self._adapter
+        entry = workdir / adapter.entry_file
+        if not entry.is_file():
+            return ""
+        try:
+            source = entry.read_text(encoding="utf-8", errors="replace")
+            fixed, fixes = adapter.repair_model_calls(source, workdir)
+        except Exception:
+            logger.debug("model-call repair failed", exc_info=True)
+            return ""
+        if not fixes or fixed == source:
+            return ""
+        if not adapter.source_is_valid(adapter.entry_file, fixed):
+            return ""
+        result = await self.executor.execute(
+            "write_file", {"path": str(entry), "content": fixed}
+        )
+        if not result.get("success"):
+            return ""
+        self._reindex_after_write(entry)
+        return (
+            f"\nPointed {len(fixes)} call(s) at the query helper that exists — "
+            + ", ".join(fixes[:6])
+            + ". Each was a `is not a function` 500 on the page behind it."
+        )
+
+    async def _strip_layout_includes(self, workdir: Path) -> str:
+        """A view that includes the shell that already wraps it."""
+        adapter = self._adapter
+        template_dir = workdir / adapter.template_dir
+        if not template_dir.is_dir():
+            return ""
+        fixed: list[str] = []
+        for view in sorted(template_dir.glob(f"*{adapter.template_ext}")):
+            if view.stem == "layout":
+                continue
+            try:
+                text = view.read_text(encoding="utf-8", errors="replace")
+                out, changed = adapter.strip_layout_include(text)
+            except Exception:
+                logger.debug("layout-include check failed for %s", view.name)
+                continue
+            if not changed:
+                continue
+            result = await self.executor.execute(
+                "write_file", {"path": str(view), "content": out}
+            )
+            if result.get("success"):
+                self._reindex_after_write(view)
+                fixed.append(view.name)
+        if not fixed:
+            return ""
+        return (
+            f"\nRemoved the layout include from {len(fixed)} view(s) — "
+            + ", ".join(fixed[:6])
+            + ". The layout wraps every render already, so including it inside "
+            "the page renders the shell twice and the page 500s."
+        )
+
+    async def _route_unrouted_views(self, workdir: Path) -> str:
+        """Serve a page the build wrote but no route renders.
+
+        Measured on the OpenBazaar build: `views/orders.ejs` and
+        `views/auctions.ejs` were generated, verified, converted to layout
+        children and linked from the navigation on every page — and both
+        answered 404, because nothing in the pipeline asks "is there a route
+        that renders this file?". `check_links` reports the dead link from the
+        other end and cannot fix it; `_wire_missing_endpoints` only knows the
+        routes the SPEC declared; coverage only knows the files the PLAN named.
+        A page nobody planned and nobody routed falls between all three.
+
+        Narrow on purpose, and evidence-led rather than name-led:
+
+        * the stem must be linked as `/<stem>` by a page in this project, or be
+          an entity's own table — a URL invented from a filename is a route
+          nothing asked for;
+        * nothing may render the view already, and no route may own that path;
+        * `new_*` / `*_detail` views are left alone: a form posts somewhere and
+          a detail page needs an id, and neither is derivable from the name.
+
+        The data local comes from the generated model helper when the stem IS a
+        table, so the page shows rows rather than an empty list.
+        """
+        adapter = self._adapter
+        entry = workdir / adapter.entry_file
+        template_dir = workdir / adapter.template_dir
+        if not entry.is_file() or not template_dir.is_dir():
+            return ""
+        try:
+            source = entry.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            logger.debug("could not read the entry file for unrouted views")
+            return ""
+
+        try:
+            rendered = set(adapter.render_locals(source))
+            # METHOD matters: `POST /register` exists the moment a form posts to
+            # it, and reading that as "the path is served" leaves the page you
+            # have to fill in unreachable. Measured: /register answered 404 with
+            # its own POST handler two lines above.
+            taken = {
+                (method.upper(), path)
+                for method, path, _view, _name in adapter.routes_from_source(source)
+            }
+        except Exception:
+            logger.debug("could not read routes for the unrouted-view pass")
+            return ""
+        if not taken:
+            return ""  # the parser could not read this file; report nothing
+
+        linked = self._linked_paths(workdir)
+        tables = {e.table for e in (self._spec.entities if self._spec else ())}
+
+        wired: list[str] = []
+        for view in sorted(template_dir.glob(f"*{adapter.template_ext}")):
+            stem = view.stem
+            if stem in rendered or stem.startswith("_") or stem in ("layout", "index"):
+                continue
+            if stem.endswith("_detail"):
+                continue  # a detail page needs an id, which no filename carries
+            if stem.startswith("new_"):
+                # `new_order.ejs` is the create form for `orders`, and the route
+                # that serves it is `/orders/new` — the same shape
+                # `derive_pages_from_entities` plans. Only when the rest of the
+                # name really is one of this project's tables: anything else is
+                # a filename, not a contract.
+                entity = self._entity_for_stem(stem[len("new_") :])
+                if entity is None:
+                    continue
+                path = f"/{entity}/new"
+            else:
+                path = f"/{stem}"
+            if ("GET", path) in taken:
+                continue
+            if path not in linked and stem not in tables and not stem.startswith("new_"):
+                continue
+            locals_js = ""
+            if stem in tables:
+                helper = f"list{_pascal_words(stem)}"
+                if helper in self._model_exports(workdir):
+                    locals_js = f"{stem}: await models.{helper}()"
+            patched, ok = adapter.wire_view_route(source, path, stem, locals_js)
+            if not ok or not adapter.source_is_valid(adapter.entry_file, patched):
+                continue
+            source = patched
+            wired.append(path)
+
+        if not wired:
+            return ""
+        result = await self.executor.execute(
+            "write_file", {"path": str(entry), "content": source}
+        )
+        if not result.get("success"):
+            return ""
+        self._reindex_after_write(entry)
+        return (
+            f"\nServed {len(wired)} page(s) the build had written but left "
+            "unreachable — " + ", ".join(wired) + ". Each one is linked from "
+            "the site's own navigation and was answering 404."
+        )
+
+    def _entity_for_stem(self, name: str) -> str | None:
+        """The table `name` refers to — `order` and `orders` both mean `orders`."""
+        for entity in self._spec.entities if self._spec else ():
+            if name in (entity.name, entity.table):
+                return entity.table
+        return None
+
+    def _linked_paths(self, workdir: Path) -> set[str]:
+        """Every local `/path` the project's own templates link to."""
+        template_dir = workdir / self._adapter.template_dir
+        out: set[str] = set()
+        if not template_dir.is_dir():
+            return out
+        for view in template_dir.glob(f"*{self._adapter.template_ext}"):
+            try:
+                text = view.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            for match in re.finditer(r"""href\s*=\s*["'](/[A-Za-z0-9_./-]*)["']""", text):
+                out.add(match.group(1).rstrip("/") or "/")
+        return out
+
+    def _model_exports(self, workdir: Path) -> set[str]:
+        """Names `models.js` / `models.py` really exports."""
+        for name in ("models.js", "models.py"):
+            path = workdir / name
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return set()
+            return set(re.findall(r"(?:^|[\s,{])([A-Za-z_$][\w$]*)\s*[,}]", text.split("module.exports")[-1])) | set(
+                re.findall(r"^(?:async\s+)?(?:function|def)\s+([A-Za-z_$][\w$]*)", text, re.MULTILINE)
+            )
+        return set()
+
     async def _repair_view_locals(self, workdir: Path) -> str:
         """Names a view uses that its route never passes.
 
@@ -6513,6 +7232,9 @@ class AgentCore:
 
         repaired: list[str] = []
         problems: list[str] = []
+        # view stem -> the names its route must start passing. Collected here
+        # and applied to the entry file once, below.
+        owed: dict[str, dict[str, str]] = {}
         for path in sorted(template_dir.glob(f"*{adapter.template_ext}")):
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
@@ -6522,6 +7244,17 @@ class AgentCore:
             except Exception:
                 logger.debug("view-locals check failed for %s", path.name)
                 continue
+            # A free name the view repair could not blank is not a defect in the
+            # VIEW — it is a local the route never passed, and the route is the
+            # place to supply it without touching a line of markup.
+            still_free = ejslocals.free_identifiers(
+                fixed, locals_by_view.get(path.stem, set())
+            )
+            if still_free:
+                owed[path.stem] = {
+                    name: ejslocals.default_for(name, fixed) for name in still_free
+                }
+                issues = []
             problems += [f"{path.name}: {issue}" for issue in issues]
             if not fixes or fixed == text:
                 continue
@@ -6532,7 +7265,41 @@ class AgentCore:
                 self._reindex_after_write(path)
                 repaired.append(f"{path.name} ({', '.join(fixes)})")
 
+        passed: list[str] = []
+        if owed:
+            source = entry.read_text(encoding="utf-8", errors="replace")
+            for stem, defaults in sorted(owed.items()):
+                patched, added = ejslocals.add_render_locals(source, stem, defaults)
+                if not added or not adapter.source_is_valid(
+                    adapter.entry_file, patched
+                ):
+                    problems += [
+                        f"{stem}{adapter.template_ext}: `{name}` is used by this "
+                        "view but no route passes it — EJS raises "
+                        "ReferenceError, so the page 500s"
+                        for name in sorted(defaults)
+                    ]
+                    continue
+                source = patched
+                passed.append(f"{stem} ({', '.join(added)})")
+            if passed:
+                result = await self.executor.execute(
+                    "write_file", {"path": str(entry), "content": source}
+                )
+                if result.get("success"):
+                    self._reindex_after_write(entry)
+                else:
+                    passed = []
+
         note = ""
+        if passed:
+            note += (
+                f"\nPassed {len(passed)} name(s) the views needed into their own "
+                "routes — "
+                + ", ".join(passed)
+                + ". A free name in an EJS view is a ReferenceError at render "
+                "time, so each of those pages answered 500."
+            )
         if repaired:
             note += (
                 f"\nRemoved {len(repaired)} undefined name(s) from views that "

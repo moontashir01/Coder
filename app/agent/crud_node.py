@@ -86,6 +86,17 @@ def _writable(entity: Entity) -> list[Field]:
     return [f for f in entity.fields if not POSTGRES.generates_pk(f.type, f.pk)]
 
 
+def _js_string(value: str) -> str:
+    """``value`` as a double-quoted JavaScript string literal."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _ref_table(field: Field) -> str:
+    """The table ``field.references`` points at: `orders(id)` -> `orders`."""
+    return field.references.split("(", 1)[0].strip()
+
+
 def _sample(field: Field, index: int) -> str:
     """A plausible demo value, as a JavaScript literal.
 
@@ -94,6 +105,15 @@ def _sample(field: Field, index: int) -> str:
     for value, so the two stacks' demo data look like the same product.
     """
     name = field.name.lower()
+    if field.check:
+        # The column's own CHECK names the only values it may hold, so anything
+        # else is not a "plausible" demo value — it is a row PostgreSQL refuses.
+        # Measured on the OpenBazaar build: `condition_rating` was seeded as
+        # "Demo condition_rating 1" and the FIRST insert took the whole seed
+        # down with `violates check constraint`, so every page of a build whose
+        # schema has any enumeration at all came up empty.
+        values = list(field.check)
+        return _js_string(values[(index - 1) % len(values)])
     if field.is_upload():
         return '""'  # no file on disk yet; the view falls back
     if field.type == "INTEGER":
@@ -380,6 +400,154 @@ def models_source(spec: ProjectSpec) -> str:
 # ---------------------------------------------------------------------------
 
 
+def restore_model_api(source: str, spec: ProjectSpec) -> tuple[str, list[str]]:
+    """Put back generated query helpers that an edit to `models.js` dropped.
+
+    `models.js` is GENERATED — its column lists are printed from the same entity
+    definitions as the tables in `db.js` — but unlike `db.js` it is still handed
+    to the model, because a later turn legitimately adds a query no schema
+    implies. Turn 2 of the OpenBazaar build is what that costs: asked to add one
+    column to the users queries, the model rewrote the file a third shorter, and
+    every page of the site answered `TypeError: models.listUsers is not a
+    function`.
+
+    Additive and deterministic. A helper the file still defines is left exactly
+    as it is, improvements included; only a name the spec says must exist and
+    the file no longer defines is re-emitted, with `module.exports` extended to
+    match. It cannot revert an edit — it can only refill a hole.
+    """
+    text = source or ""
+    if not text.strip():
+        return text, []
+
+    restored: list[str] = []
+    for entity in spec.entities:
+        if not entity.fields:
+            continue
+        wanted = _exports(entity)
+        if all(_defines(text, name) for name in wanted):
+            continue
+        # The helpers are written per entity as ONE block, so an entity missing
+        # any of them gets that whole block back. Re-emitting half of it would
+        # leave two definitions of the survivors, and in JavaScript the later
+        # one silently wins — `duplicate_definitions`' whole complaint.
+        for name in wanted:
+            text = _drop_function(text, name)
+        text = _insert_before_exports(text, entity_helpers(entity))
+        restored += wanted
+
+    # …and whatever the file defines but forgot to export. A helper that is
+    # written and not exported is `models.listAuctions is not a function` — the
+    # same 500 as one that was deleted, from the opposite cause, and the turn
+    # that added it reports success either way. Measured: the two helpers a
+    # repair turn was asked for landed in the file and never reached
+    # `module.exports`.
+    unexported = [
+        name
+        for name in re.findall(r"function\s+([A-Za-z_$][\w$]*)", text)
+        if _QUERY_NAME_RE.match(name) and not _is_exported(text, name)
+    ]
+    # …and anything the export block NAMES that the file does not define. That
+    # one is not a 500 on a page — `module.exports` is evaluated when the module
+    # loads, so `images is not defined` there takes the entire app down before
+    # it listens. Measured on turn 5 of the OpenBazaar build.
+    phantom = [
+        name for name in _exported_names(text) if not _defines(text, name)
+    ]
+    if not restored and not unexported and not phantom:
+        return source or "", []
+    return _rebuild_exports(text, spec), sorted(set(restored + unexported + phantom))
+
+
+# `listItems`, `getUserByEmail`, `createOrder` — the shape a query helper has.
+# Deliberately not "everything the file defines": `nullIfBlank` is a private
+# detail and exporting it would be noise, not a repair.
+_QUERY_NAME_RE = re.compile(r"^(list|get|create|update|delete|find|count|search)[A-Z]")
+
+
+def _exported_names(text: str) -> list[str]:
+    """Every identifier `module.exports = { … }` lists."""
+    match = _EXPORTS_RE.search(text)
+    if not match:
+        return []
+    end = text.find("}", match.end())
+    body = text[match.end() : end] if end != -1 else ""
+    return _IDENT_IN_EXPORTS_RE.findall(body)
+
+
+def _is_exported(text: str, name: str) -> bool:
+    return name in _exported_names(text)
+
+
+_EXPORTS_RE = re.compile(r"^module\.exports\s*=\s*\{", re.MULTILINE)
+_IDENT_IN_EXPORTS_RE = re.compile(r"[A-Za-z_$][\w$]*")
+
+
+def _defines(text: str, name: str) -> bool:
+    return re.search(r"function\s+" + re.escape(name) + r"\s*\(", text) is not None
+
+
+def _drop_function(text: str, name: str) -> str:
+    """Remove `function name(…) { … }` and the doc comment above it."""
+    match = re.search(
+        r"(?:^/\*\*(?:(?!\*/).)*\*/\s*)?^(?:async\s+)?function\s+"
+        + re.escape(name)
+        + r"\s*\(",
+        text,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        return text
+    brace = text.find("{", match.end())
+    if brace == -1:
+        return text
+    depth = 0
+    for index in range(brace, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[: match.start()].rstrip() + "\n\n" + text[index + 1 :].lstrip()
+    return text
+
+
+def _insert_before_exports(text: str, block: str) -> str:
+    """Put ``block`` above `module.exports`, or at the end of the file."""
+    match = _EXPORTS_RE.search(text)
+    at = match.start() if match else len(text)
+    return text[:at].rstrip() + "\n\n" + block.strip() + "\n\n" + text[at:]
+
+
+def _rebuild_exports(text: str, spec: ProjectSpec) -> str:
+    """Rewrite `module.exports` so it names every helper the file defines."""
+    names: list[str] = []
+    for entity in spec.entities:
+        if entity.fields:
+            names.extend(n for n in _exports(entity) if _defines(text, n))
+    match = _EXPORTS_RE.search(text)
+    if match:
+        end = text.find("}", match.end())
+        existing = text[match.end() : end] if end != -1 else ""
+        # A name the model added and exported stays exported — this pass refills
+        # holes, it does not take anything away.
+        for extra in _IDENT_IN_EXPORTS_RE.findall(existing):
+            if extra not in names and _defines(text, extra):
+                names.append(extra)
+        for extra in re.findall(r"function\s+([A-Za-z_$][\w$]*)", text):
+            if extra not in names and _QUERY_NAME_RE.match(extra):
+                names.append(extra)
+        block = "module.exports = {\n" + "".join(f"  {n},\n" for n in names) + "};\n"
+        tail = text[end + 1 :] if end != -1 else ""
+        return text[: match.start()] + block + tail.lstrip()
+    return (
+        text.rstrip()
+        + "\n\nmodule.exports = {\n"
+        + "".join(f"  {n},\n" for n in names)
+        + "};\n"
+    )
+
+
 def needs_password_helper(spec: ProjectSpec) -> bool:
     return any(_SECRET_NAME_RE.search(f.name) for e in spec.entities for f in e.fields)
 
@@ -469,6 +637,15 @@ def seed_source(spec: ProjectSpec, rows: int = 3) -> str:
         lines.append('const { hashPassword } = require("./passwords");')
     lines += [
         "",
+        "/**",
+        " * The id of a parent row for a foreign key to point at, or null when",
+        " * the parent table was never seeded. It cycles, so a handful of child",
+        " * rows spread over whatever parents exist.",
+        " */",
+        "function pickId(ids, index) {",
+        "  return ids.length > 0 ? ids[(index - 1) % ids.length] : null;",
+        "}",
+        "",
         "/** Insert demo rows. Safe to run repeatedly. */",
         "async function seed() {",
         "  const client = await db.getPool().connect();",
@@ -476,23 +653,97 @@ def seed_source(spec: ProjectSpec, rows: int = 3) -> str:
     ]
 
     wrote_any = False
+    # table -> the JS array holding the ids this script really inserted. A
+    # foreign key has to point at a row that EXISTS, and the only ids that
+    # exist are the ones the parent insert returned — `gen_random_uuid()`
+    # mints them, so they cannot be known here. Measured on the OpenBazaar
+    # build, where every child row was seeded with the string
+    # "Demo seller_id 1" and the first `items` insert took the whole seed down.
+    ids_var: dict[str, str] = {}
     for entity in spec.entities:
         writable = _writable(entity)
         if not writable:
             continue
+        pk = _pk(entity)
+        # A REQUIRED parent whose rows this script never inserts. Seeding the
+        # child anyway is a guaranteed foreign-key violation, and one failed
+        # insert aborts every later one — so the entity is skipped WITH ITS
+        # REASON in the file rather than emitted to fail at runtime.
+        blocked = sorted(
+            {
+                _ref_table(f)
+                for f in writable
+                if f.references
+                and f.required
+                and _ref_table(f) != entity.table
+                and _ref_table(f) not in ids_var
+            }
+        )
+        if blocked:
+            lines.append(
+                f"    // {entity.name}: not seeded - it requires a row in "
+                f"{', '.join(blocked)}, which this script does not insert."
+            )
+            continue
         wrote_any = True
         cols = ", ".join(f.name for f in writable)
         marks = POSTGRES.placeholders(len(writable))
+        var = f"{_camel(entity.table)}Ids"
         lines.append(f"    // {entity.name}")
+        if pk is not None:
+            lines.append(f"    const {var} = [];")
         for i in range(1, rows + 1):
-            values = ", ".join(_sample(f, i) for f in writable)
-            lines.append(
-                "    await client.query(\n"
-                f'      "INSERT INTO {entity.table} ({cols}) VALUES ({marks}) '
-                'ON CONFLICT DO NOTHING",\n'
-                f"      [{values}]\n"
-                "    );"
+            values = ", ".join(
+                (
+                    f"pickId({ids_var[_ref_table(f)]}, {i})"
+                    if f.references and _ref_table(f) in ids_var
+                    # A self-reference (`categories.parent_id`) and a forward one
+                    # both resolve to nothing yet. NULL is the only value that is
+                    # certainly valid, and every such column is nullable — a
+                    # required one was skipped above.
+                    else "null" if f.references else _sample(f, i)
+                )
+                for f in writable
             )
+            insert = (
+                f'"INSERT INTO {entity.table} ({cols}) VALUES ({marks}) '
+                "ON CONFLICT DO NOTHING"
+                + (f" RETURNING {pk.name}" if pk is not None else "")
+                + '"'
+            )
+            if pk is None:
+                lines.append(
+                    "    await client.query(\n"
+                    f"      {insert},\n"
+                    f"      [{values}]\n"
+                    "    );"
+                )
+                continue
+            lines.append(
+                "    {\n"
+                "      const inserted = await client.query(\n"
+                f"        {insert},\n"
+                f"        [{values}]\n"
+                "      );\n"
+                f"      if (inserted.rows[0]) {var}.push(inserted.rows[0].{pk.name});\n"
+                "    }"
+            )
+        if pk is not None:
+            # `ON CONFLICT DO NOTHING` returns NO row for one that is already
+            # there, so on the second run of a seed the array is empty and every
+            # child insert binds null into a NOT NULL foreign key. The rows do
+            # exist — they just were not inserted by THIS run — so read them
+            # back. This is what keeps the script safe to run twice, which is
+            # the whole point of `ON CONFLICT DO NOTHING`.
+            lines.append(
+                f"    if ({var}.length === 0) {{\n"
+                f"      const existing = await client.query(\n"
+                f'        "SELECT {pk.name} FROM {entity.table} LIMIT {rows}"\n'
+                "      );\n"
+                f"      for (const row of existing.rows) {var}.push(row.{pk.name});\n"
+                "    }"
+            )
+            ids_var[entity.table] = var
     if not wrote_any:
         lines.append("    // No entities with insertable columns.")
 
